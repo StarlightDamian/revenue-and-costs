@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.work/
+.debug-memory/
+coverage/
+.env
+.env.local
+*.log
+playwright-report/
+test-results/
+storage/local/
+storage/replica/
+nas/data/
+outputs/
+agent_revenue-and-costs.md

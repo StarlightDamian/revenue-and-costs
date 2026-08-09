@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="comfort" data-theme-storage-key="revenueCostsThemeV01">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="description" content="跨境电商平台收入与平台成本测算工具" />
+    <title>销售成本测算</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%233f6657'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-family='Arial' font-size='24' font-weight='700' fill='white'%3ERC%3C/text%3E%3C/svg%3E" />
+    <link rel="preload" href="/src/web/assets/portal-comfort.webp" as="image" type="image/webp" />
+    <script>
+      (function () {
+        try {
+          var root = document.documentElement;
+          var value = localStorage.getItem("revenueCostsThemeV01");
+          if (["comfort", "tech", "light", "dark"].indexOf(value) >= 0) root.dataset.theme = value;
+        } catch (_) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <noscript><div class="noscript-notice">请启用 JavaScript 后使用本工具。</div></noscript>
+    <div id="app"></div>
+    <script type="module" src="/src/web/main.ts"></script>
+  </body>
+</html>

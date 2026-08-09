@@ -1,0 +1,15 @@
+{
+  "fixtureRevision": 2,
+  "data": {
+    "records": [
+      {
+        "showDateCN": "2026-07-24",
+        "USD/CNY": "7.10000000",
+        "100JPY/CNY": "4.80000000",
+        "CNY/MYR": "0.65000000"
+      }
+    ],
+    "totalPages": 1,
+    "nonTradingDates": ["2026-07-25", "2026-07-26"]
+  }
+}
