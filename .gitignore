@@ -3,8 +3,8 @@ dist/
 .work/
 .debug-memory/
 coverage/
-.env
-.env.local
+.env*
+!.env.example
 *.log
 playwright-report/
 test-results/
