@@ -31,13 +31,20 @@ const shipment: ShipmentFact = {
   },
 };
 
-function transaction(id: string, type: string, description: string, overrides: Partial<TransactionFact["amounts"]>): TransactionFact {
+function transaction(
+  id: string,
+  type: string,
+  description: string,
+  overrides: Partial<TransactionFact["amounts"]>,
+  fulfillmentMode: TransactionFact["fulfillmentMode"] = "BLANK",
+): TransactionFact {
   return {
     ...identity,
     id,
     kind: "TRANSACTION",
     type,
     description,
+    fulfillmentMode,
     amounts: {
       productSales: "0", productSalesTax: "0", shippingCredits: "0", shippingCreditsTax: "0",
       giftWrapCredits: "0", giftWrapCreditsTax: "0", regulatoryFee: "0", taxOnRegulatoryFee: "0",
@@ -84,6 +91,32 @@ describe("财务口径 Golden", () => {
     const output = calculateFinancials({ shipments: [], transactions: [[reversal, fx]] });
     expect(output.summary.platformFee).toBe("-35.00000000");
     expect(output.summary.platformBalance).toBe("35.00000000");
+  });
+
+  it("仅将非空且非 Amazon 的 Order 九字段按交易日期汇率补充到收入", () => {
+    const seller = transaction("seller-order", "Order", "", {
+      productSales: "1", productSalesTax: "1", shippingCredits: "1", shippingCreditsTax: "1",
+      giftWrapCredits: "1", giftWrapCreditsTax: "1", regulatoryFee: "1", taxOnRegulatoryFee: "1",
+      promotionalRebates: "1", promotionalRebatesTax: "999",
+    }, "MERCHANT");
+    const localizedSeller = transaction("localized-seller-order", "Order", "", { productSales: "2" }, "MERCHANT");
+    const amazon = transaction("amazon-order", "Order", "", { productSales: "100" }, "AMAZON");
+    const blank = transaction("blank-order", "Order", "", { productSales: "100" }, "BLANK");
+    const nonOrder = transaction("seller-service-fee", "Service Fee", "", { productSales: "100" }, "MERCHANT");
+
+    const output = calculateFinancials({
+      shipments: [],
+      transactions: [seller, localizedSeller, amazon, blank, nonOrder].map((fact) => [fact, fx] as const),
+    });
+
+    expect(output.summary.income).toBe("77.00000000");
+    expect(output.summary.platformBalance).toBe("77.00000000");
+    expect(output.results.filter((result) => result.factId === seller.id && result.component === "INCOME").map((result) => result.sourceColumn)).toEqual([
+      "productSales", "productSalesTax", "shippingCredits", "shippingCreditsTax", "giftWrapCredits",
+      "giftWrapCreditsTax", "regulatoryFee", "taxOnRegulatoryFee", "promotionalRebates",
+    ]);
+    expect(output.results.some((result) => result.sourceColumn === "promotionalRebatesTax")).toBe(false);
+    expect(output.results.filter((result) => [amazon.id, blank.id, nonOrder.id].includes(result.factId) && result.component === "INCOME")).toEqual([]);
   });
 
   it("零金额保留显式汇总但不生成无贡献的结果或汇率使用来源", () => {

@@ -24,7 +24,7 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
                 (count(*)-count(DISTINCT filename))::text AS duplicates
            FROM schema_migration`,
       );
-      expect(Number(status.rows[0]?.applied ?? "0")).toBeGreaterThanOrEqual(42);
+      expect(Number(status.rows[0]?.applied ?? "0")).toBeGreaterThanOrEqual(43);
       expect(status.rows[0]?.duplicates).toBe("0");
       const enterpriseModel = await first.query<{
         invalid_roles: string; orphan_companies: string; invalid_wallet_owners: string; current_price: string;
@@ -85,6 +85,19 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
             AND NOT trigger.tgisinternal`,
       );
       expect(outboxNotifyTrigger.rows[0]?.count).toBe("1");
+      const fulfillmentMode = await first.query<{ is_nullable: string; check_count: string }>(
+        `SELECT column_info.is_nullable,
+                (SELECT count(*)::text FROM pg_constraint con
+                  JOIN pg_class relation ON relation.oid=con.conrelid
+                  JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+                 WHERE namespace.nspname=current_schema() AND relation.relname='transaction_fact'
+                   AND con.conname='transaction_fact_fulfillment_mode_check') check_count
+           FROM information_schema.columns column_info
+          WHERE column_info.table_schema=current_schema()
+            AND column_info.table_name='transaction_fact'
+            AND column_info.column_name='fulfillment_mode'`,
+      );
+      expect(fulfillmentMode.rows[0]).toEqual({ is_nullable: "YES", check_count: "1" });
       const fxOffsetConstraint = await first.query<{ definition: string }>(
         `SELECT pg_get_constraintdef(con.oid) definition
            FROM pg_constraint con

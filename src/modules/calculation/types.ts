@@ -46,6 +46,7 @@ export interface TransactionFact extends FactIdentity {
   readonly kind: "TRANSACTION";
   readonly type: string;
   readonly description: string;
+  readonly fulfillmentMode: "AMAZON" | "MERCHANT" | "BLANK";
   readonly amounts: Readonly<Record<RefundField, string>> & {
     readonly promotionalRebatesTax: string;
     readonly marketplaceWithheldTax: string;
@@ -55,7 +56,6 @@ export interface TransactionFact extends FactIdentity {
     readonly other: string;
   };
 }
-
 
 export interface FactFxConversion {
   readonly requestedDate: string;

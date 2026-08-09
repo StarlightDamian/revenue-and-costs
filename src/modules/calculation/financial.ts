@@ -80,6 +80,14 @@ function transactionResults(fact: TransactionFact, fx: FactFxConversion): Calcul
   const type = canonical(fact.type);
   const description = canonical(fact.description);
 
+  if (type === "ORDER" && fact.fulfillmentMode === "MERCHANT") {
+    // The merchant-order income contract uses the same nine semantic amount
+    // columns as refunds; keeping one field list prevents locale/column drift.
+    for (const field of REFUND_FIELDS) {
+      pushResult(results, fact, field, "INCOME", fact.amounts[field], fx, false);
+    }
+  }
+
   if (type === "REFUND") {
     for (const field of REFUND_FIELDS) {
       pushResult(results, fact, field, "REFUND", fact.amounts[field], fx, true);

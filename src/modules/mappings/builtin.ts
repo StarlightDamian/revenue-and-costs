@@ -13,6 +13,10 @@ const builtinTransactionMappingBase: FieldMappingDefinition = {
     field("description", ["description", "Beschreibung", "Descrizione", "opis", "beskrivning", "beschrijving", "descripción", "açıklama", "説明"], true),
     field("quantity", ["quantity", "Menge", "Quantità", "quantité", "ilość", "antal", "cantidad", "adet", "数量"]),
     field("marketplace", ["marketplace", "site de vente", "rynek", "marknadsplats", "web de Amazon", "pazar yeri", "Amazon 出品サービス"], true),
+    field("fulfillment", [
+      "fulfillment", "fulfilment", "Versand", "cumplimiento", "Gestione", "フルフィルメント",
+      "traitement", "expédition", "realizacja", "gestión logística", "leverans", "gönderim",
+    ], true),
     field("product_sales", ["product sales", "Umsätze", "Vendite", "ventes de produits", "sprzedaż produktów", "försäljning av produkter", "verkoop van producten", "ventas de productos", "ürün satışları", "商品売上"], true),
     field("product_sales_tax", ["product sales tax", "Produktumsatzsteuer", "imposta sulle vendite dei prodotti", "Taxes sur la vente des produits", "impuesto de ventas de productos", "商品の売上税"]),
     field("shipping_credits", ["shipping credits", "Gutschrift für Versandkosten", "Accrediti per le spedizioni", "crédits d'expédition", "crédits d’expédition", "noty kredytowe za wysyłkę", "fraktkrediter", "créditos de envío", "kargo kredileri", "配送料"]),
@@ -72,6 +76,7 @@ export const builtinTransactionMapping = withSourceAliases(builtinTransactionMap
   description: ["descrição"],
   quantity: ["quantidade"],
   marketplace: ["mercado"],
+  fulfillment: ["atendimento"],
   product_sales: ["vendas do produto"],
   product_sales_tax: ["imposto de vendas coletados"],
   shipping_credits: ["créditos de remessa"],

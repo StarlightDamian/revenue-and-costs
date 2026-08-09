@@ -51,10 +51,10 @@ describe("calculation rule versioning", () => {
     })).resolves.toMatchObject({ runId: "run-1" });
 
     const insert = calls.find(({ sql }) => sql.includes("INSERT INTO calculation_run("));
-    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v2", "local-v4"]);
+    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v3", "local-v5"]);
     expect(JSON.parse(String(insert?.parameters?.[6]))).toMatchObject({
-      formulaVersion: "revenue-cost-v2",
-      codeVersion: "local-v4",
+      formulaVersion: "revenue-cost-v3",
+      codeVersion: "local-v5",
       fxDateRuleVersion: "next-business-day-v2",
     });
   });
