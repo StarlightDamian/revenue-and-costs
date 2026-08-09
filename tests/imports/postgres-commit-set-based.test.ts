@@ -30,7 +30,6 @@ describe("set-based import materialization", () => {
     expect(statements).toHaveLength(10);
     expect(statements.filter((sql) => sql.includes("INSERT INTO shipment_fact"))).toHaveLength(1);
     expect(statements.filter((sql) => sql.includes("INSERT INTO transaction_fact"))).toHaveLength(1);
-    expect(statements.find((sql) => sql.includes("INSERT INTO transaction_fact"))).toContain("fulfillment_mode");
     expect(statements.filter((sql) => sql.includes("INSERT INTO transaction_fee_component"))).toHaveLength(1);
     expect(statements.filter((sql) => sql.includes("INSERT INTO reconciliation_result"))).toHaveLength(1);
     expect(statements.filter((sql) => sql.includes("JOIN import_version_stage"))).toHaveLength(5);

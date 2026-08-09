@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeFulfillment, normalizeReportDate, normalizeTransactionType, SingleSiteMarketplaceInference } from "../../src/modules/imports/normalize-row.js";
+import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeReportDate, normalizeTransactionType, SingleSiteMarketplaceInference } from "../../src/modules/imports/normalize-row.js";
 
 describe("import row normalization", () => {
   it("keeps report display date but crosses the German local month", () => {
@@ -80,12 +80,6 @@ describe("import row normalization", () => {
     expect(marketplaceProfile("amazon.ie")).toMatchObject({ code: "IE", timezone: "Europe/Dublin", currency: "EUR" });
     expect(marketplaceProfile("amazon.com.br")).toMatchObject({ code: "BR", timezone: "America/Sao_Paulo", currency: "BRL" });
     expect(marketplaceProfile("Non-Amazon").nonAmazon).toBe(true);
-  });
-  it("normalizes fulfillment without enumerating localized seller values", () => {
-    expect(normalizeFulfillment(" amazon ")).toBe("AMAZON");
-    expect(normalizeFulfillment(" Verkäufer ")).toBe("MERCHANT");
-    expect(normalizeFulfillment("  ")).toBe("BLANK");
-    expect(normalizeFulfillment("Ａｍａｚｏｎ")).toBe("AMAZON");
   });
   it("normalizes confirmed Dutch and Swedish Order values", () => {
     expect(normalizeTransactionType("Bestelling")).toBe("ORDER");

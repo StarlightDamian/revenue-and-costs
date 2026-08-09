@@ -4,7 +4,6 @@ import { isPermanentExportFailure } from "../../src/modules/exports/postgres";
 import { analyzeStoredUpload, loadImportMappingCandidates } from "../../src/modules/imports/postgres-analyzer";
 import {
   FILE_JOB_BATCH_SIZE,
-  isPermanentCalculationFailure,
   pgBossRuntimeOptions,
   registerHandlers,
   runExportJob,
@@ -103,17 +102,6 @@ describe("worker retry lifecycle", () => {
     )).rejects.toThrow("exhausted");
     expect(terminal).toHaveBeenCalledOnce();
     expect(terminal.mock.calls[0]?.[0]).toMatchObject({ message: "exhausted" });
-  });
-
-  it("terminates a legacy fulfillment contract error on its first calculation attempt", async () => {
-    const terminal = vi.fn(async (error: unknown) => { void error; });
-    await expect(runRetryableJob(
-      { retryCount: 0, retryLimit: 5 },
-      async () => { throw new Error("TRANSACTION_FULFILLMENT_REIMPORT_REQUIRED:42"); },
-      terminal,
-      isPermanentCalculationFailure,
-    )).resolves.toBeUndefined();
-    expect(terminal).toHaveBeenCalledOnce();
   });
 
   it("dead-letters a deterministic export contract failure on the first attempt", async () => {

@@ -31,9 +31,9 @@ describe("导入前缀分析", () => {
   });
 
   it.each([
-    ["BE", ["date/heure", "type", "description", "site de vente", "expédition", "ventes de produits", "frais de vente", "Frais pour le service Expédié par Amazon", "autres frais de transaction", "autres", "total"]],
-    ["ES", ["fecha y hora", "tipo", "descripción", "web de Amazon", "gestión logística", "ventas de productos", "tarifas de venta", "tarifas de Logística de Amazon", "tarifas de otras transacciones", "otro", "total"]],
-    ["NL", ["datum/tijd", "type", "beschrijving", "marketplace", "fulfillment", "verkoop van producten", "verkoopkosten", "fba-vergoedingen", "overige transactiekosten", "overige", "totaal"]],
+    ["BE", ["date/heure", "type", "description", "site de vente", "ventes de produits", "frais de vente", "Frais pour le service Expédié par Amazon", "autres frais de transaction", "autres", "total"]],
+    ["ES", ["fecha y hora", "tipo", "descripción", "web de Amazon", "ventas de productos", "tarifas de venta", "tarifas de Logística de Amazon", "tarifas de otras transacciones", "otro", "total"]],
+    ["NL", ["datum/tijd", "type", "beschrijving", "marketplace", "verkoop van producten", "verkoopkosten", "fba-vergoedingen", "overige transactiekosten", "overige", "totaal"]],
   ])("精确匹配 %s 本地化交易表头", (_site, headers) => {
     expect(matchHeader(headers, builtinTransactionMapping)).toBeDefined();
   });
@@ -49,7 +49,7 @@ describe("导入前缀分析", () => {
 
   it("精确匹配 Amazon 巴西葡语交易报告的必需表头", () => {
     const headers = [
-      "data/hora", "tipo", "id do pedido", "sku", "descrição", "quantidade", "mercado", "atendimento",
+      "data/hora", "tipo", "id do pedido", "sku", "descrição", "quantidade", "mercado",
       "vendas do produto", "créditos de remessa", "créditos de embalagem de presente",
       "descontos promocionais", "imposto de vendas coletados", "tarifas de venda", "taxas fba",
       "taxas de outras transações", "outro", "total",
@@ -58,28 +58,9 @@ describe("导入前缀分析", () => {
   });
 
   it("合法 UTF-8 意大利语表头不会因 Windows-1252 兼容解码产生假歧义", () => {
-    const header = ["Data/Ora:", "Tipo", "Descrizione", "Quantità", "Marketplace", "Gestione", "Vendite", "Commissioni di vendita", "Costi del servizio Logistica di Amazon", "Altri costi relativi alle transazioni", "Altro", "totale"].join(",");
+    const header = ["Data/Ora:", "Tipo", "Descrizione", "Quantità", "Marketplace", "Vendite", "Commissioni di vendita", "Costi del servizio Logistica di Amazon", "Altri costi relativi alle transazioni", "Altro", "totale"].join(",");
     const result = analyzeDelimitedPrefix(new TextEncoder().encode(`${header}\n`), [{ id: "mapping-it", definition: builtinTransactionMapping }]);
     expect(result).toMatchObject({ status: "MATCHED", encoding: "utf-8", mappingVersionId: "mapping-it" });
-  });
-
-  it.each([
-    "fulfillment", "fulfilment", "Versand", "cumplimiento", "Gestione", "フルフィルメント",
-    "traitement", "expédition", "realizacja", "gestión logística", "atendimento", "leverans", "gönderim",
-  ])("精确映射已确认的配送方式表头 %s", (fulfillmentHeader) => {
-    const headers = [
-      "date/time", "type", "description", "marketplace", fulfillmentHeader, "product sales",
-      "selling fees", "fba fees", "other transaction fees", "other", "total",
-    ];
-    expect(matchHeader(headers, builtinTransactionMapping)?.has("fulfillment")).toBe(true);
-  });
-
-  it("不按物理列位置猜测未知配送方式表头", () => {
-    const headers = [
-      "date/time", "type", "description", "marketplace", "unknown fulfillment label", "product sales",
-      "selling fees", "fba fees", "other transaction fees", "other", "total",
-    ];
-    expect(matchHeader(headers, builtinTransactionMapping)).toBeUndefined();
   });
 
   it("只按内容识别 PDF，Office 临时文件不解析", () => {

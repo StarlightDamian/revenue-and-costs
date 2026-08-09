@@ -12,12 +12,12 @@ import type { EncryptedObjectStore } from "../storage/encrypted-object-store.js"
 import type { FieldMappingDefinition } from "../mappings/types.js";
 import { parseMappedDelimitedStream, type MappedImportRow } from "./stream-parser.js";
 import { parseMappedXlsxStream, XLSX_IMPORT_ENCODING } from "./xlsx-stream.js";
-import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeFulfillment, normalizeReportDate, normalizeTransactionDescription, normalizeTransactionType, SingleSiteMarketplaceInference, type MarketplaceProfile } from "./normalize-row.js";
+import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeReportDate, normalizeTransactionDescription, normalizeTransactionType, SingleSiteMarketplaceInference, type MarketplaceProfile } from "./normalize-row.js";
 
 const STAGE_COLUMNS = [
   "report_kind", "file_id", "row_number", "row_hash", "date_text", "parsed_at", "source_timezone",
   "fx_date", "local_date", "local_month", "marketplace", "raw_marketplace", "order_id", "sku", "currency",
-  "quantity", "type", "description", "fulfillment_mode", "product_sales", "product_sales_tax", "shipping_credits",
+  "quantity", "type", "description", "product_sales", "product_sales_tax", "shipping_credits",
   "shipping_credits_tax", "gift_wrap_credits", "gift_wrap_credits_tax", "regulatory_fee",
   "tax_on_regulatory_fee", "promotional_rebates", "promotional_rebates_tax", "marketplace_withheld_tax",
   "selling_fees", "fba_fees", "other_transaction_fees", "other_amount", "product_price", "product_tax",
@@ -355,13 +355,12 @@ async function copyImportFiles(client: PoolClient, store: EncryptedObjectStore, 
         const textStarted = breakdown ? performance.now() : 0;
         const transactionType = normalizeTransactionType(values.type ?? "");
         const transactionDescription = normalizeTransactionDescription(values.description ?? "");
-        const fulfillmentMode = normalizeFulfillment(values.fulfillment);
         if (breakdown) breakdown.transactionTextMs += performance.now() - textStarted;
         const fields = [
           file.classification, file.id, row.sourceRowNumber, `\\x${row.rowHash}`, dateText, date.parsedAt, date.sourceTimezone,
           date.fxDate, date.localDate, date.localMonth, profile.code, rawMarketplace, values.order_id ?? "", values.sku ?? "", currency,
           file.classification === "SHIPMENT" ? requiredAmount("quantity") : amount("quantity"),
-          transactionType, transactionDescription, fulfillmentMode,
+          transactionType, transactionDescription,
           amount("product_sales"), amount("product_sales_tax"), amount("shipping_credits"),
           amount("shipping_credits_tax"), amount("gift_wrap_credits"), amount("gift_wrap_credits_tax"),
           amount("regulatory_fee"), amount("tax_on_regulatory_fee"), amount("promotional_rebates"),
@@ -573,11 +572,11 @@ export async function materializeImportSlices(
   );
   await client.query(
     `INSERT INTO transaction_fact(dataset_version_id,source_file_id,row_number,row_hash,original_datetime_text,parsed_at,source_timezone,
-      fx_date,marketplace_local_date,local_month,normalized_marketplace,normalized_type,normalized_description,fulfillment_mode,order_id,sku,currency,quantity,
+      fx_date,marketplace_local_date,local_month,normalized_marketplace,normalized_type,normalized_description,order_id,sku,currency,quantity,
       product_sales,product_sales_tax,shipping_credits,shipping_credits_tax,gift_wrap_credits,gift_wrap_credits_tax,regulatory_fee,
       tax_on_regulatory_fee,promotional_rebates,promotional_rebates_tax,marketplace_withheld_tax,selling_fees,fba_fees,other_transaction_fees,other_amount)
      SELECT version.version_id,stage.file_id,stage.row_number,stage.row_hash,stage.date_text,stage.parsed_at,stage.source_timezone,
-       stage.fx_date,stage.local_date,stage.local_month,stage.marketplace,upper(stage.type),stage.description,stage.fulfillment_mode,
+       stage.fx_date,stage.local_date,stage.local_month,stage.marketplace,upper(stage.type),stage.description,
        nullif(stage.order_id,''),nullif(stage.sku,''),stage.currency,stage.quantity,stage.product_sales,stage.product_sales_tax,
        stage.shipping_credits,stage.shipping_credits_tax,stage.gift_wrap_credits,stage.gift_wrap_credits_tax,stage.regulatory_fee,
        stage.tax_on_regulatory_fee,stage.promotional_rebates,stage.promotional_rebates_tax,stage.marketplace_withheld_tax,
@@ -650,7 +649,7 @@ export async function commitImportBatch(
     await client.query(`CREATE TEMP TABLE import_stage (
       report_kind text,file_id uuid,row_number bigint,row_hash bytea,date_text text,parsed_at timestamptz,source_timezone text,
       fx_date date,local_date date,local_month date,marketplace text,raw_marketplace text,order_id text,sku text,currency text,
-      quantity numeric(30,8),type text,description text,fulfillment_mode text,product_sales numeric(30,8),product_sales_tax numeric(30,8),
+      quantity numeric(30,8),type text,description text,product_sales numeric(30,8),product_sales_tax numeric(30,8),
       shipping_credits numeric(30,8),shipping_credits_tax numeric(30,8),gift_wrap_credits numeric(30,8),gift_wrap_credits_tax numeric(30,8),
       regulatory_fee numeric(30,8),tax_on_regulatory_fee numeric(30,8),promotional_rebates numeric(30,8),promotional_rebates_tax numeric(30,8),
       marketplace_withheld_tax numeric(30,8),selling_fees numeric(30,8),fba_fees numeric(30,8),other_transaction_fees numeric(30,8),

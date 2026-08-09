@@ -38,20 +38,13 @@ export async function runRetryableJob(
   attempt: { readonly retryCount: number; readonly retryLimit: number },
   work: () => Promise<void>,
   onTerminalFailure: (error: unknown) => Promise<void>,
-  isPermanentFailure: (error: unknown) => boolean = () => false,
 ): Promise<void> {
   try {
     await work();
   } catch (error) {
-    const permanent = isPermanentFailure(error);
-    if (permanent || attempt.retryCount >= attempt.retryLimit) await onTerminalFailure(error);
-    if (!permanent) throw error;
+    if (attempt.retryCount >= attempt.retryLimit) await onTerminalFailure(error);
+    throw error;
   }
-}
-
-export function isPermanentCalculationFailure(error: unknown): boolean {
-  const code = error instanceof Error ? error.message : String(error);
-  return /^TRANSACTION_FULFILLMENT_REIMPORT_REQUIRED:\d+$/u.test(code);
 }
 
 export async function runExportJob(
@@ -209,7 +202,6 @@ export async function registerHandlers(boss: PgBoss, deps: { pool: Pool; objectS
       async (error) => {
         await markCalculationRunFailed(deps.pool, job.data.runId, error);
       },
-      isPermanentCalculationFailure,
     );
   });
   const database = new PostgresDatabase(deps.pool);

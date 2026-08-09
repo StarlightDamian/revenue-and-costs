@@ -84,7 +84,7 @@ export async function processRunFacts(
     const rows = await client.query<Record<string, string>>(
       `SELECT rs.dataset_slice_id::text AS slice_id,tf.id::text AS fact_id,tf.dataset_version_id,tf.source_file_id,
         tf.row_number::text,encode(tf.row_hash,'hex') row_hash,tf.normalized_marketplace,
-        local_month::text,currency,fx_date::text,normalized_type,normalized_description,tf.fulfillment_mode,product_sales::text,product_sales_tax::text,
+        local_month::text,currency,fx_date::text,normalized_type,normalized_description,product_sales::text,product_sales_tax::text,
         shipping_credits::text,shipping_credits_tax::text,gift_wrap_credits::text,gift_wrap_credits_tax::text,regulatory_fee::text,
         tax_on_regulatory_fee::text,promotional_rebates::text,promotional_rebates_tax::text,marketplace_withheld_tax::text,
         selling_fees::text,fba_fees::text,other_transaction_fees::text,other_amount::text
@@ -95,7 +95,6 @@ export async function processRunFacts(
     if (!rows.rows.length) break;
     for (const row of rows.rows) {
       lastTransaction = BigInt(row.fact_id!);
-      if (!row.fulfillment_mode) throw new Error(`TRANSACTION_FULFILLMENT_REIMPORT_REQUIRED:${row.fact_id}`);
       const fact: TransactionFact = {
         kind: "TRANSACTION",
         id: row.fact_id!,
@@ -109,7 +108,6 @@ export async function processRunFacts(
         fxDate: row.fx_date!,
         type: row.normalized_type!,
         description: row.normalized_description!,
-        fulfillmentMode: row.fulfillment_mode as TransactionFact["fulfillmentMode"],
         amounts: {
           productSales: row.product_sales!,
           productSalesTax: row.product_sales_tax!,
