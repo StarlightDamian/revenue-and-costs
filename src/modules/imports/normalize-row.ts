@@ -108,14 +108,6 @@ export function normalizedSparseDecimal(input: string | undefined): string {
   return !value || value === "-" ? "0.00000000" : normalizedDecimal(value);
 }
 
-export type FulfillmentMode = "AMAZON" | "MERCHANT" | "BLANK";
-
-export function normalizeFulfillment(input: string | undefined): FulfillmentMode {
-  const value = (input ?? "").normalize("NFKC").trim().toLocaleLowerCase("und");
-  if (!value) return "BLANK";
-  return value === "amazon" ? "AMAZON" : "MERCHANT";
-}
-
 const MONTHS: Readonly<Record<string, string>> = {
   jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
   jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",

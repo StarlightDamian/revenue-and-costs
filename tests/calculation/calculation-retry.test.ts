@@ -61,32 +61,6 @@ describe("calculation retry lifecycle", () => {
     expect(query.mock.calls[0]?.[0]).toContain("jsonb_to_recordset");
   });
 
-  it("fails closed when a legacy transaction fact has no fulfillment mode", async () => {
-    const query = vi.fn(async (sql: string) => {
-      if (sql.includes("FROM shipment_fact")) return { rows: [], rowCount: 0 };
-      if (sql.includes("FROM transaction_fact")) return { rows: [{
-        slice_id: "slice-1", fact_id: "1", dataset_version_id: "version-1", source_file_id: "file-1",
-        row_number: "1", row_hash: "hash", normalized_marketplace: "US", local_month: "2026-08-01",
-        currency: "USD", fx_date: "2026-08-01", normalized_type: "ORDER", normalized_description: "",
-        fulfillment_mode: null,
-        product_sales: "0", product_sales_tax: "0", shipping_credits: "0", shipping_credits_tax: "0",
-        gift_wrap_credits: "0", gift_wrap_credits_tax: "0", regulatory_fee: "0", tax_on_regulatory_fee: "0",
-        promotional_rebates: "0", promotional_rebates_tax: "0", marketplace_withheld_tax: "0",
-        selling_fees: "0", fba_fees: "0", other_transaction_fees: "0", other_amount: "0",
-      }], rowCount: 1 };
-      throw new Error(`UNEXPECTED_QUERY:${sql}`);
-    });
-    const sink = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
-
-    await expect(processRunFacts(
-      { query } as unknown as PoolClient,
-      "run-1",
-      [{ dataset_slice_id: "slice-1", dataset_version_id: "version-1" }],
-      { official: [], marketDayStatus: () => "UNKNOWN" },
-      sink,
-    )).rejects.toThrow("TRANSACTION_FULFILLMENT_REIMPORT_REQUIRED:1");
-  });
-
   it("rolls a transient failure back without making the business run terminal", async () => {
     const connectionQueries: string[] = [];
     const poolQueries: string[] = [];
