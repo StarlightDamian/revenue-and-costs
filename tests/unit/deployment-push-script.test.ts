@@ -82,6 +82,14 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain(executableRestore);
     expect(remote.indexOf(executableRestore)).toBeLessThan(remote.indexOf('--store-dir "$staging/pnpm-store" install'));
     expect(remote).toContain('resolved_target="$(realpath -m -- "$link")"');
+    const databaseManifest = '> "$staging/.database-migrations"';
+    const permissionNormalization = 'find "$staging" -type f -exec chmod 0640 {} +';
+    const stagingMove = 'mv "$staging" "$target"';
+    expect(remote).toContain(databaseManifest);
+    expect(remote).toContain(permissionNormalization);
+    expect(remote.indexOf(permissionNormalization)).toBeGreaterThan(remote.indexOf(databaseManifest));
+    expect(remote.indexOf(permissionNormalization)).toBeLessThan(remote.indexOf(stagingMove));
+    expect(remote.slice(remote.indexOf(permissionNormalization), remote.indexOf(stagingMove))).not.toContain('> "$staging/');
     expect(remote).toContain('find "$staging" \\( -type f -o -type d \\) -perm /0022');
     expect(remote).not.toContain('find "$staging" -perm /0022');
     expect(remote).toContain("trap cleanup EXIT");

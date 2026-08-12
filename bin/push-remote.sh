@@ -166,9 +166,6 @@ esac
 find "$staging/pnpm-store" -type f -name '*-exec' -exec chmod 0750 {} +
 PATH="$node_root/bin:$PATH" "$node_root/bin/node" "$staging/tools/pnpm-min/pnpm.cjs" \
   --dir "$staging/app" --store-dir "$staging/pnpm-store" install --offline --frozen-lockfile --prod
-chown -R root:revenue-costs "$staging"
-find "$staging" -type d -exec chmod 0750 {} +
-find "$staging" -type f -exec chmod 0640 {} +
 find "$staging" \( -type b -o -type c -o -type p \) -print -quit | grep -q . && fail 'NON_REGULAR_RELEASE_ENTRY'
 while IFS= read -r -d '' link; do
   [[ "$link" == "$staging/app/node_modules/"* ]] || fail 'SYMLINK_OUTSIDE_NODE_MODULES'
@@ -177,7 +174,6 @@ while IFS= read -r -d '' link; do
   resolved_target="$(realpath -m -- "$link")"
   [[ "$resolved_target" == "$staging/app/node_modules/"* ]] || fail 'SYMLINK_ESCAPE_REJECTED'
 done < <(find "$staging" -type l -print0)
-find "$staging" \( -type f -o -type d \) -perm /0022 -print -quit | grep -q . && fail 'GROUP_OR_OTHER_WRITABLE_REJECTED'
 
 migration_manifest() {
   local directory="$1"
@@ -197,6 +193,14 @@ psql_bin='/usr/pgsql-17/bin/psql'; pg_dump_bin='/usr/pgsql-17/bin/pg_dump'; pg_r
 runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
   -c "SELECT filename || ' ' || checksum FROM schema_migration ORDER BY filename" > "$staging/.database-migrations"
 cmp -s "$staging/.previous-migrations" "$staging/.database-migrations" || fail 'DATABASE_MIGRATION_BASELINE_MISMATCH'
+
+# Normalize after creating the release metadata as well as installing production
+# dependencies. Otherwise these manifest files inherit 0644 from the shell and
+# trip the non-static world-readable gate after the staging directory is moved.
+chown -R root:revenue-costs "$staging"
+find "$staging" -type d -exec chmod 0750 {} +
+find "$staging" -type f -exec chmod 0640 {} +
+find "$staging" \( -type f -o -type d \) -perm /0022 -print -quit | grep -q . && fail 'GROUP_OR_OTHER_WRITABLE_REJECTED'
 
 mv "$staging" "$target"
 setfacl -m u:www:--x "$target" "$target/app" "$target/app/dist"
