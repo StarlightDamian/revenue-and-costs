@@ -1,6 +1,7 @@
 import type { Actor, PlatformRole, SqlClient, TransactionRunner, TransactionSideEffects } from '../authorization/index.js';
 import { authorizePlatform, requireAllowed } from '../authorization/index.js';
 import { AppError } from '../../shared/errors.js';
+import { maskPhone } from './crypto.js';
 
 function rethrowIdentityConstraint(error: unknown): never {
   if (error && typeof error === 'object' && 'code' in error && error.code === '23514'
@@ -32,10 +33,6 @@ interface ManagedAccountRow extends Record<string, unknown> {
   created_at: Date;
   enterprise_count: string;
   company_count: string;
-}
-
-function maskPhone(value: string): string {
-  return value.length <= 7 ? '***' : `${value.slice(0, 4)}****${value.slice(-4)}`;
 }
 
 export class IdentityAdminService {

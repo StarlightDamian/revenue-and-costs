@@ -6,8 +6,8 @@ export async function curlFetch(input: string | URL | Request): Promise<Response
   const url = input instanceof Request ? input.url : String(input);
   const command = process.platform === "win32" ? "curl.exe" : "curl";
   const args = [
-    "--silent", "--show-error", "--fail", "--location", "--max-time", "30", "--max-filesize", String(MAX_RESPONSE_BYTES),
-    "--user-agent", "Mozilla/5.0", "--referer", "https://www.chinamoney.com.cn/chinese/bkccpr/index.html?tab=2", url,
+    "--silent", "--show-error", "--fail", "--max-time", "30", "--max-filesize", String(MAX_RESPONSE_BYTES),
+    "--proto", "=https", "--user-agent", "Mozilla/5.0", "--referer", "https://www.chinamoney.com.cn/chinese/bkccpr/index.html?tab=2", "--", url,
   ];
   const chunks: Buffer[] = [];
   await new Promise<void>((resolve, reject) => {

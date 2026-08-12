@@ -91,6 +91,7 @@ export interface ShopWorkflow {
   currentStep: WorkflowStepCode;
   steps: WorkflowStepSummary[];
   latestBatch?: { id: string; status: string; stage: string; failureCode: string | null; calculationRunId?: string };
+  processingHealth?: { workerAvailable: boolean; terminalRecoveryBlocked?: boolean };
   publishedSnapshot?: NonNullable<Shop["publishedSnapshot"]>;
   download: {
     available: boolean;
@@ -127,6 +128,28 @@ export interface FxQuote {
   officialRate: DecimalString;
   quoteId: string;
   source: string;
+}
+
+export interface FxOverride {
+  id: string;
+  currency: string;
+  validFrom: IsoDate;
+  validTo: IsoDate;
+  cnyPerUnit: DecimalString;
+  sourceReference: string;
+  reason: string;
+  createdAt: IsoDateTime;
+  supersedesOverrideId: string | null;
+  isCurrent: boolean;
+}
+
+export interface FxOverrideInput {
+  currency: string;
+  validFrom: IsoDate;
+  validTo: IsoDate;
+  cnyPerUnit: DecimalString;
+  sourceReference: string;
+  reason: string;
 }
 
 export interface FxConversionRow {
@@ -286,6 +309,12 @@ export interface WalletEntry {
   balanceAfterCents: string;
   occurredAt: IsoDateTime;
   reason?: string;
+  reference?: {
+    type: "SHOP";
+    id: string;
+    name?: string;
+    status?: "ACTIVE" | "EXPIRED_READONLY" | "TRASHED" | "PURGED";
+  };
 }
 
 export interface AdminUser {

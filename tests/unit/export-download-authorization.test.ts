@@ -45,7 +45,7 @@ describe("export one-time download authorization", () => {
       if (sql.includes("FROM shop_membership")) return { rows: [], rowCount: 0 };
       if (sql.includes("FROM shop WHERE")) return { rows: [{ id: "shop", enterprise_id: "enterprise-1", status: "ACTIVE" }], rowCount: 1 };
       if (sql.includes("FROM export_request er LEFT JOIN stored_object")) {
-        return { rows: [{ requested_by: "owner", membership_authorization_version: null, status: "SUCCEEDED", storage_path: "object.esdk", output_kind: "XLSX", encryption_context: { objectId: "export" }, shop_name: "示例公司" }], rowCount: 1 };
+        return { rows: [{ requested_by: "owner", membership_authorization_version: null, status: "SUCCEEDED", storage_path: "object.esdk", output_kind: "XLSX", encryption_context: { objectId: "export" }, plaintext_size: "6", shop_name: "示例公司" }], rowCount: 1 };
       }
       if (sql.startsWith("UPDATE export_download_grant SET consumed_at")) {
         if (consumed) return { rows: [], rowCount: 0 };

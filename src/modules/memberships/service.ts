@@ -9,6 +9,10 @@ import type {
 import { AuthorizationError, authorizeShop, requireAllowed } from '../authorization/index.js';
 import { normalizePhone, tokenDigest } from '../auth/crypto.js';
 import { AppError } from '../../shared/errors.js';
+import {
+  activateShopMembership,
+  type MembershipArtifactInvalidator,
+} from './activation.js';
 
 interface ShopRow extends Record<string, unknown> {
   id: string;
@@ -49,11 +53,6 @@ function mapMembership(row: MembershipRow): CustomerMembership {
     exportAllowed: row.export_allowed,
     authorizationEpoch: row.authorization_epoch,
   };
-}
-
-/** 后续导出模块必须在同一事务内实现状态失效；下载仍实时检查 membership。 */
-export interface MembershipArtifactInvalidator {
-  invalidateForMembership(client: SqlClient, membershipId: string, newAuthorizationEpoch: string): Promise<void>;
 }
 
 export class MembershipService {
@@ -228,41 +227,18 @@ export class MembershipService {
       if (row.invited_phone_e164 !== row.account_phone) {
         return { invalid: true } as const;
       }
-      const existingMembership = await client.query<{ id: string; authorization_epoch: string }>(
-        `SELECT id, authorization_epoch::text
-           FROM shop_membership
-          WHERE shop_id = $1 AND account_id = $2
-          FOR UPDATE`,
-        [row.shop_id, input.actor.accountId],
-      );
-      const membership = await client.query<MembershipRow>(
-        `INSERT INTO shop_membership
-          (shop_id, account_id, export_allowed, invitation_id, granted_by)
-         VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (shop_id, account_id) DO UPDATE
-           SET status = 'ACTIVE', export_allowed = EXCLUDED.export_allowed,
-               authorization_epoch = shop_membership.authorization_epoch + 1,
-               invitation_id = EXCLUDED.invitation_id, granted_by = EXCLUDED.granted_by,
-               granted_at = clock_timestamp(), revoked_at = NULL, revoke_reason = NULL,
-               updated_at = clock_timestamp()
-         RETURNING id, shop_id, account_id, status, export_allowed, authorization_epoch`,
-        [row.shop_id, input.actor.accountId, row.export_allowed, row.id, row.invited_by],
-      );
+      const accepted = await activateShopMembership(client, this.artifactInvalidator, {
+        shopId: row.shop_id,
+        accountId: input.actor.accountId,
+        exportAllowed: row.export_allowed,
+        invitationId: row.id,
+        grantedBy: row.invited_by,
+      });
       await client.query(
         `UPDATE shop_invitation SET status = 'ACTIVE', accepted_by = $2, accepted_at = clock_timestamp()
           WHERE id = $1`,
         [row.id, input.actor.accountId],
       );
-      const accepted = membership.rows[0];
-      if (!accepted) throw new Error('接受客户邀请失败');
-      const previousMembership = existingMembership.rows[0];
-      if (previousMembership && previousMembership.authorization_epoch !== accepted.authorization_epoch) {
-        await this.artifactInvalidator.invalidateForMembership(
-          client,
-          accepted.id,
-          accepted.authorization_epoch,
-        );
-      }
       await this.effects.audit(client, {
         actorAccountId: input.actor.accountId,
         actorRoles: [...input.actor.roles],
@@ -273,9 +249,9 @@ export class MembershipService {
         reason: null,
         requestId: input.requestId,
         before: null,
-        after: { shopId: accepted.shop_id, exportAllowed: accepted.export_allowed },
+        after: { shopId: accepted.shopId, exportAllowed: accepted.exportAllowed },
       });
-      return { invalid: false, membership: mapMembership(accepted) } as const;
+      return { invalid: false, membership: accepted } as const;
     });
     if (result.invalid) throw new AppError('INVITATION_INVALID', '邀请无效或已过期', 400);
     return result.membership;
@@ -292,14 +268,7 @@ export class MembershipService {
     if (!input.reason.trim()) throw new AppError('REASON_REQUIRED', '变更客户导出权限必须填写原因', 400, 'reason');
     return this.transactions.transaction(async (client) => {
       const requestHash = this.changeRequestHash('EXPORT', input.membershipId, String(input.allowed), input.reason.trim());
-      const current = await client.query<MembershipRow & { enterprise_id: string; shop_status: ShopRow['status'] }>(
-        `SELECT sm.*, s.enterprise_id, s.status AS shop_status
-           FROM shop_membership sm JOIN shop s ON s.id = sm.shop_id
-          WHERE sm.id = $1 FOR UPDATE OF sm, s`,
-        [input.membershipId],
-      );
-      const row = current.rows[0];
-      if (!row) throw new AuthorizationError();
+      const row = await this.loadMembershipForChange(client, input.membershipId);
       requireAllowed(
         authorizeShop(
           input.actor,
@@ -377,14 +346,7 @@ export class MembershipService {
     if (!input.reason.trim()) throw new AppError('REASON_REQUIRED', '撤销客户关系必须填写原因', 400, 'reason');
     return this.transactions.transaction(async (client) => {
       const requestHash = this.changeRequestHash('REVOKE', input.membershipId, '', input.reason.trim());
-      const current = await client.query<MembershipRow & { enterprise_id: string; shop_status: ShopRow['status'] }>(
-        `SELECT sm.*, s.enterprise_id, s.status AS shop_status
-           FROM shop_membership sm JOIN shop s ON s.id = sm.shop_id
-          WHERE sm.id = $1 FOR UPDATE OF sm, s`,
-        [input.membershipId],
-      );
-      const row = current.rows[0];
-      if (!row) throw new AuthorizationError();
+      const row = await this.loadMembershipForChange(client, input.membershipId);
       requireAllowed(
         authorizeShop(
           input.actor,
@@ -460,6 +422,29 @@ export class MembershipService {
     return row;
   }
 
+  private async loadMembershipForChange(
+    client: SqlClient,
+    membershipId: string,
+  ): Promise<MembershipRow & { enterprise_id: string; shop_status: ShopRow['status'] }> {
+    const located = await client.query<{ shop_id: string }>(
+      'SELECT shop_id FROM shop_membership WHERE id = $1',
+      [membershipId],
+    );
+    const shopId = located.rows[0]?.shop_id;
+    if (!shopId) throw new AuthorizationError();
+    const shop = await this.loadShop(client, shopId, true);
+    const membership = await client.query<MembershipRow>(
+      `SELECT id, shop_id, account_id, status, export_allowed, authorization_epoch
+         FROM shop_membership
+        WHERE id = $1 AND shop_id = $2
+        FOR UPDATE`,
+      [membershipId, shopId],
+    );
+    const row = membership.rows[0];
+    if (!row) throw new AuthorizationError();
+    return { ...row, enterprise_id: shop.enterprise_id, shop_status: shop.status };
+  }
+
   private invitationToken(invitationId: string): string {
     return createHmac('sha256', this.invitationSecret).update(invitationId).digest('base64url');
   }
@@ -490,38 +475,19 @@ export class MembershipService {
     if (!invitee.role) {
       throw new AppError('ACCOUNT_ROLE_CONFLICT', '该手机号尚未完成平台注册，暂不能激活客户授权', 409);
     }
-    const existingMembership = await client.query<{ id: string; authorization_epoch: string }>(
-      `SELECT id, authorization_epoch::text
-         FROM shop_membership
-        WHERE shop_id = $1 AND account_id = $2
-        FOR UPDATE`,
-      [invitation.shop_id, invitee.id],
-    );
-    const membership = await client.query<MembershipRow>(
-      `INSERT INTO shop_membership
-        (shop_id, account_id, export_allowed, invitation_id, granted_by)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (shop_id, account_id) DO UPDATE
-         SET status = 'ACTIVE', export_allowed = EXCLUDED.export_allowed,
-             authorization_epoch = shop_membership.authorization_epoch + 1,
-             invitation_id = EXCLUDED.invitation_id, granted_by = EXCLUDED.granted_by,
-             granted_at = clock_timestamp(), revoked_at = NULL, revoke_reason = NULL,
-             updated_at = clock_timestamp()
-       RETURNING id, shop_id, account_id, status, export_allowed, authorization_epoch`,
-      [invitation.shop_id, invitee.id, invitation.export_allowed, invitation.id, invitation.invited_by],
-    );
-    const accepted = membership.rows[0];
-    if (!accepted) throw new Error('自动激活客户授权失败');
+    const accepted = await activateShopMembership(client, this.artifactInvalidator, {
+      shopId: invitation.shop_id,
+      accountId: invitee.id,
+      exportAllowed: invitation.export_allowed,
+      invitationId: invitation.id,
+      grantedBy: invitation.invited_by,
+    });
     await client.query(
       `UPDATE shop_invitation
           SET status = 'ACTIVE', accepted_by = $2, accepted_at = clock_timestamp()
         WHERE id = $1 AND status = 'PENDING'`,
       [invitation.id, invitee.id],
     );
-    const previous = existingMembership.rows[0];
-    if (previous && previous.authorization_epoch !== accepted.authorization_epoch) {
-      await this.artifactInvalidator.invalidateForMembership(client, accepted.id, accepted.authorization_epoch);
-    }
     await this.effects.audit(client, {
       actorAccountId: invitee.id,
       actorRoles: [invitee.role ?? 'ACCOUNTANT'],
@@ -532,7 +498,7 @@ export class MembershipService {
       reason: null,
       requestId,
       before: null,
-      after: { shopId: accepted.shop_id, exportAllowed: accepted.export_allowed, automatic: true },
+      after: { shopId: accepted.shopId, exportAllowed: accepted.exportAllowed, automatic: true },
     });
     return 'ACTIVE';
   }

@@ -1,14 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import type { SqlClient, TransactionRunner } from "../authorization/index.js";
-import type { ReportFilter, ReportRouteServices } from "../../api/routes/reports.js";
+import { FEE_CLASSIFICATION_POLICY_SHA256, FEE_CLASSIFICATION_VERSION } from "../calculation/fee-classification.js";
+import type { ReportFilter } from "./publish.js";
 import { INTERMEDIATE_REPORT_COLUMNS, SHIPMENT_AMOUNT_KEYS, type IntermediateFilter, type IntermediateReportKind } from "../../shared/intermediate-report.js";
 import { publishSnapshot, type CalculationRunForPublishing, type PublishStore, type PublishTransaction, type SnapshotManifest, type SnapshotSliceInput } from "./publish.js";
 
 function shaHex(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
-const CALCULATION_FORMULA_VERSION = "revenue-cost-v2";
-const CALCULATION_CODE_VERSION = "local-v4";
+const CALCULATION_FORMULA_VERSION = "revenue-cost-v4";
+const CALCULATION_CODE_VERSION = "local-v6";
 const FX_DATE_RULE_VERSION = "next-business-day-v2";
 
 type ResolvedCalculationRunSlice = {
@@ -75,6 +76,7 @@ class TransactionAdapter implements PublishTransaction {
     const runResult = await this.client.query<{
       id: string; shop_id: string; status: CalculationRunForPublishing["status"]; application_price_version_id: string;
       marketplace_policy_version_id: string; timezone_policy_version: string; formula_version: string; code_version: string;
+      input_manifest: Record<string, unknown>;
     }>("SELECT * FROM calculation_run WHERE id=$1", [runId]);
     const run = runResult.rows[0]; if (!run) return undefined;
     const slices = await this.client.query<{
@@ -85,9 +87,14 @@ class TransactionAdapter implements PublishTransaction {
        LEFT JOIN reconciliation_result rr ON rr.dataset_version_id=rs.dataset_version_id
        WHERE rs.calculation_run_id=$1 ORDER BY rs.dataset_slice_id`, [runId],
     );
+    const rawOverrideIds = run.input_manifest?.fxOverrideIds;
+    if (rawOverrideIds !== undefined && (!Array.isArray(rawOverrideIds) || !rawOverrideIds.every((id) => typeof id === "string"))) {
+      throw new Error("CALCULATION_FX_OVERRIDE_MANIFEST_INVALID");
+    }
     return { id: run.id, shopId: run.shop_id, status: run.status, applicationPriceVersionId: run.application_price_version_id,
       marketplacePolicyVersionId: run.marketplace_policy_version_id, timezonePolicyVersion: run.timezone_policy_version,
       formulaVersion: run.formula_version, codeVersion: run.code_version,
+      ...(rawOverrideIds !== undefined ? { fxOverrideIds: rawOverrideIds as string[] } : {}),
       mappingVersionIds: [...new Set(slices.rows.flatMap((row) => row.mapping_version_ids))],
       slices: slices.rows.map((row) => ({ sliceId: row.dataset_slice_id, datasetVersionId: row.dataset_version_id,
         hardReasons: row.hard_reason_codes, softWarning: row.soft_warning,
@@ -97,6 +104,11 @@ class TransactionAdapter implements PublishTransaction {
   async getCurrentSliceVersions(shopId: string) {
     const result = await this.client.query<{ id: string; current_version_id: string }>("SELECT id,current_version_id FROM dataset_slice WHERE shop_id=$1 AND current_version_id IS NOT NULL", [shopId]);
     return new Map(result.rows.map((row) => [row.id, row.current_version_id]));
+  }
+  async getCurrentFxOverrideIds() {
+    await this.client.query("SELECT pg_advisory_xact_lock(hashtextextended('fx-override:set', 0))");
+    const result = await this.client.query<{ id: string }>("SELECT id FROM fx_current_override ORDER BY id");
+    return result.rows.map((row) => row.id);
   }
   async createSnapshot(input: { shopId: string; calculationRunId: string; actorAccountId: string; manifest: SnapshotManifest }) {
     const run = await this.client.query<{ input_manifest: Record<string, unknown> }>("SELECT input_manifest FROM calculation_run WHERE id=$1", [input.calculationRunId]);
@@ -157,7 +169,7 @@ class StoreAdapter implements PublishStore {
   inTransaction<T>(work: (transaction: PublishTransaction) => Promise<T>) { return this.transactions.transaction((client) => work(new TransactionAdapter(client))); }
 }
 
-export class PostgresReportService implements ReportRouteServices {
+export class PostgresReportService {
   constructor(private readonly transactions: TransactionRunner, private readonly database: SqlClient) {}
 
   async requestCalculation(shopId: string, input: {
@@ -168,9 +180,9 @@ export class PostgresReportService implements ReportRouteServices {
   }) {
     return this.transactions.transaction(async (client) => {
       await client.query("SELECT id FROM shop WHERE id=$1 FOR UPDATE", [shopId]);
-      const slices = await client.query<{ slice_id: string; version_id: string; status: string; mappings: string[]; warning: boolean; hard_ack: string | null; soft_ack: string | null; normalized_marketplace: string; policy_id: string | null; iana_timezone: string | null }>(
+      const slices = await client.query<{ slice_id: string; version_id: string; status: string; mappings: string[]; warning: boolean; hard_ack: string | null; soft_ack: string | null; normalized_marketplace: string; policy_id: string | null; iana_timezone: string | null; date_attribution_mode: string | null }>(
         `SELECT ds.id slice_id,dv.id version_id,dv.status,array_remove(array_agg(DISTINCT b.mapping_version_id),NULL) mappings,
-                ds.normalized_marketplace,policy.id policy_id,policy.iana_timezone,
+                ds.normalized_marketplace,policy.id policy_id,policy.iana_timezone,policy.date_attribution_mode,
                 COALESCE(bool_or(rr.warning),false) warning,
                 (SELECT qa.id FROM quality_acknowledgement qa WHERE qa.dataset_version_id=dv.id
                   AND qa.calculation_run_id IS NULL AND qa.issue_kind='HARD_INCOMPLETE'
@@ -182,17 +194,20 @@ export class PostgresReportService implements ReportRouteServices {
            LEFT JOIN dataset_source_binding b ON b.dataset_version_id=dv.id
            LEFT JOIN reconciliation_result rr ON rr.dataset_version_id=dv.id
            LEFT JOIN LATERAL (
-             SELECT p.id,p.iana_timezone FROM marketplace_policy_version p
+             SELECT p.id,p.iana_timezone,p.date_attribution_mode FROM marketplace_policy_version p
               WHERE p.normalized_marketplace=ds.normalized_marketplace
                 AND p.effective_from<=dv.created_at
                 AND (p.effective_to IS NULL OR p.effective_to>dv.created_at)
               ORDER BY p.effective_from DESC,p.id DESC LIMIT 1
            ) policy ON true
-          WHERE ds.shop_id=$1 GROUP BY ds.id,dv.id,policy.id,policy.iana_timezone ORDER BY ds.id`, [shopId],
+          WHERE ds.shop_id=$1 GROUP BY ds.id,dv.id,policy.id,policy.iana_timezone,policy.date_attribution_mode ORDER BY ds.id`, [shopId],
       );
       if (!slices.rows.length) throw new Error("NO_ACTIVE_DATASET");
-      if (slices.rows.some((row) => !row.policy_id || !row.iana_timezone)) {
+      if (slices.rows.some((row) => !row.policy_id || !row.iana_timezone || !row.date_attribution_mode)) {
         throw new Error("CALCULATION_MARKETPLACE_POLICY_NOT_INITIALIZED");
+      }
+      if (new Set(slices.rows.map((row) => row.date_attribution_mode)).size !== 1) {
+        throw new Error("CALCULATION_DATE_ATTRIBUTION_MODE_MIXED");
       }
       if (input.autoPublish && slices.rows.some((row) => row.status === "INCOMPLETE" && !row.hard_ack)) {
         throw new Error("HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
@@ -205,26 +220,33 @@ export class PostgresReportService implements ReportRouteServices {
                  ORDER BY run.finished_at DESC LIMIT 1) fx_sync_run_id`, [shopId],
       );
       const metadata=meta.rows[0]; if(!metadata?.price_id) throw new Error("CALCULATION_POLICY_NOT_INITIALIZED");
+      const currentOverrides = await client.query<{ id: string }>(
+        `SELECT id FROM fx_current_override ORDER BY id`,
+      );
       const policySet=slices.rows.map((row)=>({sliceId:row.slice_id,normalizedMarketplace:row.normalized_marketplace,
-        marketplacePolicyVersionId:row.policy_id!,ianaTimezone:row.iana_timezone!}));
-      const timezonePolicyVersion=`marketplace-policy-set:${shaHex(JSON.stringify(policySet))}`;
+        marketplacePolicyVersionId:row.policy_id!,ianaTimezone:row.iana_timezone!,dateAttributionMode:row.date_attribution_mode!}));
+      const timezonePolicyVersion=`date-attribution-policy-set:${shaHex(JSON.stringify(policySet))}`;
       const legacyPolicyId=policySet[0]!.marketplacePolicyVersionId;
       const manifestObject={shopId,slices:slices.rows.map((row)=>({sliceId:row.slice_id,versionId:row.version_id,mappings:row.mappings,
         status:row.status,warning:row.warning,hardAcknowledgementId:row.hard_ack,softAcknowledgementId:row.soft_ack,
-        normalizedMarketplace:row.normalized_marketplace,marketplacePolicyVersionId:row.policy_id,ianaTimezone:row.iana_timezone})),
+        normalizedMarketplace:row.normalized_marketplace,marketplacePolicyVersionId:row.policy_id,ianaTimezone:row.iana_timezone,
+        dateAttributionMode:row.date_attribution_mode})),
         applicationPriceVersionId:metadata.price_id,marketplacePolicyVersionId:legacyPolicyId,
         marketplacePolicyVersionIds:[...new Set(policySet.map((policy)=>policy.marketplacePolicyVersionId))].sort(),timezonePolicyVersion,
         formulaVersion:CALCULATION_FORMULA_VERSION,codeVersion:CALCULATION_CODE_VERSION,fxDateRuleVersion:FX_DATE_RULE_VERSION,
+        feeClassificationVersion:FEE_CLASSIFICATION_VERSION,
+        feeClassificationPolicySha256:FEE_CLASSIFICATION_POLICY_SHA256,
         fxSyncRunId:metadata.fx_sync_run_id??"NO_FX_SNAPSHOT",
+        fxOverrideIds:currentOverrides.rows.map((row)=>row.id).sort(),
         ...(input.sourceImportBatchId ? { sourceImportBatchId: input.sourceImportBatchId } : {}),
         ...(input.autoPublish ? { autoPublish: true } : {})};
       const manifest=JSON.stringify(manifestObject);
       const inserted=await client.query<{ id:string;status:string }>(
         `INSERT INTO calculation_run(shop_id,application_price_version_id,marketplace_policy_version_id,timezone_policy_version,
-          formula_version,code_version,status,input_manifest,input_manifest_sha256,requested_by)
-         VALUES($1,$2,$3,$4,$5,$6,'QUEUED',$7::jsonb,digest(($7::jsonb)::text,'sha256'),$8)
+          formula_version,code_version,fee_classification_version,status,input_manifest,input_manifest_sha256,requested_by)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'QUEUED',$8::jsonb,digest(($8::jsonb)::text,'sha256'),$9)
          ON CONFLICT(shop_id,input_manifest_sha256) DO UPDATE SET shop_id=EXCLUDED.shop_id RETURNING id,status`,
-        [shopId,metadata.price_id,legacyPolicyId,timezonePolicyVersion,CALCULATION_FORMULA_VERSION,CALCULATION_CODE_VERSION,manifest,input.actorAccountId],
+        [shopId,metadata.price_id,legacyPolicyId,timezonePolicyVersion,CALCULATION_FORMULA_VERSION,CALCULATION_CODE_VERSION,FEE_CLASSIFICATION_VERSION,manifest,input.actorAccountId],
       );
       const run=inserted.rows[0]; if(!run) throw new Error("CALCULATION_RUN_CREATE_FAILED");
       const bindAcknowledgement = async (sourceId: string | null, issueKind: "HARD_INCOMPLETE" | "SOFT_RECONCILIATION_WARNING") => {
@@ -330,7 +352,7 @@ export class PostgresReportService implements ReportRouteServices {
       calculationRunId: runId,
       shopId: row.shop_id,
       slices: slices.rows.map((slice) => ({ sliceId: slice.slice_id, datasetVersionId: slice.dataset_version_id, disposition: slice.disposition })),
-    }, { actorAccountId, idempotencyKey: `auto-import:${sourceImportBatchId}` });
+    }, { actorAccountId, idempotencyKey: `auto-import:${sourceImportBatchId}:${runId}` }, { snapshotOnly: true });
     return published;
   }
 
@@ -342,14 +364,14 @@ export class PostgresReportService implements ReportRouteServices {
     );
   }
 
-  private async latestIntermediateRun(shopId: string): Promise<{ id: string; enterpriseName: string; status: string } | undefined> {
-    const run = await this.database.query<{ id: string; enterprise_name: string; status: string }>(
-      `SELECT cr.id,cr.status,e.name enterprise_name FROM calculation_run cr
-         JOIN shop s ON s.id=cr.shop_id JOIN enterprise e ON e.id=s.enterprise_id
+  private async latestIntermediateRun(shopId: string): Promise<{ id: string; shopName: string; status: string } | undefined> {
+    const run = await this.database.query<{ id: string; shop_name: string; status: string }>(
+      `SELECT cr.id,cr.status,s.name shop_name FROM calculation_run cr
+         JOIN shop s ON s.id=cr.shop_id
         WHERE cr.shop_id=$1 ORDER BY cr.created_at DESC,cr.id DESC LIMIT 1`, [shopId],
     );
     const row = run.rows[0];
-    return row ? { id: row.id, enterpriseName: row.enterprise_name, status: row.status } : undefined;
+    return row ? { id: row.id, shopName: row.shop_name, status: row.status } : undefined;
   }
 
   async getIntermediate(shopId: string, kind: IntermediateReportKind, limit: number, afterId?: string, filter: IntermediateFilter = {}, runIdOverride?: string, frozenRatesOverride?: ReadonlyMap<string, string>) {
@@ -541,7 +563,7 @@ export class PostgresReportService implements ReportRouteServices {
     );
     if (check.rows.some((row) => row.invalid)) throw new Error("INTERMEDIATE_FX_NOT_FIXED");
     return {
-      enterpriseName: run.enterpriseName,
+      shopName: run.shopName,
       calculationRunId: run.id,
       frozenRates: new Map(check.rows.flatMap((row) => row.cny_rate === null ? [] : [[`${row.requested_date}\0${row.currency}`, row.cny_rate]])),
     };
@@ -553,7 +575,11 @@ export class PostgresReportService implements ReportRouteServices {
     const id=pointer.rows[0]?.published_snapshot_id; if(!id) throw new Error("PUBLISHED_SNAPSHOT_NOT_FOUND");
     return this.reportView(shopId,id,true,filter);
   }
-  async publish(manifest: SnapshotManifest, input: { actorAccountId: string; idempotencyKey: string }) {
+  async publish(
+    manifest: SnapshotManifest,
+    input: { actorAccountId: string; idempotencyKey: string },
+    options: { snapshotOnly?: boolean } = {},
+  ) {
     const snapshotId = await this.transactions.transaction(async (client) => {
       const scope = `report.publish:${manifest.shopId}`;
       const requestHash = shaHex(canonicalManifest(manifest));
@@ -594,6 +620,7 @@ export class PostgresReportService implements ReportRouteServices {
           AND batch.id=(run.input_manifest->>'sourceImportBatchId')::uuid`,
       [manifest.calculationRunId, manifest.shopId],
     );
+    if (options.snapshotOnly) return { snapshotId };
     return this.reportView(manifest.shopId,snapshotId,true);
   }
 

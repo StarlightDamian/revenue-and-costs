@@ -1,7 +1,40 @@
-import { describe, expect, it } from "vitest";
-import { applyTheme, initialTheme, normalizeTheme, THEME_NAMES, THEME_STORAGE_KEY } from "../../src/web/theme";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Me } from "../../src/web/api/types";
+import { acceptSession, clearSession } from "../../src/web/session";
+import {
+  applyTheme,
+  clearPendingThemePreference,
+  initialTheme,
+  normalizeTheme,
+  stageThemePreference,
+  THEME_NAMES,
+  THEME_STORAGE_KEY,
+} from "../../src/web/theme";
+
+const account: Me = {
+  id: "00000000-0000-4000-8000-000000000001",
+  phoneMasked: "138****0000",
+  avatarId: 1,
+  roles: ["ACCOUNTANT"],
+  theme: "comfort",
+  customerShopCount: 0,
+  isFirstLogin: false,
+};
+
+function installThemeDom() {
+  const root = { dataset: {} as DOMStringMap };
+  vi.stubGlobal("document", { documentElement: root });
+  vi.stubGlobal("localStorage", { setItem: vi.fn() });
+  return root;
+}
 
 describe("web theme contract", () => {
+  afterEach(() => {
+    clearSession();
+    clearPendingThemePreference();
+    vi.unstubAllGlobals();
+  });
+
   it("accepts only the four frozen theme ids", () => {
     expect(normalizeTheme("comfort")).toBe("comfort");
     expect(normalizeTheme("tech")).toBe("tech");
@@ -23,5 +56,24 @@ describe("web theme contract", () => {
     applyTheme("tech", root, { setItem: (key, value) => { writes.push([key, value]); } });
     expect(root.dataset.theme).toBe("tech");
     expect(writes).toEqual([[THEME_STORAGE_KEY, "tech"]]);
+  });
+
+  it("keeps a theme explicitly selected on the login page when accepting the session", () => {
+    const root = installThemeDom();
+
+    applyTheme("dark");
+    stageThemePreference("dark");
+    acceptSession(account);
+
+    expect(root.dataset.theme).toBe("dark");
+  });
+
+  it("uses the account preference when there was no anonymous theme selection", () => {
+    const root = installThemeDom();
+
+    applyTheme("dark");
+    acceptSession(account);
+
+    expect(root.dataset.theme).toBe("comfort");
   });
 });

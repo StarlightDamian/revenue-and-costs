@@ -1,5 +1,11 @@
 export type SnapshotSliceDisposition = "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED";
 
+export interface ReportFilter {
+  readonly start?: string;
+  readonly end?: string;
+  readonly marketplace?: string;
+}
+
 export interface CalculationRunSlice {
   readonly sliceId: string;
   readonly datasetVersionId: string;
@@ -19,6 +25,7 @@ export interface CalculationRunForPublishing {
   readonly timezonePolicyVersion: string;
   readonly formulaVersion: string;
   readonly codeVersion: string;
+  readonly fxOverrideIds?: readonly string[];
   readonly slices: readonly CalculationRunSlice[];
 }
 
@@ -42,6 +49,7 @@ export interface PublishTransaction {
   lockShop(shopId: string): Promise<void>;
   getCalculationRun(runId: string): Promise<CalculationRunForPublishing | undefined>;
   getCurrentSliceVersions(shopId: string): Promise<ReadonlyMap<string, string>>;
+  getCurrentFxOverrideIds?(): Promise<readonly string[]>;
   createSnapshot(input: {
     shopId: string;
     calculationRunId: string;
@@ -51,6 +59,16 @@ export interface PublishTransaction {
   createSnapshotSlices(snapshotId: string, slices: readonly SnapshotSliceInput[]): Promise<void>;
   setCurrentSnapshot(shopId: string, snapshotId: string): Promise<void>;
   appendAudit(input: { actorAccountId: string; action: string; objectId: string }): Promise<void>;
+}
+
+function validateCurrentFxOverrides(run: CalculationRunForPublishing, currentIds: readonly string[]): void {
+  if (run.fxOverrideIds === undefined) return;
+  const frozen = [...run.fxOverrideIds].sort();
+  const current = [...currentIds].sort();
+  if (new Set(frozen).size !== frozen.length) throw new Error("PUBLISH_FX_OVERRIDE_MANIFEST_INVALID");
+  if (frozen.length !== current.length || frozen.some((id, index) => id !== current[index])) {
+    throw new Error("PUBLISH_FX_OVERRIDE_SET_STALE");
+  }
 }
 
 function validateManifest(run: CalculationRunForPublishing, manifest: SnapshotManifest, current: ReadonlyMap<string, string>): void {
@@ -100,6 +118,10 @@ export async function publishSnapshot(
     if (!run) throw new Error("CALCULATION_RUN_NOT_FOUND");
     const current = await transaction.getCurrentSliceVersions(input.manifest.shopId);
     validateManifest(run, input.manifest, current);
+    if (run.fxOverrideIds !== undefined) {
+      if (!transaction.getCurrentFxOverrideIds) throw new Error("PUBLISH_FX_OVERRIDE_VALIDATION_UNAVAILABLE");
+      validateCurrentFxOverrides(run, await transaction.getCurrentFxOverrideIds());
+    }
 
     const snapshotId = await transaction.createSnapshot({
       shopId: input.manifest.shopId,

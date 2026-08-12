@@ -33,6 +33,20 @@ pnpm dev:web -- --host 0.0.0.0
 
 Vite 使用 5173 端口，局域网入口以 `.env.local` 中无尾斜杠的 `PUBLIC_ORIGIN` 为准；API 默认为 `http://127.0.0.1:3000`。开发模式的 OTP 与支付均为显式沙箱；不得用于真实交易。
 
+### 一键发布（先演练，后人工确认）
+
+`bin\push.cmd` 是受控的代码制品更新器，不是数据同步工具。首次或每次变更后先运行本地演练：
+
+```powershell
+.\bin\push.cmd -DryRun
+```
+
+演练会执行 `pnpm verify:release`，只打包 `dist/`、`migrations/`、`package.json`、`pnpm-lock.yaml` 与锁文件匹配的既有 Linux x64 生产依赖，并反向扫描禁项；演练在进入任何 `ssh`/`scp` 语句前结束。确认演练结果后，执行 `.\bin\push.cmd`，并按提示输入大写 `PUSH` 才会连接服务器。
+
+发布固定校验 SSH 主机指纹，先上传 `.partial`，再在新版本目录离线校验依赖、比较本地/上一版本/生产库三份迁移文件名与 SHA-256。该入口不接受新增或改写迁移，不上传 `.env*`、`nas/data/`、本地对象存储、测试、Git 元数据、本地 `node_modules` 或数据库转储；因此本地测试数据不会进入制品。远端切换前创建 root-only PostgreSQL 恢复点，原子切换 `current` 后验证 API、Worker 与内外网 live/ready；失败只切回上一代码版本并保留恢复点和失败版本供诊断。服务器已有业务数据、对象存储和配置目录不会被复制或覆盖；后续业务正常使用产生的新数据不属于发布脚本影响。
+
+新增或改写依赖、迁移、服务、Nginx 或生产配置不属于这个一键入口，必须单独审查发布。脚本不会执行管理员初始化、内置映射初始化或“空库”断言。
+
 ### CLI 日志诊断
 
 API 每个请求输出一条 JSON 终态事件，可按页面错误响应中的 `requestId` 或稳定 `errorCode` 检索。启动器同时维护 `.work/startup/current-api.json` 等当前进程清单，`bin/logs.ps1` 只输出诊断白名单字段，不回显请求体、查询值、手机号、验证码、Cookie 或令牌。
@@ -48,16 +62,16 @@ API 每个请求输出一条 JSON 终态事件，可按页面错误响应中的 
 ## 质量门禁
 
 ```powershell
-pnpm test
-pnpm lint
-pnpm typecheck
-pnpm build
+pnpm verify          # 无数据库单元/合约测试 + lint + typecheck + build
+pnpm test:postgres   # 在 TEST_DATABASE_URL 基库中每套件创建并销毁随机 schema
+pnpm test:ui-contract
+pnpm verify:release  # 上述三项的发布总门禁
 ```
 
-需要 PostgreSQL 的集成套件通过各自的 `MIGRATION_TEST_DATABASE_URL`、`AUTH_BILLING_TEST_DATABASE_URL`、`FX_INTEGRATION_DATABASE_URL` 和 `REPORT_ACCEPTANCE_DATABASE_URL` 指向隔离测试库。2GB、浏览器、备份和 PITR 验收脚本写入 `.work/acceptance`，不得指向业务样例目录。
+`pnpm test` 不含数据库套件，也不使用 skip 把缺失环境伪装为通过。常规 PostgreSQL 集成测试只读取 `TEST_DATABASE_URL`，并通过随机 schema + `search_path` 隔离并发套件。会发布快照的报告验收只能显式使用专用 `REPORT_ACCEPTANCE_DATABASE_URL` 运行 `pnpm test:report-acceptance`；恢复演练只能使用独立的 `OPERATIONS_TEST_SOURCE_DATABASE_URL` 和 `OPERATIONS_TEST_RESTORE_DATABASE_URL` 运行 `pnpm test:recovery`。2GB 和 PITR 验收产物写入 `.work/acceptance`，不得指向业务样例目录。
 
 ## 生产停止条件
 
-生产模式必须使用真实短信/支付适配配置、ChinaMoney 官方 HTTPS 接入、独立密钥托管、远端对象副本、异机加密数据库备份与 WAL/PITR、有效域名/TLS，并具备新鲜的恢复演练证据；任一条件缺失时 readiness 失败闭合。`ops/` 仅提供部署配置示例，不会执行部署。
+正式生产模式必须使用真实短信/支付适配配置、ChinaMoney 官方 HTTPS 接入、独立密钥托管、远端对象副本、异机加密数据库备份与 WAL/PITR、有效域名/TLS，并具备新鲜的恢复演练证据；任一条件缺失时 readiness 失败闭合。经用户于 2026-08-10 明确批准的固定码受控试运行是唯一例外：必须显式启用 `TEMPORARY_DEGRADED_PRODUCTION`；启用 `TEMPORARY_PUBLIC_REGISTRATION` 后，任意手机号可用运维侧固定码注册为 `ACCOUNTANT` 并直接进入已登录状态，换绑手机号仍关闭，管理员授权保持应用现有逻辑。`PAYMENT_PROVIDER=temporary-manual` 可开放受控即时到账，但不连接真实支付渠道，也不得表述为外部支付成功；ChinaMoney 仍失败闭合，readiness 返回 `degraded`，不得表述为正式生产就绪。公网不使用额外 Basic Auth，访问控制由 OTP 限流、Origin/CSRF 和会话校验承担。`ops/` 仅提供部署配置示例，不会执行部署。
 
 完整迁移、验收证据和仍需外部解除的门禁见 `nas/doc/2-交付/首版验收报告.md`。

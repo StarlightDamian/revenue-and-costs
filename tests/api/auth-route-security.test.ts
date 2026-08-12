@@ -27,15 +27,31 @@ async function createAuthApp() {
       themeId: "comfort",
       roles: actor.roles,
     },
+    isFirstLogin: false,
+  }));
+  const verifyRegistration = vi.fn(async () => ({
+    expiresAt: "2026-08-04T00:00:00.000Z",
+    sessionToken: "registered-session-token",
+    csrfToken: "registered-csrf-token",
+    account: {
+      id: actor.accountId,
+      displayName: "新注册用户",
+      avatarId: 1,
+      status: "ACTIVE",
+      themeId: "comfort",
+      roles: actor.roles,
+    },
+    isFirstLogin: true,
   }));
   const app = Fastify({ requestIdHeader: "x-request-id" });
   await app.register(cookie);
   await app.register(authRoutes, {
-    auth: { authenticate, logout, changePhone, verifyLogin } as never,
+    auth: { authenticate, logout, changePhone, verifyLogin, verifyRegistration } as never,
     publicOrigin,
     secureCookies: false,
+    cookiePath: "/revenue-costs",
   });
-  return { app, authenticate, logout, changePhone, verifyLogin };
+  return { app, authenticate, logout, changePhone, verifyLogin, verifyRegistration };
 }
 
 describe("auth route CSRF enforcement", () => {
@@ -106,6 +122,67 @@ describe("auth route CSRF enforcement", () => {
       actorRoles: ["ACCOUNTANT"],
       requestId: "phone-change-request-id",
     }));
+    const loginCookies = login.headers["set-cookie"] as string[];
+    expect(loginCookies.find((value) => value.startsWith("rc_session=session-token"))).toContain("Path=/revenue-costs");
+    expect(loginCookies.find((value) => value.startsWith("rc_session=session-token"))).toContain("HttpOnly");
+    expect(loginCookies.find((value) => value.startsWith("rc_csrf=csrf-token"))).toContain("Path=/revenue-costs");
+    expect(loginCookies.some((value) => value.startsWith("rc_session=;") && value.includes("Path=/;"))).toBe(true);
+    expect(loginCookies.some((value) => value.startsWith("rc_csrf=;") && value.includes("Path=/;"))).toBe(true);
+    const changedCookies = changed.headers["set-cookie"] as string[];
+    expect(changedCookies.some((value) => value.startsWith("rc_session=;") && value.includes("Path=/revenue-costs;"))).toBe(true);
+    expect(changedCookies.some((value) => value.startsWith("rc_csrf=;") && value.includes("Path=/revenue-costs;"))).toBe(true);
+    expect(changedCookies.some((value) => value.startsWith("rc_session=;") && value.includes("Path=/;"))).toBe(true);
+    expect(changedCookies.some((value) => value.startsWith("rc_csrf=;") && value.includes("Path=/;"))).toBe(true);
+    await fixture.app.close();
+  });
+
+  it("clears authentication cookies on both the configured and legacy root paths", async () => {
+    const fixture = await createAuthApp();
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: "/api/v1/auth/logout",
+      headers: {
+        cookie: "rc_session=session-token",
+        origin: publicOrigin,
+        "x-csrf-token": "csrf-token",
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const cookies = response.headers["set-cookie"] as string[];
+    expect(cookies.some((value) => value.startsWith("rc_session=;") && value.includes("Path=/revenue-costs;"))).toBe(true);
+    expect(cookies.some((value) => value.startsWith("rc_csrf=;") && value.includes("Path=/revenue-costs;"))).toBe(true);
+    expect(cookies.some((value) => value.startsWith("rc_session=;") && value.includes("Path=/;"))).toBe(true);
+    expect(cookies.some((value) => value.startsWith("rc_csrf=;") && value.includes("Path=/;"))).toBe(true);
+    await fixture.app.close();
+  });
+
+  it("注册成功后在同一响应签发正常会话并记录请求 ID", async () => {
+    const fixture = await createAuthApp();
+    const response = await fixture.app.inject({
+      method: "POST",
+      url: "/api/v1/auth/register",
+      headers: { origin: publicOrigin, "x-request-id": "registration-request-id" },
+      payload: {
+        challengeId: "20000000-0000-4000-8000-000000000002",
+        phone: "+8613800000000",
+        purpose: "REGISTER",
+        code: "246810",
+        displayName: "新注册用户",
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(fixture.verifyRegistration).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: "registration-request-id",
+    }));
+    expect(response.json()).toMatchObject({ isFirstLogin: true, account: { displayName: "新注册用户" } });
+    const cookies = response.headers["set-cookie"] as string[];
+    expect(cookies.find((value) => value.startsWith("rc_session=registered-session-token"))).toContain("Path=/revenue-costs");
+    expect(cookies.find((value) => value.startsWith("rc_session=registered-session-token"))).toContain("HttpOnly");
+    expect(cookies.find((value) => value.startsWith("rc_csrf=registered-csrf-token"))).toContain("Path=/revenue-costs");
+    expect(cookies.some((value) => value.startsWith("rc_session=;") && value.includes("Path=/;"))).toBe(true);
+    expect(cookies.some((value) => value.startsWith("rc_csrf=;") && value.includes("Path=/;"))).toBe(true);
     await fixture.app.close();
   });
 });

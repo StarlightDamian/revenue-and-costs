@@ -15,7 +15,7 @@ const identity = {
   rowNumber: "1",
   rowHash: "hash-1",
   marketplace: "amazon.de",
-  localMonth: "2026-10",
+  localMonth: "2026-09",
   currency: "USD",
   fxDate: "2026-09-30",
 } as const;
@@ -31,13 +31,20 @@ const shipment: ShipmentFact = {
   },
 };
 
-function transaction(id: string, type: string, description: string, overrides: Partial<TransactionFact["amounts"]>): TransactionFact {
+function transaction(
+  id: string,
+  type: string,
+  description: string,
+  overrides: Partial<TransactionFact["amounts"]>,
+  fulfillmentMode: TransactionFact["fulfillmentMode"] = "BLANK",
+): TransactionFact {
   return {
     ...identity,
     id,
     kind: "TRANSACTION",
     type,
     description,
+    fulfillmentMode,
     amounts: {
       productSales: "0", productSalesTax: "0", shippingCredits: "0", shippingCreditsTax: "0",
       giftWrapCredits: "0", giftWrapCreditsTax: "0", regulatoryFee: "0", taxOnRegulatoryFee: "0",
@@ -84,6 +91,70 @@ describe("财务口径 Golden", () => {
     const output = calculateFinancials({ shipments: [], transactions: [[reversal, fx]] });
     expect(output.summary.platformFee).toBe("-35.00000000");
     expect(output.summary.platformBalance).toBe("35.00000000");
+  });
+
+  it("重新规范化历史本地化类型，排除转账并把库存费归入仓储费", () => {
+    const facts = [
+      transaction("jp-transfer", "振込み", "", { other: "-100" }),
+      transaction("nl-transfer", "OVERBOEKING", "", { other: "-10" }),
+      transaction("jp-storage", "FBA_在庫関連の手数料", "", { other: "-8" }),
+      transaction("it-storage", "COSTO_DI_STOCCAGGIO_LOGISTICA_DI_AMAZON", "", { other: "-0.16" }),
+    ] as const;
+    const output = calculateFinancials({
+      shipments: [],
+      transactions: facts.map((fact) => [fact, fx] as const),
+    });
+
+    expect(output.summary.fbaStorageFee).toBe("57.12000000");
+    expect(output.summary.otherDeduction).toBe("0.00000000");
+    expect(output.results.filter((result) => result.component === "FBA_STORAGE_FEE")).toHaveLength(2);
+    expect(output.results.some((result) => result.factId === "jp-transfer" || result.factId === "nl-transfer")).toBe(false);
+  });
+
+  it("精确区分广告扣费和广告退款", () => {
+    const advertising = transaction("jp-advertising", "注文外料金", "広告費用", { otherTransactionFees: "-100" });
+    const refund = transaction("jp-advertising-refund", "注文外料金", "広告費の返金", { otherTransactionFees: "15" });
+    const output = calculateFinancials({ shipments: [], transactions: [[advertising, fx], [refund, fx]] });
+
+    expect(output.summary.advertisingFee).toBe("700.00000000");
+    expect(output.summary.otherDeduction).toBe("-105.00000000");
+  });
+
+  it.each(["Cost of Advertising", "Costo de la publicidad", "Costo della pubblicità", "Gastos de publicidad", "Koszt reklamy", "Prix de la publicité", "広告費用"])(
+    "把已确认的广告描述 %s 精确归入广告费",
+    (description) => {
+      const output = calculateFinancials({
+        shipments: [],
+        transactions: [[transaction(`advertising-${description}`, "Service Fee", description, { otherTransactionFees: "-1" }), fx]],
+      });
+      expect(output.summary.advertisingFee).toBe("7.00000000");
+      expect(output.summary.otherDeduction).toBe("0.00000000");
+    },
+  );
+
+  it("FMB 仅把 Order + MERCHANT 的九个语义金额字段计入收入", () => {
+    const merchantOrder = transaction("merchant-order", "Order", "", {
+      productSales: "100", productSalesTax: "8", shippingCredits: "5", shippingCreditsTax: "0.4",
+      giftWrapCredits: "2", giftWrapCreditsTax: "0.2", regulatoryFee: "0.3",
+      taxOnRegulatoryFee: "0.03", promotionalRebates: "-4", promotionalRebatesTax: "99",
+    }, "MERCHANT");
+    const amazonOrder = transaction("amazon-order", "Order", "", { productSales: "100" }, "AMAZON");
+    const blankOrder = transaction("blank-order", "Order", "", { productSales: "100" });
+    const merchantRefund = transaction("merchant-refund", "Refund", "", { productSales: "-10" }, "MERCHANT");
+
+    const output = calculateFinancials({
+      shipments: [],
+      transactions: [[merchantOrder, fx], [amazonOrder, fx], [blankOrder, fx], [merchantRefund, fx]],
+    });
+
+    expect(output.summary.income).toBe("783.51000000");
+    expect(output.summary.refund).toBe("70.00000000");
+    expect(output.results.filter((result) => result.component === "INCOME").map((result) => result.sourceColumn)).toEqual([
+      "productSales", "productSalesTax", "shippingCredits", "shippingCreditsTax", "giftWrapCredits",
+      "giftWrapCreditsTax", "regulatoryFee", "taxOnRegulatoryFee", "promotionalRebates",
+    ]);
+    expect(output.results.some((result) => result.sourceColumn === "promotionalRebatesTax")).toBe(false);
+    expect(output.results.some((result) => ["amazon-order", "blank-order"].includes(result.factId))).toBe(false);
   });
 
   it("零金额保留显式汇总但不生成无贡献的结果或汇率使用来源", () => {

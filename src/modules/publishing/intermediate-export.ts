@@ -15,13 +15,13 @@ function shortHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 6);
 }
 
-export function intermediateLogicalName(kind: IntermediateReportKind, enterpriseName: string): string {
-  const base = `${kind === "TRANSACTION" ? "交易报告" : "配送货件"}-${enterpriseName}`.replace(/[\\/*?:[\]]/gu, "_").trim() || "中间结果";
+export function intermediateLogicalName(kind: IntermediateReportKind, shopName: string): string {
+  const base = `${kind === "TRANSACTION" ? "交易报告" : "配送货件"}-${shopName}`.replace(/[\\/*?:[\]]/gu, "_").trim() || "中间结果";
   return [...base].length <= 31 ? base : `${[...base].slice(0, 24).join("")}-${shortHash(base)}`;
 }
 
-export function intermediateFileName(kind: IntermediateReportKind, enterpriseName: string): string {
-  const raw = `${kind === "TRANSACTION" ? "交易报告" : "配送货件"}-${enterpriseName}`;
+export function intermediateFileName(kind: IntermediateReportKind, shopName: string): string {
+  const raw = `${kind === "TRANSACTION" ? "交易报告" : "配送货件"}-${shopName}`;
   const stem = [...raw].map((character) => character.charCodeAt(0) < 32 || '<>:"/\\|?*'.includes(character) ? "_" : character).join("").trim() || "中间结果";
   return `${stem}.xlsx`;
 }
@@ -36,14 +36,14 @@ function numericFormula(value: string, scale: 2 | 8): { formula: string } {
 export async function writeIntermediateWorkbook(input: {
   readonly output: Writable;
   readonly kind: IntermediateReportKind;
-  readonly enterpriseName: string;
+  readonly shopName: string;
   readonly rows: AsyncIterable<Record<string, string>>;
 }): Promise<number> {
   const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: input.output as never, useStyles: true, useSharedStrings: false });
   workbook.creator = "revenue-and-costs";
   workbook.calcProperties = { fullCalcOnLoad: true };
   const columns = INTERMEDIATE_REPORT_COLUMNS[input.kind];
-  const sheet = workbook.addWorksheet(intermediateLogicalName(input.kind, input.enterpriseName), {
+  const sheet = workbook.addWorksheet(intermediateLogicalName(input.kind, input.shopName), {
     views: [{ state: "frozen", xSplit: input.kind === "TRANSACTION" ? 3 : 3, ySplit: 1, showGridLines: false }],
   });
   sheet.columns = columns.map((item) => ({ key: item.key, header: item.header, width: item.width }));

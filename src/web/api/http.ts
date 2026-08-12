@@ -28,6 +28,13 @@ function csrfToken(): string | undefined {
   return document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("rc_csrf="))?.slice(8);
 }
 
+export function withAppBasePath(path: string, basePath = import.meta.env.BASE_URL): string {
+  if (!path.startsWith("/") || path.startsWith("//")) throw new Error("Application URLs must be same-origin absolute paths");
+  const normalizedBase = basePath === "/" ? "" : basePath.replace(/\/$/u, "");
+  if (!normalizedBase || path === normalizedBase || path.startsWith(`${normalizedBase}/`)) return path;
+  return `${normalizedBase}${path}`;
+}
+
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const method = (init.method ?? "GET").toUpperCase();
   const headers = new Headers(init.headers);
@@ -42,7 +49,7 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
     if (csrf) headers.set("X-CSRF-Token", decodeURIComponent(csrf));
   }
 
-  const response = await fetch(path, { ...init, method, headers, credentials: "include" });
+  const response = await fetch(withAppBasePath(path), { ...init, method, headers, credentials: "include" });
   const contentType = response.headers.get("content-type") ?? "";
   if (!response.ok) {
     const payload = contentType.includes("application/json") ? await response.clone().json() : undefined;

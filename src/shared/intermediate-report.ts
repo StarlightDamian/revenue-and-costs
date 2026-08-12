@@ -21,7 +21,7 @@ const column = (
 
 export const INTERMEDIATE_REPORT_COLUMNS: Readonly<Record<IntermediateReportKind, readonly IntermediateColumn[]>> = {
   TRANSACTION: [
-    column("id", "行号", "text", 12), column("marketplace", "站点", "text", 12), column("localDate", "当地日期", "date", 14),
+    column("id", "行号", "text", 12), column("marketplace", "站点", "text", 12), column("localDate", "报表日期", "date", 14),
     column("type", "交易类型", "text", 18), column("description", "交易说明", "text", 28), column("orderId", "订单号", "text", 24),
     column("sku", "SKU", "text", 22), column("currency", "币种", "text", 10), column("quantity", "数量", "quantity", 12),
     column("productSales", "商品销售额", "money"), column("productSalesTax", "商品销售税", "money"),
@@ -34,7 +34,7 @@ export const INTERMEDIATE_REPORT_COLUMNS: Readonly<Record<IntermediateReportKind
     column("otherAmount", "其他金额", "money"), column("cnyRate", "人民币汇率", "rate", 16),
   ],
   SHIPMENT: [
-    column("id", "行号", "text", 12), column("marketplace", "站点", "text", 12), column("localDate", "当地日期", "date", 14),
+    column("id", "行号", "text", 12), column("marketplace", "站点", "text", 12), column("localDate", "报表日期", "date", 14),
     column("orderId", "订单号", "text", 24), column("sku", "SKU", "text", 22), column("currency", "币种", "text", 10),
     column("shippedQuantity", "发货数量", "quantity", 12), column("productPrice", "商品价格", "money"),
     column("productTax", "商品税", "money"), column("shippingPrice", "配送费", "money"), column("shippingTax", "配送税", "money"),

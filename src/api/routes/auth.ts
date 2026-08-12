@@ -1,9 +1,9 @@
 import { Type, type Static } from '@sinclair/typebox';
-import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { AppError } from '../../shared/errors.js';
 import { UuidSchema } from '../../shared/contracts.js';
 import type { Actor } from '../../modules/authorization/index.js';
-import type { AuthService, OtpPurpose } from '../../modules/auth/index.js';
+import type { AuthService, OtpPurpose, SessionCredentials } from '../../modules/auth/index.js';
 
 const PhoneSchema = Type.String({ pattern: '^\\+[1-9][0-9]{7,14}$' });
 const OtpRequestSchema = Type.Object({
@@ -48,12 +48,58 @@ export interface AuthRouteOptions {
   readonly auth: AuthService;
   readonly publicOrigin: string;
   readonly secureCookies: boolean;
+  readonly cookiePath: string;
 }
 
 function sessionToken(request: FastifyRequest): string {
   const token = request.cookies.rc_session;
   if (!token) throw new AppError('SESSION_REQUIRED', '请先登录', 401);
   return token;
+}
+
+function sessionResponse(
+  reply: FastifyReply,
+  options: Pick<AuthRouteOptions, 'secureCookies' | 'cookiePath'>,
+  result: SessionCredentials,
+) {
+  // Releases before the app-specific cookie path used Path=/; expire those
+  // legacy cookies so they cannot reappear after logout or account changes.
+  if (options.cookiePath !== '/') {
+    reply.clearCookie('rc_session', { path: '/' });
+    reply.clearCookie('rc_csrf', { path: '/' });
+  }
+  const cookieBase = {
+    path: options.cookiePath,
+    secure: options.secureCookies,
+    sameSite: 'lax' as const,
+    expires: new Date(result.expiresAt),
+  };
+  reply.setCookie('rc_session', result.sessionToken, { ...cookieBase, httpOnly: true });
+  reply.setCookie('rc_csrf', result.csrfToken, { ...cookieBase, httpOnly: false });
+  return {
+    expiresAt: result.expiresAt,
+    isFirstLogin: result.isFirstLogin,
+    account: {
+      id: result.account.id,
+      displayName: result.account.displayName ?? undefined,
+      avatarId: result.account.avatarId,
+      status: result.account.status,
+      themeId: result.account.themeId,
+      roles: [...result.account.roles],
+    },
+  };
+}
+
+function clearSessionCookies(
+  reply: FastifyReply,
+  cookiePath: string,
+): void {
+  reply.clearCookie('rc_session', { path: cookiePath });
+  reply.clearCookie('rc_csrf', { path: cookiePath });
+  if (cookiePath !== '/') {
+    reply.clearCookie('rc_session', { path: '/' });
+    reply.clearCookie('rc_csrf', { path: '/' });
+  }
 }
 
 function requirePublicOrigin(
@@ -126,26 +172,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, opti
         });
       }
       const result = await options.auth.verifyLogin({ ...request.body, requestId: request.id });
-      const cookieBase = {
-        path: '/',
-        secure: options.secureCookies,
-        sameSite: 'lax' as const,
-        expires: new Date(result.expiresAt),
-      };
-      reply.setCookie('rc_session', result.sessionToken, { ...cookieBase, httpOnly: true });
-      reply.setCookie('rc_csrf', result.csrfToken, { ...cookieBase, httpOnly: false });
-      return {
-        expiresAt: result.expiresAt,
-        isFirstLogin: result.isFirstLogin,
-        account: {
-          id: result.account.id,
-          displayName: result.account.displayName ?? undefined,
-          avatarId: result.account.avatarId,
-          status: result.account.status,
-          themeId: result.account.themeId,
-          roles: [...result.account.roles],
-        },
-      };
+      return sessionResponse(reply, options, result);
     },
   );
 
@@ -154,16 +181,15 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, opti
     { schema: { body: RegistrationSchema } },
     async (request, reply) => {
       requirePublicOrigin(options, request);
-      const result = await options.auth.verifyRegistration(request.body);
-      return reply.code(201).send(result);
+      const result = await options.auth.verifyRegistration({ ...request.body, requestId: request.id });
+      return reply.code(201).send(sessionResponse(reply, options, result));
     },
   );
 
   app.post('/api/v1/auth/logout', async (request, reply) => {
     await authenticateAuthRoute(options, request, true);
     await options.auth.logout(sessionToken(request));
-    reply.clearCookie('rc_session', { path: '/' });
-    reply.clearCookie('rc_csrf', { path: '/' });
+    clearSessionCookies(reply, options.cookiePath);
     return { loggedOut: true };
   });
 
@@ -178,8 +204,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, opti
         requestId: request.id,
         ...request.body,
       });
-      reply.clearCookie('rc_session', { path: '/' });
-      reply.clearCookie('rc_csrf', { path: '/' });
+      clearSessionCookies(reply, options.cookiePath);
       return { changed: true, reauthenticationRequired: true };
     },
   );

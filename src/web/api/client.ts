@@ -1,4 +1,4 @@
-import { ApiError, apiFetch, apiRequest } from "./http";
+import { ApiError, apiFetch, apiRequest, withAppBasePath } from "./http";
 import type {
   AdminApp,
   AdminUser,
@@ -8,6 +8,7 @@ import type {
   Enterprise,
   EnterpriseMember,
   ExportJob,
+  FxOverrideInput,
   ImportPreview,
   IntermediateReportPage,
   IntermediateReportSummary,
@@ -21,10 +22,56 @@ import type {
   OperationsOverview,
 } from "./types";
 import type { ThemeId } from "../theme";
-import { normalizeFxConversions, normalizeFxHistory, normalizeFxStatus, normalizeUploadCompletion } from "./financial-contracts";
+import {
+  normalizeFxConversions,
+  normalizeFxHistory,
+  normalizeFxOverrideList,
+  normalizeFxOverrideMutation,
+  normalizeFxStatus,
+  normalizeUploadCompletion,
+} from "./financial-contracts";
 import { sha256Base64 } from "../uploads/checksum";
 
 const json = (value: unknown) => JSON.stringify(value);
+
+function commandIdempotencyKey(prefix: string): string {
+  return globalThis.crypto?.randomUUID?.() ?? `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function createUploadBatchRequest<T>(body: string): Promise<T> {
+  const idempotencyKey = commandIdempotencyKey("upload");
+  const request = () => apiRequest<T>("/api/v1/uploads/batches", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body,
+  });
+  try {
+    return await request();
+  } catch (error) {
+    // A transport failure can happen after the server committed. One replay
+    // with the same key retrieves that committed batch without duplicating it.
+    if (!(error instanceof TypeError)) throw error;
+    return request();
+  }
+}
+
+async function createRechargeRequest(enterpriseId: string, creditAmountCents: string) {
+  const idempotencyKey = commandIdempotencyKey("recharge");
+  const body = json({ enterpriseId, creditAmountCents });
+  const request = () => apiRequest<{ orderId: string; status: string }>("/api/v1/payments/manual/orders", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body,
+  });
+  try {
+    return await request();
+  } catch (error) {
+    // The server may have committed before the response was lost. Replay once
+    // with the same key so the existing order is returned instead of credited twice.
+    if (!(error instanceof TypeError)) throw error;
+    return request();
+  }
+}
 
 export function cnyToCents(value: string): string {
   const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(value.trim());
@@ -45,14 +92,17 @@ function addBillingYears(startDate: string, yearsText: string): string {
 
 export const api = {
   requestOtp: (phone: string, purpose: "REGISTER" | "LOGIN") => apiRequest<{ challengeId: string; expiresAt: string; sandboxCode?: string }>("/api/v1/auth/otp", { method: "POST", body: json({ phone: `+86${phone}`, purpose, deviceId: `web-${phone.slice(-4)}-${purpose.toLowerCase()}` }) }),
-  registerAccount: (challengeId: string, phone: string, code: string, displayName?: string) =>
-    apiRequest<{ accountId: string; displayName?: string; registeredAt: string }>("/api/v1/auth/register", { method: "POST", body: json({ challengeId, phone: `+86${phone}`, code, purpose: "REGISTER", ...(displayName ? { displayName } : {}) }) }),
+  registerAccount: async (challengeId: string, phone: string, code: string, displayName?: string) => {
+    await apiRequest("/api/v1/auth/register", { method: "POST", body: json({ challengeId, phone: `+86${phone}`, code, purpose: "REGISTER", ...(displayName ? { displayName } : {}) }) });
+    return apiRequest<Me>("/api/v1/me");
+  },
   verifyOtp: async (challengeId: string, phone: string, code: string) => {
     await apiRequest("/api/v1/auth/verify", { method: "POST", body: json({ challengeId, phone: `+86${phone}`, code, purpose: "LOGIN" }) });
     return apiRequest<Me>("/api/v1/me");
   },
   logout: () => apiRequest<void>("/api/v1/auth/logout", { method: "POST" }),
   getMe: () => apiRequest<Me>("/api/v1/me"),
+  updateProfile: (displayName: string) => apiRequest<Me>("/api/v1/me/profile", { method: "PATCH", body: json({ displayName }) }),
   updateTheme: (theme: ThemeId) => apiRequest<Me>("/api/v1/me/theme", { method: "PATCH", body: json({ themeId: theme }) }),
   updateAvatar: (avatarId: number) => apiRequest<Me>("/api/v1/me/avatar", { method: "PATCH", body: json({ avatarId }) }),
   getAccountingPreferences: () => apiRequest<AccountingPreferences>("/api/v1/me/accounting-preferences"),
@@ -88,18 +138,43 @@ export const api = {
   getFxStatus: async () => normalizeFxStatus(await apiRequest<unknown>("/api/v1/fx/status")),
   getFxHistory: async (query: URLSearchParams) => normalizeFxHistory(await apiRequest<unknown>(`/api/v1/fx/history?${query}`)),
   convertFx: async (input: { from: string; to: string; lines: string[] }) => normalizeFxConversions(await apiRequest<unknown>("/api/v1/fx/convert-batch", { method: "POST", body: json({ rows: input.lines.map((line) => ({ input: line, fromCurrency: input.from.toUpperCase(), toCurrency: input.to.toUpperCase() })) }) })),
+  listFxOverrides: async () => normalizeFxOverrideList(await apiRequest<unknown>("/api/v1/admin/fx-overrides")),
+  createFxOverride: async (input: FxOverrideInput) => normalizeFxOverrideMutation(await apiRequest<unknown>("/api/v1/admin/fx-overrides", { method: "POST", body: json(input) })),
+  reviseFxOverride: async (overrideId: string, input: FxOverrideInput) => normalizeFxOverrideMutation(await apiRequest<unknown>(`/api/v1/admin/fx-overrides/${encodeURIComponent(overrideId)}/revisions`, { method: "POST", body: json(input) })),
   createUploadBatch: async (shopId: string, files: Array<{ relativePath: string; bytes: string; contentType: string; metadataOnly?: boolean }>) => {
-    const batch = await apiRequest<{ id: string }>("/api/v1/uploads/batches", { method: "POST", body: json({ shopId }) });
-    const registered: Array<{ id: string; relativePath: string; offset: string }> = [];
-    for (const file of files) {
-      const remote = await apiRequest<{ id: string; offset: string }>(`/api/v1/uploads/batches/${encodeURIComponent(batch.id)}/files`, { method: "POST", body: json({ relativePath: file.relativePath, declaredSize: file.bytes, contentType: file.contentType, ...(file.metadataOnly ? { metadataOnly: true } : {}) }) });
-      registered.push({ ...remote, relativePath: file.relativePath });
+    if (files.length === 0) {
+      const batch = await createUploadBatchRequest<{ id: string }>(json({ shopId }));
+      return { id: batch.id, files: [] };
     }
-    return { id: batch.id, files: registered };
+    return createUploadBatchRequest<{ id: string; files: Array<{ id: string; relativePath: string; offset: string }> }>(json({
+        shopId,
+        fileCount: files.length,
+        files: files.map((file) => ({
+          relativePath: file.relativePath,
+          declaredSize: file.bytes,
+          contentType: file.contentType,
+          ...(file.metadataOnly ? { metadataOnly: true } : {}),
+        })),
+      }));
   },
   uploadChunk: async (fileId: string, offset: string, chunk: Blob) => {
-    const checksum = await sha256Base64(await chunk.arrayBuffer());
-    const response = await apiFetch(`/api/v1/uploads/files/${encodeURIComponent(fileId)}`, { method: "PATCH", headers: { "Upload-Offset": offset, "Upload-Checksum": `sha256 ${checksum}`, "Tus-Resumable": "1.0.0", "Content-Type": "application/offset+octet-stream" }, body: chunk });
+    const bytes = await chunk.arrayBuffer();
+    const checksum = await sha256Base64(bytes);
+    const headers: Record<string, string> = { "Upload-Offset": offset, "Upload-Checksum": `sha256 ${checksum}`, "Tus-Resumable": "1.0.0", "Content-Type": "application/offset+octet-stream" };
+    let body = chunk;
+    if (chunk.size >= 64 * 1024 && typeof CompressionStream === "function" && !/(?:^image\/|^audio\/|^video\/|zip|gzip|pdf|officedocument)/iu.test(chunk.type)) {
+      try {
+        const compressed = await new Response(new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"))).blob();
+        if (compressed.size < chunk.size) {
+          body = compressed;
+          headers["Upload-Content-Encoding"] = "gzip";
+          headers["Upload-Uncompressed-Length"] = String(chunk.size);
+        }
+      } catch {
+        // Compression is only a transport optimization; raw resumable upload remains the compatibility path.
+      }
+    }
+    const response = await apiFetch(`/api/v1/uploads/files/${encodeURIComponent(fileId)}`, { method: "PATCH", headers, body });
     return { offset: response.headers.get("Upload-Offset") ?? "" };
   },
   getUploadOffset: async (fileId: string) => {
@@ -135,7 +210,7 @@ export const api = {
   },
   intermediateReportExportUrl: (shopId: string, kind: "TRANSACTION" | "SHIPMENT", filters: URLSearchParams) => {
     const query = new URLSearchParams(filters); query.set("kind", kind);
-    return `/api/v1/reports/shops/${encodeURIComponent(shopId)}/intermediate/export?${query}`;
+    return withAppBasePath(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/intermediate/export?${query}`);
   },
   publishReport: (shopId: string, report: ReportResult) => apiRequest<ReportResult>(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/publish`, { method: "POST", body: json({ calculationRunId: report.runId, slices: report.completeness.map((slice) => ({ sliceId: slice.sliceId, datasetVersionId: slice.datasetVersionId, disposition: slice.disposition })) }) }),
   listExports: (shopId: string) => apiRequest<ExportJob[]>(`/api/v1/exports?shopId=${encodeURIComponent(shopId)}`),
@@ -149,7 +224,10 @@ export const api = {
   createExport: (shopId: string, snapshotId: string, preferences?: AccountingPreferences) => apiRequest<ExportJob>("/api/v1/exports", { method: "POST", body: json({ shopId, snapshotId, ...preferences }) }),
   createCurrentExport: (shopId: string, preferences?: AccountingPreferences) => apiRequest<ExportJob>(`/api/v1/shops/${encodeURIComponent(shopId)}/exports/current`, { method: "POST", body: json(preferences ?? {}) }),
   cancelExport: (id: string) => apiRequest<void>(`/api/v1/exports/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
-  getDownloadUrl: (id: string) => apiRequest<{ url: string }>(`/api/v1/exports/${encodeURIComponent(id)}/download-token`, { method: "POST" }),
+  getDownloadUrl: async (id: string) => {
+    const result = await apiRequest<{ url: string }>(`/api/v1/exports/${encodeURIComponent(id)}/download-token`, { method: "POST" });
+    return { url: withAppBasePath(result.url) };
+  },
   getOperationsReadiness: () => apiRequest<{ ready: boolean; checks: Array<{ name: string; status: "ok" | "blocked"; detail: string }> }>("/api/v1/admin/operations/readiness"),
   getOperationsJobs: async () => (await apiRequest<{ items: OperationsJob[] }>("/api/v1/admin/operations/jobs")).items,
   getOperationsOverview: () => apiRequest<OperationsOverview>("/api/v1/admin/operations/status"),
@@ -158,7 +236,7 @@ export const api = {
     const quote = await apiRequest<{ creditAmountCents: string; payableAmountCents: string; discountBasisPoints: "10000" }>("/api/v1/payments/quote", { method: "POST", body: json({ enterpriseId, creditAmountCents: cnyToCents(amountYuan) }) });
     return { creditCents: quote.creditAmountCents, payableCents: quote.payableAmountCents };
   },
-  createSandboxRecharge: (enterpriseId: string, amountYuan: string) => apiRequest<{ orderId: string; status: string }>("/api/v1/payments/sandbox/orders", { method: "POST", body: json({ enterpriseId, creditAmountCents: cnyToCents(amountYuan) }) }),
+  createRecharge: (enterpriseId: string, amountYuan: string) => createRechargeRequest(enterpriseId, cnyToCents(amountYuan)),
   listAdminUsers: (search: string) => apiRequest<AdminUser[]>(`/api/v1/admin/users?search=${encodeURIComponent(search)}`),
   updateAdminUser: (id: string, input: { action: string; reason: string }) => {
     if (input.action === "DISABLE" || input.action === "ENABLE") return apiRequest<void>(`/api/v1/admin/users/${encodeURIComponent(id)}/status`, { method: "PATCH", body: json({ status: input.action === "DISABLE" ? "DISABLED" : "ACTIVE", reason: input.reason }) });

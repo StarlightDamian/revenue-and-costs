@@ -1,21 +1,31 @@
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresDatabase } from "../../src/db/database.js";
 import type { SqlClient, TransactionRunner } from "../../src/modules/authorization/index.js";
 import { calculateRun } from "../../src/modules/calculation/postgres-runner.js";
 import { PostgresImportService } from "../../src/modules/imports/postgres-service.js";
 import { PostgresReportService } from "../../src/modules/publishing/postgres-service.js";
+import { requireDedicatedTestDatabaseUrl } from "./postgres-harness.js";
 
-const databaseUrl = process.env.REPORT_ACCEPTANCE_DATABASE_URL;
-const describeWithDatabase = databaseUrl ? describe : describe.skip;
+const databaseUrl = requireDedicatedTestDatabaseUrl("REPORT_ACCEPTANCE_DATABASE_URL");
 
-describeWithDatabase("published report acceptance database", () => {
-  const pool = new Pool({ connectionString: databaseUrl });
-  const database = new PostgresDatabase(pool);
-  const imports = new PostgresImportService(database, database);
-  const reports = new PostgresReportService(database, database);
+// This is deliberately a separate gate: it validates a real published dataset whose
+// complete import fixture is too large to duplicate inside the ordinary integration suite.
+describe("published report acceptance database", () => {
+  let pool!: Pool;
+  let database!: PostgresDatabase;
+  let imports!: PostgresImportService;
+  let reports!: PostgresReportService;
 
-  afterAll(async () => { await pool.end(); });
+  beforeAll(() => {
+    pool = new Pool({ connectionString: databaseUrl });
+    database = new PostgresDatabase(pool);
+    imports = new PostgresImportService(database, database);
+    reports = new PostgresReportService(database, database);
+  });
+
+  afterAll(async () => { await pool?.end(); });
 
   it("reads the published pointer and proves calculation result keys are unique", async () => {
     const pointer = await pool.query<{ shop_id: string; published_snapshot_id: string }>(
@@ -91,6 +101,7 @@ describeWithDatabase("published report acceptance database", () => {
   });
 
   it("recalculates and explicitly publishes a canonical snapshot with exact per-slice marketplace policies", async () => {
+    const acceptanceId = randomUUID();
     const target = (await pool.query<{ shop_id: string; owner_account_id: string; published_snapshot_id: string }>(
       `SELECT pointer.shop_id,shop.owner_account_id,pointer.published_snapshot_id
          FROM shop_current_published_snapshot pointer JOIN shop ON shop.id=pointer.shop_id
@@ -121,12 +132,12 @@ describeWithDatabase("published report acceptance database", () => {
         actorAccountId: target.owner_account_id,
         reason: "报告验收确认数量差异",
         confirmations: "2",
-        idempotencyKey: `acceptance-warning-${warning.dataset_version_id}`,
+        idempotencyKey: `acceptance-warning-${acceptanceId}-${warning.dataset_version_id}`,
       });
     }
     const requested = await reports.requestCalculation(target.shop_id, {
       actorAccountId: target.owner_account_id,
-      idempotencyKey: "acceptance-policy-manifest-v1",
+      idempotencyKey: `acceptance-policy-manifest-${acceptanceId}`,
     });
     await calculateRun(pool, requested.runId);
     const slices = await pool.query<{ slice_id: string; dataset_version_id: string; disposition: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED" }>(
@@ -138,16 +149,17 @@ describeWithDatabase("published report acceptance database", () => {
       calculationRunId: requested.runId,
       shopId: target.shop_id,
       slices: slices.rows.map((slice) => ({ sliceId: slice.slice_id, datasetVersionId: slice.dataset_version_id, disposition: slice.disposition })),
-    }, { actorAccountId: target.owner_account_id, idempotencyKey: "acceptance-policy-publish-v1" });
+    }, { actorAccountId: target.owner_account_id, idempotencyKey: `acceptance-policy-publish-${acceptanceId}` });
     const trace = (await pool.query<{ stored_hash: string; canonical_hash: string; recomputed_hash: string; policy_slices: string; total_slices: string }>(
       `SELECT encode(snapshot.manifest_sha256,'hex') stored_hash,
               encode(integrity.canonical_manifest_sha256,'hex') canonical_hash,
               encode(digest(snapshot.manifest::text,'sha256'),'hex') recomputed_hash,
               (SELECT count(*)::text FROM jsonb_array_elements(snapshot.manifest->'slices') slice
                 JOIN marketplace_policy_version policy
-                  ON policy.id=(slice->>'marketplacePolicyVersionId')::uuid
+                 ON policy.id=(slice->>'marketplacePolicyVersionId')::uuid
                  AND policy.normalized_marketplace=slice->>'normalizedMarketplace'
-                 AND policy.iana_timezone=slice->>'ianaTimezone') policy_slices,
+                 AND policy.iana_timezone=slice->>'ianaTimezone'
+                 AND policy.date_attribution_mode=slice->>'dateAttributionMode') policy_slices,
               jsonb_array_length(snapshot.manifest->'slices')::text total_slices
          FROM published_snapshot snapshot
          JOIN published_snapshot_integrity integrity ON integrity.published_snapshot_id=snapshot.id

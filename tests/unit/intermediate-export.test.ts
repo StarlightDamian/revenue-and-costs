@@ -8,7 +8,7 @@ async function workbookBuffer(kind: "TRANSACTION" | "SHIPMENT", row: Record<stri
   const chunks: Buffer[] = [];
   output.on("data", (chunk: Buffer) => chunks.push(chunk));
   async function* rows() { yield row; }
-  await writeIntermediateWorkbook({ output, kind, enterpriseName: "示例企业", rows: rows() });
+  await writeIntermediateWorkbook({ output, kind, shopName: "做账公司", rows: rows() });
   return Buffer.concat(chunks);
 }
 
@@ -22,7 +22,7 @@ describe("intermediate XLSX export", () => {
     });
     const workbook = new ExcelJS.Workbook(); await workbook.xlsx.load(buffer as never);
     const sheet = workbook.worksheets[0]!;
-    expect(sheet.getRow(1).values).toEqual([undefined, "行号", "站点", "当地日期", "订单号", "SKU", "币种", "发货数量", "商品价格", "商品税", "配送费", "配送税", "礼品包装费", "礼品包装税", "商品促销折扣", "配送促销折扣", "人民币汇率", "原币合计", "人民币合计"]);
+    expect(sheet.getRow(1).values).toEqual([undefined, "行号", "站点", "报表日期", "订单号", "SKU", "币种", "发货数量", "商品价格", "商品税", "配送费", "配送税", "礼品包装费", "礼品包装税", "商品促销折扣", "配送促销折扣", "人民币汇率", "原币合计", "人民币合计"]);
     expect(sheet.getCell("D2").value).toBe("'=unsafe");
     expect(sheet.getCell("G2").formula).toBe('ROUND(VALUE("3"),2)');
     expect(sheet.getCell("N2").formula).toBe('ROUND(VALUE("-1.60000000"),2)');
@@ -43,9 +43,9 @@ describe("intermediate XLSX export", () => {
   });
 
   it("sanitizes illegal sheet characters and truncates with a stable hash", () => {
-    const name = intermediateLogicalName("TRANSACTION", "非常长/且包含:非法*字符?的企业名称超过Excel限制");
+    const name = intermediateLogicalName("TRANSACTION", "非常长/且包含:非法*字符?的做账公司名称超过Excel限制");
     expect([...name].length).toBeLessThanOrEqual(31);
     expect(name).not.toMatch(/[\\/*?:[\]]/u);
-    expect(intermediateLogicalName("TRANSACTION", "非常长/且包含:非法*字符?的企业名称超过Excel限制")).toBe(name);
+    expect(intermediateLogicalName("TRANSACTION", "非常长/且包含:非法*字符?的做账公司名称超过Excel限制")).toBe(name);
   });
 });

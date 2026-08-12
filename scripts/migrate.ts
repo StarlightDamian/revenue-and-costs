@@ -1,9 +1,8 @@
 import { migrate } from "../src/db/migrate";
 import { createPool } from "../src/db/pool";
-import { loadConfig } from "../src/shared/config";
+import { maintenanceDatabaseUrl } from "./database-url.js";
 
-const config = loadConfig();
-const pool = createPool(config.databaseUrl);
+const pool = createPool(maintenanceDatabaseUrl(), "cli");
 try {
   const applied = await migrate(pool);
   process.stdout.write(`${JSON.stringify({ applied })}\n`);

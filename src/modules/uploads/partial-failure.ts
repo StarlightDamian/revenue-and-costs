@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTransaction } from "../../db/pool.js";
 import { structuredLog } from "../../shared/structured-logger.js";
+import { releaseArchiveBudgetInTransaction } from "./archive-budget.js";
 
 export const CLIENT_UPLOAD_FAILURE_CODES = [
   "CLIENT_NETWORK_RETRY_EXHAUSTED",
@@ -10,7 +11,7 @@ export const CLIENT_UPLOAD_FAILURE_CODES = [
 ] as const;
 
 export type ClientUploadFailureCode = typeof CLIENT_UPLOAD_FAILURE_CODES[number];
-export type UploadFileFailureCode = ClientUploadFailureCode | `ZIP_${string}` | "UPLOAD_FINALIZE_FAILED";
+export type UploadFileFailureCode = ClientUploadFailureCode | `ZIP_${string}` | "PDF_BODY_UPLOAD_REJECTED" | "UPLOAD_FINALIZE_FAILED";
 
 interface PreflightCounts {
   readonly expected: string;
@@ -132,9 +133,11 @@ export async function recordUploadFileFailure(
       file_status: string;
       batch_status: string;
       import_status: string;
+      archive_reservation_state: "NONE" | "RESERVED" | "COMMITTED";
     }>(
       `SELECT uf.batch_id,ib.id AS import_batch_id,uf.relative_path,uf.temp_path,
-              uf.status AS file_status,ub.status AS batch_status,ib.status AS import_status
+              uf.status AS file_status,ub.status AS batch_status,ib.status AS import_status,
+              uf.archive_reservation_state
          FROM upload_file uf
          JOIN upload_batch ub ON ub.id=uf.batch_id
          JOIN import_batch ib ON ib.upload_batch_id=ub.id
@@ -146,6 +149,9 @@ export async function recordUploadFileFailure(
     if (!row) throw new Error("UPLOAD_FILE_NOT_FOUND");
     if (row.file_status !== "FAILED" && !input.allowedStatuses.includes(row.file_status)) {
       throw new Error("UPLOAD_FILE_NOT_FAILABLE");
+    }
+    if (row.archive_reservation_state === "RESERVED") {
+      await releaseArchiveBudgetInTransaction(tx, { fileId: input.fileId, batchId: row.batch_id });
     }
     if (row.file_status !== "FAILED") {
       await tx.query(

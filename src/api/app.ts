@@ -65,6 +65,10 @@ export async function createApp(deps: ApiDependencies): Promise<FastifyInstance>
   }
   const requestLogStates = new WeakMap<FastifyRequest, RequestLogState>();
   const app = Fastify({
+    // Production traffic reaches this loopback-only listener through nginx.
+    // Trust only that hop so request.ip retains the real client address without
+    // accepting spoofed forwarding headers from arbitrary peers.
+    trustProxy: deps.config.mode === "production" ? ["127.0.0.1", "::1"] : false,
     logController: new LogController({ disableRequestLogging: true }),
     logger: {
       base: { pid: process.pid },
@@ -140,8 +144,13 @@ export async function createApp(deps: ApiDependencies): Promise<FastifyInstance>
   app.get("/health/live", async () => ({ status: "ok", service: "api", time: new Date().toISOString() }));
   app.get("/health/ready", async (_request, reply) => {
     const checks = await operationalReadiness(deps.config, deps.pool);
-    const ready = checks.every((check) => check.status === "ok");
-    return reply.code(ready ? 200 : 503).send({ status: ready ? "ok" : "degraded", service: "api", time: new Date().toISOString(), checks });
+    const blocked = checks.some((check) => check.status === "blocked");
+    const degraded = checks.some((check) => check.status === "degraded");
+    return reply.code(blocked ? 503 : 200).send({
+      status: blocked || degraded ? "degraded" : "ok",
+      service: "api",
+      time: new Date().toISOString(),
+    });
   });
 
   await registerCoreRoutes(app, deps.config, deps.pool);

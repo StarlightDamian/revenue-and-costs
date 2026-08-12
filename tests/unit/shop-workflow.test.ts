@@ -64,6 +64,63 @@ describe("shop workflow step derivation", () => {
     expect(publishing.steps[4]).toMatchObject({ state: "IN_PROGRESS", progress: null });
   });
 
+  it("stops polling when a deterministic FX gap reaches the calculation terminal state", () => {
+    const result = deriveWorkflowSteps(input({
+      batch: batch({
+        status: "FAILED",
+        stage: "CALCULATION_BLOCKED",
+        failureCode: "FX_DATA_GAP",
+        processedFileCount: 10,
+      }),
+      calculation: { status: "FAILED", failureCode: "FX_DATA_GAP" },
+    }));
+
+    expect(result.currentStep).toBe("CALCULATE");
+    expect(result.steps[3]).toMatchObject({ state: "NOT_STARTED", severity: "BLOCKING", blockingCount: 1 });
+    expect(result.steps.some((step) => step.state === "IN_PROGRESS")).toBe(false);
+  });
+
+  it("turns an active background stage into a visible blocker when the worker heartbeat is stale", () => {
+    const result = deriveWorkflowSteps(input({
+      batch: batch({ status: "CALCULATING", stage: "CALCULATION", processedFileCount: 10 }),
+      calculation: { status: "RUNNING", failureCode: null },
+      workerAvailable: false,
+    }));
+
+    expect(result.steps[3]).toMatchObject({ state: "IN_PROGRESS", severity: "BLOCKING", blockingCount: 1 });
+  });
+
+  it("surfaces a terminal job whose original callback still owns the recovery lock", () => {
+    const result = deriveWorkflowSteps(input({
+      batch: batch({ status: "CALCULATING", stage: "CALCULATION", processedFileCount: 10 }),
+      calculation: { status: "RUNNING", failureCode: null },
+      workerAvailable: true,
+      terminalRecoveryBlocked: true,
+    }));
+
+    expect(result.currentStep).toBe("CALCULATE");
+    expect(result.steps[3]).toMatchObject({ state: "IN_PROGRESS", severity: "BLOCKING", blockingCount: 1 });
+  });
+
+  it("blocks an active export when its callback is stuck or the worker heartbeat is stale", () => {
+    const base = {
+      hasPublishedSnapshot: true,
+      latestExport: { id: "export-1", snapshotId: "snapshot-1", status: "RUNNING", progress: "42" },
+    } as const;
+    const recovering = deriveWorkflowSteps(input({ ...base, terminalRecoveryBlocked: true }));
+    const unavailable = deriveWorkflowSteps(input({ ...base, workerAvailable: false }));
+
+    for (const result of [recovering, unavailable]) {
+      expect(result.currentStep).toBe("EXPORT");
+      expect(result.steps[5]).toMatchObject({
+        state: "IN_PROGRESS",
+        severity: "BLOCKING",
+        blockingCount: 1,
+        progress: "42",
+      });
+    }
+  });
+
   it("marks automatic publication failure as blocking", () => {
     const result = deriveWorkflowSteps(input({
       batch: batch({ status: "READY_FOR_REVIEW", stage: "AUTO_PUBLISH_FAILED", failureCode: "AUTO_PUBLISH_FAILED", processedFileCount: 10 }),

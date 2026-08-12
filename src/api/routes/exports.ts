@@ -116,6 +116,8 @@ export const exportRoutes: FastifyPluginAsync<ExportRouteOptions> = async (app, 
       return reply
         .header("Content-Type", file.mediaType)
         .header("Content-Disposition", `attachment; filename="sales-cost.${file.fileName.endsWith(".zip") ? "zip" : "xlsx"}"; filename*=UTF-8''${encodeURIComponent(file.fileName)}`)
+        .header("Content-Length", file.contentLength)
+        .header("X-Accel-Buffering", "no")
         .send(file.stream);
     },
   );

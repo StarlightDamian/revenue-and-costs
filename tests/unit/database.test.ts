@@ -1,6 +1,8 @@
 import type { Pool, PoolClient } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { PostgresDatabase } from "../../src/db/database.js";
+import { createPool } from "../../src/db/pool.js";
+import { REQUIRED_USABLE_CONNECTIONS, STEADY_STATE_CONNECTION_BUDGET } from "../../src/db/connection-budget.js";
 
 function transactionFixture() {
   const release = vi.fn();
@@ -14,6 +16,20 @@ function transactionFixture() {
 }
 
 describe("PostgresDatabase transaction", () => {
+  it("uses purpose-specific bounded pools with observable application names", async () => {
+    const api = createPool("postgresql://example.invalid/test", "api");
+    const worker = createPool("postgresql://example.invalid/test", "worker");
+    const cli = createPool("postgresql://example.invalid/test", "cli");
+
+    expect(api.options).toMatchObject({ max: 2, application_name: "revenue-costs-api" });
+    expect(worker.options).toMatchObject({ max: 3, application_name: "revenue-costs-worker" });
+    expect(cli.options).toMatchObject({ max: 1, application_name: "revenue-costs-cli" });
+
+    await Promise.all([api.end(), worker.end(), cli.end()]);
+    expect(STEADY_STATE_CONNECTION_BUDGET).toBe(6);
+    expect(REQUIRED_USABLE_CONNECTIONS).toBe(17);
+  });
+
   it("commits the work result and releases the connection", async () => {
     const fixture = transactionFixture();
 

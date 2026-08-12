@@ -8,10 +8,15 @@ describe("PostgresFxService", () => {
       void values;
       if (sql.includes("FROM fx_current_quote")) return { rows: [] };
       if (sql.includes("FROM fx_current_market_day")) return { rows: [] };
-      if (sql.includes("FROM fx_override")) return { rows: [] };
+      if (sql.includes("FROM fx_current_override")) return { rows: [] };
       throw new Error(`UNEXPECTED_QUERY:${sql}`);
     });
-    const service = new PostgresFxService({ query } as unknown as SqlClient);
+    const database = { query } as unknown as SqlClient;
+    const service = new PostgresFxService(
+      database,
+      { transaction: async (work) => work(database) },
+      { audit: vi.fn(), outbox: vi.fn() },
+    );
 
     await service.convertBatch([{ input: "2026-08-01", fromCurrency: "USD", toCurrency: "CNY" }]);
 

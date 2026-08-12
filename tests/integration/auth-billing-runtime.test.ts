@@ -1,12 +1,10 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
-import { Pool } from 'pg';
+import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/api/app.js';
-import { migrate } from '../../src/db/migrate.js';
 import type { AppConfig } from '../../src/shared/config.js';
-
-const databaseUrl = process.env.AUTH_BILLING_TEST_DATABASE_URL;
+import { createPostgresTestSchema, type PostgresTestSchema } from './postgres-harness.js';
 
 interface Session { cookie: string; csrf: string }
 interface EnterpriseResponse { id: string; wallet: { balanceCents: string }; profileComplete: boolean }
@@ -14,15 +12,16 @@ interface EnterpriseResponse { id: string; wallet: { balanceCents: string }; pro
 function cookieSession(response: { headers: Record<string, string | number | readonly string[] | undefined> }): Session {
   const raw = response.headers['set-cookie'];
   const lines = Array.isArray(raw) ? raw.map(String) : raw ? [String(raw)] : [];
-  const cookie = lines.map((line) => line.split(';', 1)[0]).join('; ');
-  const csrfLine = lines.find((line) => line.startsWith('rc_csrf='));
-  const csrf = decodeURIComponent(csrfLine?.split(';', 1)[0]?.slice('rc_csrf='.length) ?? '');
-  if (!cookie || !csrf) throw new Error('login cookies missing');
+  const cookiePairs = lines.map((line) => line.split(';', 1)[0] ?? '');
+  const sessionPair = cookiePairs.findLast((pair) => pair.startsWith('rc_session=') && pair !== 'rc_session=');
+  const csrfPair = cookiePairs.findLast((pair) => pair.startsWith('rc_csrf=') && pair !== 'rc_csrf=');
+  const csrf = decodeURIComponent(csrfPair?.slice('rc_csrf='.length) ?? '');
+  if (!sessionPair || !csrfPair || !csrf) throw new Error('login cookies missing');
+  const cookie = `${sessionPair}; ${csrfPair}`;
   return { cookie, csrf };
 }
 
-describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与公司运行时集成', () => {
-  const pool = new Pool({ connectionString: databaseUrl });
+describe.sequential('企业、做账员、企业钱包与公司运行时集成', () => {
   const publicOrigin = 'http://enterprise-runtime.test';
   const suffix = randomInt(10_000_000, 99_999_999).toString();
   const ownerPhone = `+861${suffix}01`;
@@ -30,6 +29,8 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
   const outsiderPhone = `+861${suffix}03`;
   const registrationAdminPhone = `+861${suffix}04`;
   let app: Awaited<ReturnType<typeof createApp>>;
+  let database: PostgresTestSchema | undefined;
+  let pool!: Pool;
   let owner!: Session;
   let invited!: Session;
   let outsider!: Session;
@@ -39,12 +40,13 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
   let companyId = '';
 
   beforeAll(async () => {
-    await migrate(pool);
+    database = await createPostgresTestSchema();
+    pool = database.pool;
     const config: AppConfig = {
-      mode: 'test', host: '127.0.0.1', port: 3000, databaseUrl: databaseUrl!, publicOrigin,
+      mode: 'test', host: '127.0.0.1', port: 3000, databaseUrl: database.connectionString, publicOrigin, appBasePath: '/revenue-costs',
       otpHmacKey: 'otp-test-key-32-bytes-minimum-value',
       sessionHmacKey: 'session-test-key-32-bytes-minimum',
-      paymentProvider: 'sandbox', smsProvider: 'sandbox', sandboxOtpCode: '246810',
+      paymentProvider: 'temporary-manual', smsProvider: 'sandbox', sandboxOtpCode: '246810',
       registrationAdminPhoneE164: registrationAdminPhone,
       chinaMoneyEnabled: false, chinaMoneyEndpointTemplate: undefined,
       chinaMoneyAuthorizationReference: undefined, chinaMoneyFixturePath: undefined,
@@ -57,8 +59,11 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
   });
 
   afterAll(async () => {
-    await app?.close();
-    await pool.end();
+    try {
+      await app?.close();
+    } finally {
+      await database?.cleanup();
+    }
   });
 
   function writeHeaders(session: Session) {
@@ -74,14 +79,15 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
     return response.json<{ challengeId: string; sandboxCode: string }>();
   }
 
-  async function register(phone: string, displayName?: string) {
+  async function register(phone: string, displayName?: string): Promise<Session> {
     const challenge = await requestOtp(phone, 'REGISTER', `${phone.slice(-4)}-register`);
     const response = await app.inject({
       method: 'POST', url: '/api/v1/auth/register', headers: { origin: publicOrigin },
       payload: { challengeId: challenge.challengeId, phone, code: challenge.sandboxCode, purpose: 'REGISTER', ...(displayName ? { displayName } : {}) },
     });
     expect(response.statusCode).toBe(201);
-    expect(response.headers['set-cookie']).toBeUndefined();
+    expect(response.json()).toMatchObject({ isFirstLogin: true });
+    return cookieSession(response);
   }
 
   async function login(phone: string): Promise<Session> {
@@ -115,8 +121,7 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
     expect(unknown.statusCode).toBe(409);
     expect(unknown.json()).toMatchObject({ code: 'ACCOUNT_NOT_REGISTERED' });
 
-    await register(ownerPhone);
-    owner = await login(ownerPhone);
+    owner = await register(ownerPhone);
     const ownerMe = await app.inject({ method: 'GET', url: '/api/v1/me', headers: { cookie: owner.cookie } });
     const ownerBody = ownerMe.json<{ roles: string[]; avatarId: number; wallet?: unknown; displayName?: string }>();
     expect(ownerBody.roles).toEqual(['ACCOUNTANT']);
@@ -178,7 +183,7 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
 
     const topUpKey = `topup-${randomUUID()}`;
     const topUps = await Promise.all([1, 2].map(() => app.inject({
-      method: 'POST', url: '/api/v1/payments/sandbox/orders',
+      method: 'POST', url: '/api/v1/payments/manual/orders',
       headers: { ...writeHeaders(owner), 'idempotency-key': topUpKey },
       payload: { enterpriseId: workingEnterprise.id, creditAmountCents: '20000' },
     })));
@@ -188,12 +193,13 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
     const applications = await app.inject({ method: 'GET', url: '/api/v1/apps', headers: { cookie: owner.cookie } });
     const amazon = applications.json<Array<{ id: string; code: string }>>().find(({ code }) => code === 'amazon-sales-cost');
     expect(amazon).toBeDefined();
+    const originalCompanyName = `运行时公司-${suffix}`;
     const created = await app.inject({
       method: 'POST', url: '/api/v1/shops',
       headers: { ...writeHeaders(owner), 'idempotency-key': `company-${randomUUID()}` },
       payload: {
         enterpriseId: workingEnterprise.id, applicationId: amazon!.id,
-        name: `运行时公司-${suffix}`, startDate: '2026-08-01', requestedCloseDate: '2027-08-01',
+        name: originalCompanyName, startDate: '2026-08-01', requestedCloseDate: '2027-08-01',
       },
     });
     expect(created.statusCode).toBe(200);
@@ -208,7 +214,12 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
       method: 'GET', url: `/api/v1/payments/ledger?enterpriseId=${workingEnterprise.id}`, headers: { cookie: owner.cookie },
     });
     expect(ledger.json()).toEqual([
-      expect.objectContaining({ type: 'SHOP_CHARGE', amountCents: '-18800', balanceAfterCents: '1200' }),
+      expect.objectContaining({
+        type: 'SHOP_CHARGE',
+        amountCents: '-18800',
+        balanceAfterCents: '1200',
+        reference: { type: 'SHOP', id: companyId, name: originalCompanyName, status: 'ACTIVE' },
+      }),
       expect.objectContaining({ type: 'TOP_UP', amountCents: '20000', balanceAfterCents: '20000' }),
     ]);
 
@@ -217,20 +228,59 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
     });
     expect(collaboratorCompanies.statusCode).toBe(200);
     expect(collaboratorCompanies.json()).toEqual([expect.objectContaining({ id: companyId, access: 'ENTERPRISE' })]);
+    const renamedCompanyName = `协同公司-${suffix}`;
     const renamed = await app.inject({
       method: 'PATCH', url: `/api/v1/shops/${companyId}/name`, headers: writeHeaders(invited),
-      payload: { name: `协同公司-${suffix}` },
+      payload: { name: renamedCompanyName },
     });
     expect(renamed.statusCode).toBe(200);
     expect(renamed.json()).toMatchObject({ lastOperatedByAccountId: expect.any(String) });
     expect(renamed.json().lastOperatedByAccountId).not.toBe(company.createdByAccountId);
+    const ledgerAfterRename = await app.inject({
+      method: 'GET', url: `/api/v1/payments/ledger?enterpriseId=${workingEnterprise.id}`, headers: { cookie: owner.cookie },
+    });
+    expect(ledgerAfterRename.json()[0]).toMatchObject({
+      type: 'SHOP_CHARGE',
+      reference: {
+        type: 'SHOP',
+        id: companyId,
+        name: renamedCompanyName,
+        status: 'ACTIVE',
+      },
+    });
 
-    await register(outsiderPhone, '外部做账员');
-    outsider = await login(outsiderPhone);
+    outsider = await register(outsiderPhone, '外部做账员');
     const crossEnterprise = await app.inject({
       method: 'GET', url: `/api/v1/shops?enterpriseId=${workingEnterprise.id}`, headers: { cookie: outsider.cookie },
     });
     expect(crossEnterprise.statusCode).toBe(404);
+
+    const outsiderAccountId = (await pool.query<{ id: string }>(
+      'SELECT id FROM account WHERE phone_e164=$1',
+      [outsiderPhone],
+    )).rows[0]!.id;
+    const insertExport = async (
+      status: 'QUEUED' | 'RUNNING' | 'SUCCEEDED',
+      membershipAuthorizationVersion: string | null,
+    ) => {
+      const id = randomUUID();
+      const stage = status === 'QUEUED' ? 'QUEUED' : status === 'RUNNING' ? 'VALIDATING' : 'SUCCEEDED';
+      await pool.query(
+        `INSERT INTO export_request
+          (id,shop_id,requested_by,published_snapshot_id,membership_authorization_version,status,business_key,
+           expires_at,format_version,continent_prefixes,stage,progress_percent,started_at,finished_at,heartbeat_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()+interval '1 day',
+                'revenue-and-costs-export-v8',ARRAY['EU']::text[],$8,
+                CASE WHEN $6='SUCCEEDED' THEN 100 WHEN $6='RUNNING' THEN 1 ELSE 0 END,
+                CASE WHEN $6<>'QUEUED' THEN clock_timestamp() END,
+                CASE WHEN $6='SUCCEEDED' THEN clock_timestamp() END,
+                CASE WHEN $6<>'QUEUED' THEN clock_timestamp() END)`,
+        [id, companyId, outsiderAccountId, randomUUID(), membershipAuthorizationVersion, status, `membership-activation:${id}`, stage],
+      );
+      return id;
+    };
+
+    const firstActivationExportId = await insertExport('QUEUED', null);
 
     const customerInvitation = await app.inject({
       method: 'POST', url: `/api/v1/shops/${companyId}/invitations`,
@@ -239,6 +289,81 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
     });
     expect(customerInvitation.statusCode).toBe(200);
     expect(customerInvitation.json()).toMatchObject({ status: 'ACTIVE' });
+    const firstMembership = (await pool.query<{ id: string; authorization_epoch: string }>(
+      `SELECT id,authorization_epoch::text
+         FROM shop_membership WHERE shop_id=$1 AND account_id=$2`,
+      [companyId, outsiderAccountId],
+    )).rows[0]!;
+    expect(firstMembership.authorization_epoch).toBe('1');
+    expect((await pool.query<{ status: string }>('SELECT status FROM export_request WHERE id=$1', [firstActivationExportId])).rows[0]?.status)
+      .toBe('QUEUED');
+
+    const staleExportIds = await Promise.all([
+      insertExport('QUEUED', '4'),
+      insertExport('RUNNING', '4'),
+      insertExport('SUCCEEDED', '4'),
+    ]);
+    const staleGrantId = randomUUID();
+    const consumedGrantId = randomUUID();
+    const currentGrantId = randomUUID();
+    for (const [id, version, consumedAt] of [
+      [staleGrantId, '4', null],
+      [consumedGrantId, '4', new Date()],
+      [currentGrantId, '5', null],
+    ] as const) {
+      await pool.query(
+        `INSERT INTO export_download_grant
+          (id,export_request_id,shop_id,account_id,membership_id,membership_authorization_version,
+           token_hash,expires_at,consumed_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()+interval '1 day',$8)`,
+        [id, staleExportIds[2], companyId, outsiderAccountId, firstMembership.id, version, randomUUID().replaceAll('-', '').repeat(2), consumedAt],
+      );
+    }
+    await pool.query('UPDATE shop_membership SET authorization_epoch=4 WHERE id=$1', [firstMembership.id]);
+
+    const reactivation = await app.inject({
+      method: 'POST', url: `/api/v1/shops/${companyId}/invitations`,
+      headers: { ...writeHeaders(owner), 'idempotency-key': `customer-reactivation-${randomUUID()}` },
+      payload: { phone: outsiderPhone, exportAllowed: false },
+    });
+    expect(reactivation.statusCode).toBe(200);
+    const reactivationBody = reactivation.json<{ invitationId: string; status: string }>();
+    expect(reactivationBody.status).toBe('ACTIVE');
+    const reactivated = (await pool.query<{
+      authorization_epoch: string; invitation_status: string; accepted_at: Date | null;
+    }>(
+      `SELECT membership.authorization_epoch::text,invitation.status invitation_status,invitation.accepted_at
+         FROM shop_membership membership
+         JOIN shop_invitation invitation ON invitation.id=membership.invitation_id
+        WHERE membership.id=$1 AND invitation.id=$2`,
+      [firstMembership.id, reactivationBody.invitationId],
+    )).rows[0];
+    expect(reactivated).toMatchObject({ authorization_epoch: '5', invitation_status: 'ACTIVE', accepted_at: expect.any(Date) });
+
+    const staleExports = await pool.query<{ id: string; status: string; stage: string; error_code: string; finished: boolean; heartbeat: boolean }>(
+      `SELECT id::text,status,stage,error_code,finished_at IS NOT NULL finished,heartbeat_at IS NOT NULL heartbeat
+         FROM export_request WHERE id=ANY($1::uuid[]) ORDER BY id`,
+      [staleExportIds],
+    );
+    expect(staleExports.rows).toHaveLength(3);
+    expect(staleExports.rows.every((row) => row.status === 'REVOKED'
+      && row.stage === 'REVOKED'
+      && row.error_code === 'MEMBERSHIP_REVOKED'
+      && row.finished
+      && row.heartbeat)).toBe(true);
+    expect((await pool.query<{ status: string }>('SELECT status FROM export_request WHERE id=$1', [firstActivationExportId])).rows[0]?.status)
+      .toBe('QUEUED');
+    const grantStates = await pool.query<{ id: string; consumed: boolean; revoked: boolean }>(
+      `SELECT id::text,consumed_at IS NOT NULL consumed,revoked_at IS NOT NULL revoked
+         FROM export_download_grant WHERE id=ANY($1::uuid[])`,
+      [[staleGrantId, consumedGrantId, currentGrantId]],
+    );
+    expect(Object.fromEntries(grantStates.rows.map((row) => [row.id, { consumed: row.consumed, revoked: row.revoked }]))).toEqual({
+      [staleGrantId]: { consumed: false, revoked: true },
+      [consumedGrantId]: { consumed: true, revoked: false },
+      [currentGrantId]: { consumed: false, revoked: false },
+    });
+
     const outsiderMe = await app.inject({ method: 'GET', url: '/api/v1/me', headers: { cookie: outsider.cookie } });
     expect(outsiderMe.json()).toMatchObject({ roles: ['ACCOUNTANT'], customerShopCount: 1 });
     const customerCompanies = await app.inject({ method: 'GET', url: '/api/v1/shops', headers: { cookie: outsider.cookie } });
@@ -250,8 +375,7 @@ describe.skipIf(!databaseUrl).sequential('企业、做账员、企业钱包与�
   });
 
   it('管理员免费多年计费写入原价，并在升降级后吊销旧会话且保留客户关系', async () => {
-    await register(registrationAdminPhone, '运行时管理员');
-    administrator = await login(registrationAdminPhone);
+    administrator = await register(registrationAdminPhone, '运行时管理员');
     const applications = await app.inject({ method: 'GET', url: '/api/v1/apps', headers: { cookie: administrator.cookie } });
     const amazon = applications.json<Array<{ id: string; code: string }>>().find(({ code }) => code === 'amazon-sales-cost')!;
     const adminCompany = await app.inject({

@@ -5,6 +5,7 @@ import type { EnterpriseMember } from "../api/types";
 import { currentEnterprise, enterpriseState, loadEnterprises, selectEnterprise } from "../enterprise";
 import { hasPlatformRole } from "../navigation";
 import { session } from "../session";
+import PhoneDisplay from "./PhoneDisplay.vue";
 
 const emit = defineEmits<{ selected: [] }>();
 const creating = ref(false);
@@ -128,7 +129,7 @@ onMounted(async () => { await loadEnterprises(); resetProfileForm(); emit("selec
     <div v-if="membersOpen && currentEnterprise" class="enterprise-members">
       <div class="form-grid three"><label class="form-field"><span>手机号</span><input v-model.trim="memberPhone" maxlength="11" inputmode="numeric" /></label><label class="form-field"><span>姓名或备注（选填）</span><input v-model.trim="memberName" maxlength="80" /></label><button class="primary-button" type="button" :disabled="busy || !currentEnterprise.profileComplete" @click="addMember">新增做账员</button></div>
       <label class="form-field"><span>删除原因</span><input v-model.trim="removeReason" maxlength="1000" placeholder="仅在删除成员时填写" /></label>
-      <div v-if="members.length" class="table-scroll" tabindex="0"><table><thead><tr><th>做账员</th><th>手机号</th><th>状态</th><th>操作</th></tr></thead><tbody><tr v-for="member in members" :key="member.id"><td>{{ member.displayName || "未填写姓名" }}</td><td>{{ member.phoneMasked }}</td><td>{{ member.status === "ACTIVE" ? "已加入" : member.status === "PENDING" ? "待加入" : "已撤销" }}</td><td><button v-if="member.status !== 'REVOKED'" class="secondary-button compact" type="button" :disabled="busy" @click="removeMember(member)">删除</button></td></tr></tbody></table></div>
+      <div v-if="members.length" class="table-scroll" tabindex="0"><table><thead><tr><th>做账员</th><th>手机号</th><th>状态</th><th>操作</th></tr></thead><tbody><tr v-for="member in members" :key="member.id"><td>{{ member.displayName || "未填写姓名" }}</td><td><PhoneDisplay :value="member.phoneMasked" /></td><td>{{ member.status === "ACTIVE" ? "已加入" : member.status === "PENDING" ? "待加入" : "已撤销" }}</td><td><button v-if="member.status !== 'REVOKED'" class="secondary-button compact" type="button" :disabled="busy" @click="removeMember(member)">删除</button></td></tr></tbody></table></div>
     </div>
     <p v-if="enterpriseState.error || error" class="form-error" role="alert">{{ error || enterpriseState.error }}</p>
   </section>

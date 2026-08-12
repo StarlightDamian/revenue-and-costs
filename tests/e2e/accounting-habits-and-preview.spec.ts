@@ -50,11 +50,20 @@ async function mockWorkspace(page: Page) {
   let preferences = { profitRate: "0.04370000", minimumSalesCostRate: "0.15000000", continentPrefixes: ["EU"] };
   let savedPayload: Record<string, unknown> | undefined;
   let previewQuery = "";
+  let failNextExportsRead = false;
+  let delayPreferencesRead = false;
+  let markPreferencesReadStarted: () => void = () => undefined;
+  let releasePreferencesRead: () => void = () => undefined;
+  let preferencesReadStarted = Promise.resolve();
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
   await page.route("**/api/v1/me/accounting-preferences", async (route) => {
     if (route.request().method() === "PATCH") {
       savedPayload = route.request().postDataJSON() as Record<string, unknown>;
       preferences = savedPayload as typeof preferences;
+    } else if (delayPreferencesRead) {
+      markPreferencesReadStarted();
+      await new Promise<void>((resolve) => { releasePreferencesRead = resolve; });
+      delayPreferencesRead = false;
     }
     await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(preferences) });
   });
@@ -81,7 +90,13 @@ async function mockWorkspace(page: Page) {
     publishedSnapshot: { id: snapshotId, publishedAt: "2026-08-02T12:00:00.000Z", stale: false },
     download: { available: true, usesPreviousPublishedVersion: false },
   }) }));
-  await page.route(`**/api/v1/exports?shopId=${shopId}`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route(`**/api/v1/exports?shopId=${shopId}`, (route) => {
+    if (failNextExportsRead) {
+      failNextExportsRead = false;
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ message: "temporary export read failure" }) });
+    }
+    return route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
   await page.route(`**/api/v1/shops/${shopId}/exports/cost-preview**`, (route) => {
     previewQuery = new URL(route.request().url()).search;
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(preview("0.10000000", "0.15000000")) });
@@ -89,6 +104,13 @@ async function mockWorkspace(page: Page) {
   return {
     savedPayload: () => savedPayload,
     previewQuery: () => previewQuery,
+    failNextExportsRead: () => { failNextExportsRead = true; },
+    delayNextPreferencesRead: () => {
+      delayPreferencesRead = true;
+      preferencesReadStarted = new Promise<void>((resolve) => { markPreferencesReadStarted = resolve; });
+    },
+    waitForPreferencesRead: () => preferencesReadStarted,
+    releasePreferencesRead: () => releasePreferencesRead(),
   };
 }
 
@@ -117,9 +139,23 @@ test("做账习惯保存默认参数，报告页带入后可预览最低销售�
   await expect(page.getByRole("definition").filter({ hasText: "15.00%" })).toBeVisible();
   const totalRow = page.locator(".cost-preview tfoot tr");
   await expect(totalRow).toHaveText("全年合计¥1,000.00¥900.00¥700.00¥50.00¥150.0015.00%已触发");
+  state.delayNextPreferencesRead();
+  await page.reload();
+  await state.waitForPreferencesRead();
+  const createExportButton = page.getByRole("button", { name: "生成并下载" });
+  await expect(createExportButton).toBeDisabled();
   await page.getByLabel("利润率（可选）").fill("10");
-  await page.getByRole("button", { name: "预览调整结果" }).click();
+  await page.getByLabel("最低销售成本率（可选）").fill("15");
+  state.releasePreferencesRead();
+  await expect(page.getByLabel("利润率（可选）")).toHaveValue("10");
+  await expect(page.getByLabel("最低销售成本率（可选）")).toHaveValue("15");
   await expect.poll(state.previewQuery).toContain("profitRate=0.10000000");
   await expect.poll(state.previewQuery).toContain("minimumSalesCostRate=0.15000000");
+  await expect(createExportButton).toBeEnabled();
+  state.failNextExportsRead();
+  await page.reload();
+  await page.getByRole("button", { name: "重新读取" }).click();
+  await expect(page.getByLabel("利润率（可选）")).toHaveValue("5.25");
+  await expect(createExportButton).toBeEnabled();
   await page.screenshot({ path: resolve(evidenceDirectory, `preview-${testInfo.project.name}.png`), fullPage: true });
 });

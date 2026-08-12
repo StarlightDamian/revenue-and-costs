@@ -1,6 +1,6 @@
 import ExcelJS from "exceljs";
 import { Temporal } from "@js-temporal/polyfill";
-import { parseChinaMoneyPage, type ChinaMoneyPage, type ChinaMoneyRange, type ChinaMoneySource } from "./chinamoney.js";
+import { parseChinaMoneyPage, readBoundedResponseBody, type ChinaMoneyPage, type ChinaMoneyRange, type ChinaMoneySource } from "./chinamoney.js";
 import { parseUnambiguousDate } from "./date.js";
 import { decimal } from "./decimal.js";
 
@@ -80,12 +80,12 @@ export class ChinaMoneyXlsxSource implements ChinaMoneySource {
         referer: "https://www.chinamoney.com.cn/chinese/bkccpr/index.html?tab=2",
         "user-agent": "Mozilla/5.0",
       },
+      redirect: "manual",
       signal: AbortSignal.timeout(30_000),
     });
+    if (response.status >= 300 && response.status < 400) throw new Error("CHINAMONEY_REDIRECT_REJECTED");
     if (!response.ok) throw new Error(`CHINAMONEY_XLSX_HTTP_${response.status}`);
-    const contentLength = Number(response.headers.get("content-length") ?? "0");
-    if (contentLength > MAX_WORKBOOK_BYTES) throw new Error("CHINAMONEY_XLSX_SIZE_INVALID");
-    const rawBody = new Uint8Array(await response.arrayBuffer());
+    const rawBody = await readBoundedResponseBody(response, MAX_WORKBOOK_BYTES, "CHINAMONEY_XLSX_SIZE_INVALID");
     const parsedWorkbook = await parseChinaMoneyWorkbook(rawBody);
     if (parsedWorkbook.records.some((record) => record["validDate"]! < pageFrom.toString() || record["validDate"]! > pageTo.toString())) {
       throw new Error("CHINAMONEY_XLSX_DATE_OUT_OF_RANGE");

@@ -4,21 +4,28 @@ import { loadConfig } from "../shared/config";
 import {
   createOutboxDispatchScheduler,
   dispatchOutbox,
-  listenForOutboxNotifications,
 } from "./outbox-dispatcher";
 import { EncryptedObjectStore } from "../modules/storage/encrypted-object-store";
-import { pgBossRuntimeOptions, registerHandlers } from "./register-handlers";
+import { registerHandlers } from "./register-handlers";
 import { exportOutputRoot, PostgresExportService } from "../modules/exports/postgres.js";
 import { ChinaMoneyXlsxSource, FixtureChinaMoneySource, HttpChinaMoneySource, curlFetch } from "../modules/fx/index.js";
 import { safeErrorDiagnostic } from "../shared/diagnostics.js";
+import { recordWorkerHeartbeat, startWorkerHeartbeat } from "./service-heartbeat.js";
+import {
+  createTerminalFailureProjector,
+  reconcileTerminalBusinessFailures,
+  startTerminalReconciler,
+} from "./terminal-reconciler.js";
+import { expireUploadStaging } from "../modules/uploads/service.js";
+import { pgBossRuntimeOptions, startPgBoss } from "./pg-boss-runtime.js";
 
 const config = loadConfig();
-const pool = createPool(config.databaseUrl);
+const pool = createPool(config.databaseUrl, "worker");
 const boss = new PgBoss(pgBossRuntimeOptions(config.databaseUrl));
-await boss.start();
+await startPgBoss(boss);
 const rawKey = Buffer.from(config.fileKekBase64, "base64");
 const objectStore = new EncryptedObjectStore(config.storageRoot, rawKey);
-const exportsService = new PostgresExportService(pool, objectStore, exportOutputRoot(process.cwd()));
+const exportsService = new PostgresExportService(pool, objectStore, config.exportOutputRoot ?? exportOutputRoot(process.cwd()));
 const fxSync = config.chinaMoneyEnabled
   ? {
       source: config.chinaMoneyFixturePath
@@ -35,7 +42,19 @@ await registerHandlers(boss, {
   exports: exportsService,
   ...(config.databaseCapacityPath ? { databaseCapacityPath: config.databaseCapacityPath } : {}),
   ...(fxSync ? { fxSync } : {}),
+  ...(config.storageReplicaRoot && config.storageReplicaRoot !== config.storageRoot
+    ? { replication: { root: config.storageReplicaRoot, targetReference: config.storageReplicaRoot } }
+    : {}),
 });
+const reportWorkerHeartbeatError = (error: unknown) => process.stderr.write(`${JSON.stringify({
+  level: "error",
+  time: Date.now(),
+  event: "worker_heartbeat_failed",
+  service: "worker",
+  ...safeErrorDiagnostic(error),
+})}\n`);
+await recordWorkerHeartbeat(pool);
+const workerHeartbeat = startWorkerHeartbeat(pool, reportWorkerHeartbeatError);
 process.stdout.write(`${JSON.stringify({ level: "info", time: Date.now(), event: "worker_started", service: "worker", pid: process.pid, fxSyncEnabled: Boolean(fxSync) })}\n`);
 
 const OUTBOX_BATCH_LIMIT = 50;
@@ -52,22 +71,38 @@ const dispatcher = createOutboxDispatchScheduler(
   OUTBOX_BATCH_LIMIT,
   reportOutboxError,
 );
-let stopOutboxNotifications = async () => {};
-try {
-  stopOutboxNotifications = await listenForOutboxNotifications(pool, dispatcher.wake, reportOutboxError);
-} catch (error) {
-  reportOutboxError(error);
-}
 const timer = setInterval(dispatcher.wake, 1_000);
 timer.unref();
 dispatcher.wake();
+
+const terminalProjector = createTerminalFailureProjector({
+  pool,
+  objectStore,
+  failExport: (exportId, error) => exportsService.fail(exportId, error),
+});
+const reportTerminalReconciliationError = (error: unknown) => process.stderr.write(`${JSON.stringify({
+  level: "error",
+  time: Date.now(),
+  event: "terminal_reconciliation_cycle_failed",
+  service: "worker",
+  ...safeErrorDiagnostic(error),
+})}\n`);
+const terminalReconciler = startTerminalReconciler(
+  async () => {
+    await expireUploadStaging(pool);
+    await reconcileTerminalBusinessFailures(pool, terminalProjector);
+  },
+  reportTerminalReconciliationError,
+);
+terminalReconciler.wake();
 
 let closing = false;
 const close = async (): Promise<void> => {
   if (closing) return;
   closing = true;
   clearInterval(timer);
-  await stopOutboxNotifications();
+  await workerHeartbeat.stop();
+  await terminalReconciler.stop();
   await dispatcher.stop();
   await boss.stop({ graceful: true, timeout: 10_000 });
   await pool.end();

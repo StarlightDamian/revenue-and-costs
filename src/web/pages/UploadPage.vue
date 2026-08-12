@@ -7,8 +7,9 @@ import PageHeader from "../components/PageHeader.vue";
 import { formatBytes } from "../format";
 import { projectCommitCoverage } from "../imports/commit-coverage";
 import { prepareUploadChecksum } from "../uploads/checksum";
-import { collectDroppedFiles, type DroppedFile } from "../uploads/dropped-files";
+import { collectDroppedFiles, mergeFileSelections, type DroppedFile } from "../uploads/dropped-files";
 import { uploadBatchConclusion, uploadFailureMessage, uploadFilesContinuing, type UploadFileItem } from "../uploads/upload-flow";
+import { preflightZipForPdf } from "../uploads/zip-preflight";
 
 const route = useRoute();
 const emit = defineEmits<{ workflowChange: [] }>();
@@ -24,11 +25,25 @@ const completeness = ref<CompletenessSlice[]>([]);
 const exclusionReason = ref("");
 const resuming = ref(false);
 const dragActive = ref(false);
+const checkingSelection = ref(false);
+const restoringLatest = ref(true);
+const selectionNotice = ref("");
 const selectedPaths = new WeakMap<File, string>();
 let pollingGeneration = 0;
+let stateEpoch = 0;
 const totalBytes = computed(() => uploadItems.value.reduce((sum, item) => sum + item.size, 0));
 const accepted = computed(() => files.value.length > 0 && files.value.length <= 20_000 && totalBytes.value <= 2 * 1024 * 1024 * 1024);
-const selectionLocked = computed(() => ["uploading", "preflight", "processing"].includes(status.value));
+const selectionLocked = computed(() => restoringLatest.value
+  || checkingSelection.value
+  || resuming.value
+  || ["uploading", "preflight", "processing"].includes(status.value)
+  || (Boolean(batchId.value) && !preview.value && status.value !== "cancelled"));
+const canStartUpload = computed(() => !restoringLatest.value
+  && !checkingSelection.value
+  && !resuming.value
+  && accepted.value
+  && !batchId.value
+  && ["idle", "error"].includes(status.value));
 const uploadConclusion = computed(() => uploadBatchConclusion(uploadItems.value));
 const canContinue = computed(() => Boolean(batchId.value) && uploadItems.value.some((item) => item.state === "failed"));
 const uploadStateNames = { pending: "等待", uploading: "上传中", complete: "成功", failed: "失败", skipped: "已跳过" } as const;
@@ -79,6 +94,12 @@ const preflightConclusion = computed(() => {
   if (preview.value.status === "PROCESSING") return "正在入库、计算并发布安全快照，完成后客户会自动看到新结果。";
   if (preview.value.status === "PUBLISHED") return "已完成入库、计算和发布，客户现在可以看到新结果。";
   if (preview.value.failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED") return "发现缺失资料。补充文件，或确认排除缺失切片后即可继续。";
+  if (preview.value.failureCode === "CALCULATION_DATE_ATTRIBUTION_MODE_MIXED") return "当前公司仍混有旧日期口径数据；请按相同日期口径完整重传当前数据范围，不能确认绕过。";
+  const fxFailure = /^(FX_DATA_GAP|FX_NO_AVAILABLE_QUOTE)(?::([A-Z]{3}):(\d{4}-\d{2}-\d{2}))?$/u.exec(preview.value.failureCode ?? "");
+  if (fxFailure) {
+    const subject = fxFailure[2] && fxFailure[3] ? `${fxFailure[3]} ${fxFailure[2]}/CNY` : "报表日期对应币种";
+    return `计算所需的 ${subject} 汇率缺失，系统已停止而不是继续等待。请先由管理员依据授权来源补齐汇率，再重新导入。`;
+  }
   if (preview.value.failureCode === "IMPORT_DATABASE_CAPACITY_UNAVAILABLE") return "数据库容量检查配置不可用；配置恢复后可直接重试，无需重新上传。";
   if (preview.value.failureCode === "IMPORT_DATABASE_CAPACITY_INSUFFICIENT") return "数据库可用空间不足；释放空间后可直接重试，无需重新上传。";
   if (preview.value.status === "FAILED") return "处理未完成，请按本页提示处理后重试。";
@@ -91,26 +112,46 @@ const previewStatusLabel = computed(() => ({
 } as Record<string, string>)[preview.value?.status ?? ""] ?? "处理中");
 
 async function acceptSelection(selection: readonly DroppedFile[]) {
-  if (selectionLocked.value) return;
-  pollingGeneration += 1;
-  files.value = selection.map((item) => item.file);
-  for (const item of selection) selectedPaths.set(item.file, item.relativePath);
-  uploadItems.value = files.value.map((file) => ({
-    key: `${relativePath(file)}\0${file.size}\0${file.lastModified}`,
-    path: relativePath(file),
-    size: isMetadataPdf(file) ? 0 : file.size,
-    remoteId: "",
-    source: file,
-    state: "pending",
-  }));
-  batchId.value = "";
-  preview.value = null;
-  status.value = "idle";
-  progress.value = "0";
+  if (selectionLocked.value || selection.length === 0) return;
+  stateEpoch += 1;
+  checkingSelection.value = true;
   error.value = "";
-  if (files.value.length > 20_000) error.value = "单批文件数不能超过 20,000";
-  else if (totalBytes.value > 2 * 1024 * 1024 * 1024) error.value = "单批上传不能超过 2GB";
-  else if (accepted.value) await startUpload();
+  try {
+    for (const item of selection) {
+      if (!/\.zip$/iu.test(item.relativePath) && !/zip/iu.test(item.file.type)) continue;
+      const result = await preflightZipForPdf(item.file);
+      if (!result.allowed) {
+        error.value = result.message;
+        return;
+      }
+    }
+
+    pollingGeneration += 1;
+    const previous = files.value.map((file) => ({ file, relativePath: relativePath(file) }));
+    const merged = mergeFileSelections(previous, selection);
+    files.value = merged.files.map((item) => item.file);
+    for (const item of merged.files) selectedPaths.set(item.file, item.relativePath);
+    uploadItems.value = merged.files.map(({ file, relativePath: path }) => ({
+      key: `${path}\0${file.size}\0${file.lastModified}`,
+      path,
+      size: isMetadataPdf(file) ? 0 : file.size,
+      remoteId: "",
+      source: file,
+      state: "pending",
+    }));
+    batchId.value = "";
+    preview.value = null;
+    completeness.value = [];
+    status.value = "idle";
+    progress.value = "0";
+    const action = previous.length > 0 ? `已追加 ${merged.added} 个文件` : `已选择 ${merged.added} 个文件`;
+    const replacement = merged.replaced > 0 ? `，已用最后一次选择替换 ${merged.replaced} 个同路径文件` : "";
+    selectionNotice.value = `${action}${replacement}；当前共 ${merged.files.length} 个文件，可继续追加，确认后再开始上传。`;
+    if (files.value.length > 20_000) error.value = "单批文件数不能超过 20,000";
+    else if (totalBytes.value > 2 * 1024 * 1024 * 1024) error.value = "单批上传不能超过 2GB";
+  } finally {
+    checkingSelection.value = false;
+  }
 }
 
 async function collect(event: Event) {
@@ -142,27 +183,41 @@ function wait(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-async function refreshPreview(importBatchId = preview.value?.id) {
-  if (!importBatchId) return;
+async function refreshPreview(importBatchId = preview.value?.id, expectedEpoch?: number) {
+  if (!importBatchId) return false;
   const next = await api.getImportPreview(shopId.value, importBatchId);
+  if (expectedEpoch !== undefined && expectedEpoch !== stateEpoch) return false;
+  const nextCompleteness = await api.getCompleteness(shopId.value);
+  if (expectedEpoch !== undefined && expectedEpoch !== stateEpoch) return false;
   preview.value = next;
-  completeness.value = await api.getCompleteness(shopId.value);
+  completeness.value = nextCompleteness;
   if (["QUEUED", "RUNNING"].includes(next.status)) status.value = "preflight";
   else if (next.status === "PROCESSING") status.value = "processing";
   else if (next.status === "FAILED") status.value = "error";
   else if (next.status === "CANCELLED") status.value = "cancelled";
   else status.value = "ready";
   emit("workflowChange");
+  return true;
 }
 
 async function awaitPreview(importBatchId: string) {
   const generation = ++pollingGeneration;
+  let consecutiveFailures = 0;
   while (generation === pollingGeneration) {
     try {
       await refreshPreview(importBatchId);
+      consecutiveFailures = 0;
       error.value = "";
     } catch (caught) {
-      error.value = caught instanceof Error ? `自动刷新失败，正在重试：${caught.message}` : "自动刷新失败，正在重试";
+      consecutiveFailures += 1;
+      const detail = caught instanceof Error ? caught.message : "未知网络错误";
+      if (consecutiveFailures >= 3) {
+        status.value = "error";
+        error.value = `自动刷新连续失败，已停止等待：${detail}。请手动刷新；如仍未恢复，请复制顶部诊断 ID 联系管理员。`;
+        emit("workflowChange");
+        return;
+      }
+      error.value = `自动刷新失败，正在重试（${consecutiveFailures}/3）：${detail}`;
       await wait(1_500);
       continue;
     }
@@ -172,19 +227,26 @@ async function awaitPreview(importBatchId: string) {
 }
 
 async function restoreLatestPreview() {
+  const restoreEpoch = stateEpoch;
   try {
     const latest = await api.getLatestImportPreview(shopId.value);
+    if (restoreEpoch !== stateEpoch) return;
     if (!latest) return;
-    preview.value = latest;
-    await refreshPreview(latest.id);
-    if (preview.value && ["QUEUED", "RUNNING", "PROCESSING"].includes(preview.value.status)) await awaitPreview(latest.id);
+    if (!await refreshPreview(latest.id, restoreEpoch)) return;
+    if (preview.value && ["QUEUED", "RUNNING", "PROCESSING"].includes(preview.value.status)) void awaitPreview(latest.id);
   } catch (caught) {
-    error.value = caught instanceof Error ? `恢复最近批次失败：${caught.message}` : "恢复最近批次失败";
+    if (restoreEpoch !== stateEpoch) return;
+    const detail = caught instanceof Error ? caught.message : "未知网络错误";
+    error.value = `恢复最近批次失败：${detail}。可刷新页面重试；确认没有进行中的批次后，也可继续选择文件。`;
+  } finally {
+    if (restoreEpoch === stateEpoch) restoringLatest.value = false;
   }
 }
 
 async function startUpload() {
-  if (!accepted.value) return;
+  if (restoringLatest.value || !accepted.value) return;
+  stateEpoch += 1;
+  selectionNotice.value = "";
   status.value = "uploading"; error.value = ""; progress.value = "0";
   try {
     if (!batchId.value) {
@@ -195,10 +257,12 @@ async function startUpload() {
         const remote = batch.files.find((candidate) => candidate.relativePath === item.path);
         if (!remote) throw new Error(`服务端未返回文件清单：${item.path}`);
         item.remoteId = remote.id;
+        item.initialOffset = remote.offset;
       }
     }
     const result = await uploadFilesContinuing(uploadItems.value, {
       chunkBytes: 16 * 1024 * 1024,
+      fileConcurrency: 4,
       getOffset: async (remoteId) => (await api.getUploadOffset(remoteId)).offset,
       uploadChunk: api.uploadChunk,
       onProgress: (sent) => { progress.value = totalBytes.value === 0 ? "100" : String(Math.min(100, Math.floor((sent / totalBytes.value) * 100))); },
@@ -245,17 +309,24 @@ async function skipFailedFiles() {
 }
 
 async function retryImport() {
-  if (!preview.value || !retryableCommitFailure.value) return;
+  const currentPreview = preview.value;
+  if (checkingSelection.value || restoringLatest.value || resuming.value || !currentPreview || !retryableCommitFailure.value) return;
+  resuming.value = true;
   try {
-    await api.confirmImport(shopId.value, preview.value.id);
-    preview.value.status = "PROCESSING";
+    await api.confirmImport(shopId.value, currentPreview.id);
+    currentPreview.status = "PROCESSING";
     status.value = "processing";
     emit("workflowChange");
-    void awaitPreview(preview.value.id);
-  } catch (caught) { error.value = caught instanceof Error ? caught.message : "重试入库失败"; }
+    void awaitPreview(currentPreview.id);
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : "重试入库失败";
+  } finally {
+    resuming.value = false;
+  }
 }
 
 async function confirmHardExclusions() {
+  if (checkingSelection.value || restoringLatest.value || resuming.value) return;
   const currentPreview = preview.value;
   const batch = currentPreview?.id;
   if (!currentPreview || !batch || !hardIncompleteSlices.value.length) { error.value = "没有可确认的缺失切片，请刷新状态"; return; }
@@ -280,7 +351,7 @@ async function confirmHardExclusions() {
 }
 
 onMounted(() => { void restoreLatestPreview(); });
-onUnmounted(() => { pollingGeneration += 1; });
+onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
 </script>
 
 <template>
@@ -300,18 +371,20 @@ onUnmounted(() => { pollingGeneration += 1; });
         @drop.prevent="collectDrop"
       >
         <div aria-hidden="true" class="upload-drop-icon">＋</div>
-        <div><strong>拖入文件夹、ZIP 或文件</strong><p>文件夹会递归读取并保留相对路径，选择后立即开始上传，不再追加应用确认。</p></div>
+        <div><strong>拖入文件夹、ZIP 或文件</strong><p>若当前浏览器的原生选择器一次只允许选择一个文件夹，可重复追加；也可一次拖入多个文件夹。直接选择的 PDF 只登记文件名；ZIP 内含 PDF 时会拒绝该 ZIP。</p></div>
         <div class="upload-source-actions">
-          <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">选择文件夹<input type="file" multiple webkitdirectory directory :disabled="selectionLocked" @change="collect" /></label>
-          <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">选择 ZIP 或文件<input type="file" multiple accept=".zip,.csv,.txt,.pdf,.xlsx,.xls" :disabled="selectionLocked" @change="collect" /></label>
+          <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加文件夹" : "选择文件夹" }}<input type="file" multiple webkitdirectory directory :disabled="selectionLocked" @change="collect" /></label>
+          <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加 ZIP 或文件" : "选择 ZIP 或文件" }}<input type="file" multiple accept=".zip,.csv,.txt,.pdf,.xlsx,.xls" :disabled="selectionLocked" @change="collect" /></label>
         </div>
       </div>
       <div v-if="files.length" class="selection-summary"><span>{{ files.length }} 个文件</span><strong>{{ formatBytes(totalBytes) }}</strong><span>上限 20,000 个文件 / 2GB</span></div>
+      <p v-if="restoringLatest" class="action-help" role="status">正在检查最近批次，完成前暂不可选择或开始上传。</p>
+      <p v-if="selectionNotice" class="action-help" role="status">{{ selectionNotice }}</p>
       <div v-if="uploadItems.length" class="file-manifest" role="region" aria-label="待上传文件" tabindex="0"><div v-for="item in uploadItems.slice(0, 200)" :key="item.key"><span>{{ item.path }}</span><b>{{ /\.pdf$/i.test(item.path) ? "仅登记文件名" : formatBytes(item.size) }}</b><span class="status-chip" :data-state="item.state">{{ /\.pdf$/i.test(item.path) && item.state === "complete" ? "未解析" : uploadStateNames[item.state] }}</span><small v-if="item.error">{{ item.error }}</small></div><p v-if="uploadItems.length > 200">另有 {{ uploadItems.length - 200 }} 个文件，服务端仍会校验完整清单。</p></div>
       <p v-if="error && !preview" class="form-error" role="alert">{{ error }}</p>
       <div v-if="status !== 'idle' && !preview" class="warning-panel" :data-tone="uploadConclusion.tone" role="status"><strong>{{ uploadConclusion.title }}</strong><p>{{ uploadConclusion.detail }}</p></div>
       <div v-if="status === 'uploading'" class="upload-progress" role="status" aria-live="polite"><div><span>分片上传 {{ progress }}%</span><b>可在中断后按服务端 offset 续传</b></div><progress :value="Number(progress)" max="100"></progress></div>
-      <div class="form-actions"><button v-if="canContinue" class="primary-button" type="button" @click="startUpload">继续上传</button><button v-if="canContinue" class="secondary-button" type="button" @click="skipFailedFiles">跳过失败并继续</button><button v-if="batchId && ['uploading','preflight','error'].includes(status)" class="secondary-button" type="button" @click="cancel">安全取消</button></div>
+      <div class="form-actions"><button v-if="files.length && !batchId && ['idle','error'].includes(status)" class="primary-button" type="button" :disabled="!canStartUpload" @click="startUpload">{{ status === "error" ? "重试开始上传" : "开始上传" }}</button><button v-if="canContinue" class="primary-button" type="button" @click="startUpload">继续上传</button><button v-if="canContinue" class="secondary-button" type="button" @click="skipFailedFiles">跳过失败并继续</button><button v-if="batchId && ['uploading','preflight','error'].includes(status)" class="secondary-button" type="button" @click="cancel">安全取消</button></div>
     </section>
 
     <section v-if="preview" class="surface-section workflow-commit-panel">
@@ -341,7 +414,7 @@ onUnmounted(() => { pollingGeneration += 1; });
         <label class="form-field"><span>排除原因（选填）</span><textarea v-model="exclusionReason" rows="3" maxlength="1000" placeholder="可补充说明本次排除原因"></textarea></label>
       </section>
       <p v-if="error" class="form-error" role="alert">{{ error }}</p>
-      <div class="stage-next-action"><span class="action-help">{{ requiresHardExclusionConfirmation ? '补充文件，或确认排除后继续处理。' : preview.status === 'PUBLISHED' ? '资料处理完成，可以进入计算复核。' : '系统会继续自动处理，当前状态会在本页更新。' }}</span><button v-if="retryableCommitFailure" class="primary-button" type="button" @click="retryImport">重试入库</button><template v-else-if="requiresHardExclusionConfirmation"><a class="secondary-button" href="#upload-source">补充文件</a><button class="primary-button" type="button" :disabled="resuming" @click="confirmHardExclusions">{{ resuming ? "正在继续" : "确认排除并继续" }}</button></template><a v-else-if="preview.status === 'FAILED'" class="secondary-button" href="#upload-source">补充文件</a><RouterLink v-else-if="preview.status === 'PUBLISHED'" class="primary-button" :to="`/shops/${shopId}/workflow/calculate`">进入计算复核</RouterLink></div>
+      <div class="stage-next-action"><span class="action-help">{{ requiresHardExclusionConfirmation ? '补充文件，或确认排除后继续处理。' : preview.status === 'PUBLISHED' ? '资料处理完成，可以进入计算复核。' : '系统会继续自动处理，当前状态会在本页更新。' }}</span><button v-if="retryableCommitFailure" class="primary-button" type="button" :disabled="checkingSelection || restoringLatest || resuming" @click="retryImport">{{ resuming ? "正在重试" : "重试入库" }}</button><template v-else-if="requiresHardExclusionConfirmation"><a class="secondary-button" href="#upload-source">补充文件</a><button class="primary-button" type="button" :disabled="resuming || checkingSelection || restoringLatest" @click="confirmHardExclusions">{{ resuming ? "正在继续" : "确认排除并继续" }}</button></template><a v-else-if="preview.status === 'FAILED'" class="secondary-button" href="#upload-source">补充文件</a><RouterLink v-else-if="preview.status === 'PUBLISHED'" class="primary-button" :to="`/shops/${shopId}/workflow/calculate`">进入计算复核</RouterLink></div>
     </section>
   </section>
 </template>

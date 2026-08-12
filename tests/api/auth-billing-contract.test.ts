@@ -7,7 +7,7 @@ import { paymentRoutes } from '../../src/api/routes/payments.js';
 import type { Actor } from '../../src/modules/authorization/index.js';
 import {
   PaymentService,
-  SandboxPaymentProvider,
+  TemporaryManualPaymentProvider,
   type PaymentRepository,
   type VerifiedPaymentEvent,
 } from '../../src/modules/payments/index.js';
@@ -22,16 +22,24 @@ const actor: Actor = {
 describe('身份与计费 HTTP 合约', () => {
   it('/me 返回前端使用的主题、掩码手机号、客户店铺数和字符串钱包', async () => {
     const app = Fastify();
+    let displayName = '财务管理员';
+    const csrfRequirements: boolean[] = [];
     await app.register(meRoutes, {
-      authService: { async setTheme() {} } as never,
-      async authenticate() {
+      authService: {
+        async setTheme() {},
+        async setDisplayName(_accountId: string, nextDisplayName: string) {
+          displayName = nextDisplayName;
+        },
+      } as never,
+      async authenticate(_request, requireCsrf) {
+        csrfRequirements.push(requireCsrf);
         return { actor, isFirstLogin: true };
       },
       async getAccount() {
         return {
           id: actor.accountId,
           phoneE164: '+8613800000000',
-          displayName: '财务管理员',
+          displayName,
           registeredAt: new Date('2026-07-28T00:00:00.000Z'),
           avatarId: 24,
           status: 'ACTIVE',
@@ -50,20 +58,39 @@ describe('身份与计费 HTTP 合约', () => {
       id: actor.accountId,
       displayName: '财务管理员',
       avatarId: 24,
-      phoneMasked: '+861****0000',
+      phoneMasked: '+86 138****0000',
       theme: 'comfort',
       roles: ['ACCOUNTANT'],
       customerShopCount: 2,
       customerHomeShopId: '20000000-0000-4000-8000-000000000002',
       isFirstLogin: true,
     });
+    const updated = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/me/profile',
+      payload: { displayName: '更新后的名称' },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(displayName).toBe('更新后的名称');
+    expect(updated.json()).toMatchObject({ displayName: '更新后的名称', phoneMasked: '+86 138****0000' });
+    const emojiName = '😀'.repeat(80);
+    const emojiUpdated = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/me/profile',
+      payload: { displayName: emojiName },
+    });
+    expect(emojiUpdated.statusCode).toBe(200);
+    expect(displayName).toBe(emojiName);
+    expect(csrfRequirements).toEqual([false, true, true]);
     await app.close();
   });
 
-  it('充值报价、账本与沙箱实付使用同一分单位合约', async () => {
+  it('充值报价、账本与受控实付使用同一分单位合约', async () => {
     const applied: VerifiedPaymentEvent[] = [];
+    let createdOrders = 0;
     const repository: PaymentRepository = {
       async createOrder() {
+        createdOrders += 1;
         return { id: '20000000-0000-4000-8000-000000000002', status: 'CREATED', duplicate: false };
       },
       async markOrderPending() {},
@@ -77,7 +104,7 @@ describe('身份与计费 HTTP 合约', () => {
         };
       },
     };
-    const service = new PaymentService(repository, [new SandboxPaymentProvider('merchant', Buffer.alloc(32, 8))]);
+    const service = new PaymentService(repository, [new TemporaryManualPaymentProvider('merchant', Buffer.alloc(32, 8))]);
     const app = Fastify();
     await app.register(paymentRoutes, {
       service,
@@ -123,14 +150,37 @@ describe('身份与计费 HTTP 合约', () => {
     expect(ledger.statusCode).toBe(200);
     expect(ledger.json()[0]).toMatchObject({ amountCents: '1000000' });
 
-    const sandbox = await app.inject({
+    const genericLocalOrder = await app.inject({
+      method: 'POST',
+      url: '/api/v1/payments/orders',
+      headers: { 'idempotency-key': 'generic-local-test-key' },
+      payload: {
+        enterpriseId: '40000000-0000-4000-8000-000000000004',
+        provider: 'SANDBOX',
+        creditAmountCents: '1000000',
+      },
+    });
+    expect(genericLocalOrder.statusCode).toBe(400);
+    expect(createdOrders).toBe(0);
+
+    const disabledSandbox = await app.inject({
       method: 'POST',
       url: '/api/v1/payments/sandbox/orders',
       headers: { 'idempotency-key': 'sandbox-test-key' },
       payload: { enterpriseId: '40000000-0000-4000-8000-000000000004', creditAmountCents: '1000000' },
     });
-    expect(sandbox.statusCode).toBe(200);
-    expect(sandbox.json()).toMatchObject({ status: 'PAID', walletBalanceCents: '1000000' });
+    expect(disabledSandbox.statusCode).toBe(503);
+    expect(createdOrders).toBe(0);
+
+    const manual = await app.inject({
+      method: 'POST',
+      url: '/api/v1/payments/manual/orders',
+      headers: { 'idempotency-key': 'manual-test-key' },
+      payload: { enterpriseId: '40000000-0000-4000-8000-000000000004', creditAmountCents: '1000000' },
+    });
+    expect(manual.statusCode).toBe(200);
+    expect(manual.json()).toMatchObject({ status: 'PAID', walletBalanceCents: '1000000' });
+    expect(createdOrders).toBe(1);
     expect(applied).toHaveLength(1);
     expect(applied[0]).toMatchObject({ amountCents: '1000000', currency: 'CNY' });
     await app.close();
@@ -187,6 +237,7 @@ describe('身份与计费 HTTP 合约', () => {
     const app = Fastify();
     await app.register(adminRoutes, {
       identity: {} as never,
+      fx: {} as never,
       wallet: {
         async listEnterpriseEntries(enterpriseId: string) {
           return [{

@@ -1,16 +1,17 @@
 [Unit]
 Description=Revenue and Costs API
-After=network-online.target postgresql.service
+After=network-online.target postgresql-17.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=revenue-costs
 Group=revenue-costs
-WorkingDirectory=/opt/revenue-and-costs
+WorkingDirectory=/opt/revenue-costs/current
 Environment=NODE_ENV=production
-EnvironmentFile=/etc/revenue-costs/revenue-costs.env
-ExecStart=/usr/bin/node dist/server/api/index.js
+EnvironmentFile=/etc/revenue-and-costs/database-app.env
+EnvironmentFile=/etc/revenue-and-costs/revenue-costs.env
+ExecStart=/opt/revenue-costs/node/bin/node /opt/revenue-costs/current/dist/server/api/index.js
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45

@@ -17,6 +17,7 @@ export interface ChinaMoneyPage {
 
 export interface ChinaMoneySource {
   readonly sourceName: "ChinaMoney" | "ChinaMoneyXlsx" | "ChinaMoneyFixture";
+  readonly pageSize?: number;
   fetchPage(range: ChinaMoneyRange, page: number, pageSize: number): Promise<ChinaMoneyPage>;
 }
 
@@ -37,13 +38,57 @@ function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function records(payload: unknown): readonly Record<string, unknown>[] {
+interface ChinaMoneyRecordSet {
+  readonly rows: readonly Record<string, unknown>[];
+  readonly authoritativeTable: boolean;
+}
+
+function records(payload: unknown): ChinaMoneyRecordSet {
   const root = object(payload);
   const data = object(root?.data);
+  if (Array.isArray(data?.head)) {
+    if (!Array.isArray(root?.records) || !Array.isArray(data.searchlist)) {
+      throw new Error("CHINAMONEY_TABLE_RECORD_INVALID");
+    }
+    const headers = data.head.map((value) => typeof value === "string" ? value.trim().toUpperCase() : "");
+    const searchList = data.searchlist.map((value) => typeof value === "string" ? value.trim().toUpperCase() : "");
+    if (headers.length === 0 || new Set(headers).size !== headers.length
+      || headers.some((header) => !/^(?:\d+)?[A-Z]{3}\/[A-Z]{3}$/u.test(header))
+      || searchList.length !== headers.length
+      || searchList.some((header, index) => header !== headers[index])) {
+      throw new Error("CHINAMONEY_TABLE_HEADER_INVALID");
+    }
+    const seenDates = new Set<string>();
+    const rows = root.records.map((value) => {
+      const row = object(value);
+      if (!row || typeof row.date !== "string" || !Array.isArray(row.values) || row.values.length !== headers.length) {
+        throw new Error("CHINAMONEY_TABLE_RECORD_INVALID");
+      }
+      const validDate = parseUnambiguousDate(row.date);
+      if (!validDate) throw new Error("CHINAMONEY_TABLE_RECORD_INVALID");
+      if (seenDates.has(validDate)) throw new Error("CHINAMONEY_TABLE_DUPLICATE_DATE");
+      seenDates.add(validDate);
+      const normalized: Record<string, unknown> = { validDate };
+      for (const [index, header] of headers.entries()) {
+        const rawValue = row.values[index];
+        if (typeof rawValue !== "string") throw new Error("CHINAMONEY_TABLE_RATE_INVALID");
+        const value = rawValue.trim();
+        if (/^-+$/u.test(value)) continue;
+        const parsedRate = rate(value);
+        if (!parsedRate) throw new Error("CHINAMONEY_TABLE_RATE_INVALID");
+        normalized[header] = value;
+      }
+      return normalized;
+    });
+    return { rows, authoritativeTable: true };
+  }
   const candidates = [root?.records, data?.records, data?.result, root?.result, root?.data];
   const found = candidates.find(Array.isArray);
   if (!found) throw new Error("CHINAMONEY_RECORDS_NOT_FOUND");
-  return found.map(object).filter((row): row is Record<string, unknown> => Boolean(row));
+  return {
+    rows: found.map(object).filter((row): row is Record<string, unknown> => Boolean(row)),
+    authoritativeTable: false,
+  };
 }
 
 function recordDate(row: Record<string, unknown>): string {
@@ -76,7 +121,8 @@ function rate(value: unknown): string | undefined {
 
 export function parseChinaMoneyPage(payload: unknown): ParsedChinaMoneyPage {
   const quotes: ChinaMoneyQuoteRecord[] = [];
-  for (const row of records(payload)) {
+  const recordSet = records(payload);
+  for (const row of recordSet.rows) {
     const validDate = recordDate(row);
     const longPair = typeof row.currencyPair === "string" ? pair(row.currencyPair)
       : typeof row.pair === "string" ? pair(row.pair) : undefined;
@@ -102,7 +148,9 @@ export function parseChinaMoneyPage(payload: unknown): ParsedChinaMoneyPage {
     ? rawNonTrading.map((value) => typeof value === "string" ? parseUnambiguousDate(value) : undefined)
       .filter((value): value is string => Boolean(value))
     : [];
-  if (unique.size === 0 && explicitNonTradingDates.length === 0) throw new Error("CHINAMONEY_QUOTES_NOT_FOUND");
+  if (unique.size === 0 && explicitNonTradingDates.length === 0 && !recordSet.authoritativeTable) {
+    throw new Error("CHINAMONEY_QUOTES_NOT_FOUND");
+  }
   return { quotes: [...unique.values()], explicitNonTradingDates };
 }
 
@@ -113,6 +161,41 @@ function pageCount(payload: unknown): number | undefined {
     if (Number.isInteger(number) && number >= 1) return number;
   }
   return undefined;
+}
+
+const MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+export async function readBoundedResponseBody(response: Response, maxBytes: number, errorCode: string): Promise<Uint8Array> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const value = Number(declared);
+    if (!Number.isSafeInteger(value) || value < 0 || value > maxBytes) throw new Error(errorCode);
+  }
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel(errorCode);
+        throw new Error(errorCode);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 export class HttpChinaMoneySource implements ChinaMoneySource {
@@ -127,9 +210,17 @@ export class HttpChinaMoneySource implements ChinaMoneySource {
     const url = this.endpointTemplate
       .replaceAll("{from}", encodeURIComponent(range.from)).replaceAll("{to}", encodeURIComponent(range.to))
       .replaceAll("{page}", String(page)).replaceAll("{pageSize}", String(pageSize));
-    const response = await this.fetcher(url, { method: "GET", headers: { accept: "application/json" }, signal: AbortSignal.timeout(30_000) });
-    const rawBody = await response.text();
+    const response = await this.fetcher(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      redirect: "manual",
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (response.status >= 300 && response.status < 400) throw new Error("CHINAMONEY_REDIRECT_REJECTED");
     if (!response.ok) throw new Error(`CHINAMONEY_HTTP_${response.status}`);
+    const rawBody = new TextDecoder("utf-8", { fatal: true }).decode(
+      await readBoundedResponseBody(response, MAX_JSON_RESPONSE_BYTES, "CHINAMONEY_RESPONSE_SIZE_INVALID"),
+    );
     let payload: unknown;
     try { payload = JSON.parse(rawBody); } catch { throw new Error("CHINAMONEY_RESPONSE_NOT_JSON"); }
     const parsed = parseChinaMoneyPage(payload);

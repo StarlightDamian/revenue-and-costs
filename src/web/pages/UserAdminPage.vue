@@ -5,6 +5,7 @@ import type { AdminUser } from "../api/types";
 import { avatarById } from "../avatars";
 import AsyncState from "../components/AsyncState.vue";
 import PageHeader from "../components/PageHeader.vue";
+import PhoneDisplay from "../components/PhoneDisplay.vue";
 import { useAsyncResource } from "../composables/useAsyncResource";
 
 const search = ref("");
@@ -61,7 +62,7 @@ async function act(user: AdminUser, action: string) {
                     <img
                       :src="avatarById(user.avatarId).src"
                       alt=""
-                    ><div><strong>{{ user.displayName || "未设置名称" }}</strong><small>{{ user.phoneMasked }}</small></div>
+                    ><div><strong>{{ user.displayName || "未设置名称" }}</strong><small><PhoneDisplay :value="user.phoneMasked" /></small></div>
                   </div>
                 </td><td>{{ roleLabel(user) }}</td><td>{{ user.status }}</td><td class="numeric">
                   {{ user.enterpriseCount }}

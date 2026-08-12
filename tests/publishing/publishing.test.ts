@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { publishSnapshot, type PublishStore, type PublishTransaction } from "../../src/modules/publishing";
 
-function store(options?: { failSliceInsert?: boolean; currentVersion?: string; sliceCount?: number }): {
+function store(options?: { failSliceInsert?: boolean; currentVersion?: string; sliceCount?: number; runFxOverrides?: string[]; currentFxOverrides?: string[] }): {
   store: PublishStore;
   state: { current: string; snapshots: string[] };
   calls: { sliceWrites: number };
@@ -20,9 +20,11 @@ function store(options?: { failSliceInsert?: boolean; currentVersion?: string; s
       id: "run-1", shopId: "shop-1", status: "READY", applicationPriceVersionId: "price-1",
       mappingVersionIds: ["map-1"], marketplacePolicyVersionId: "policy-1", timezonePolicyVersion: "tz-1",
       formulaVersion: "formula-1", codeVersion: "code-1",
+      ...(options?.runFxOverrides ? { fxOverrideIds: options.runFxOverrides } : {}),
       slices,
     }),
     getCurrentSliceVersions: async () => new Map(slices.map((slice, index) => [slice.sliceId, index === 0 ? options?.currentVersion ?? slice.datasetVersionId : slice.datasetVersionId])),
+    getCurrentFxOverrideIds: async () => options?.currentFxOverrides ?? [],
     createSnapshot: async () => { state.snapshots.push("snapshot-new"); return "snapshot-new"; },
     createSnapshotSlices: async () => { calls.sliceWrites += 1; if (options?.failSliceInsert) throw new Error("INJECTED_FAILURE"); },
     setCurrentSnapshot: async (_shop, snapshot) => { state.current = snapshot; },
@@ -57,6 +59,14 @@ describe("显式发布", () => {
   it("数据版本已变化时拒绝发布，旧快照保持当前", async () => {
     const fixture = store({ currentVersion: "version-2" });
     await expect(publishSnapshot(fixture.store, { actorAccountId: "owner-1", manifest })).rejects.toThrow("PUBLISHED_DATASET_VERSION_STALE");
+    expect(fixture.state.current).toBe("snapshot-old");
+  });
+
+  it("人工汇率集合已修订时拒绝旧运行发布，旧快照保持当前", async () => {
+    const fixture = store({ runFxOverrides: ["fx-old"], currentFxOverrides: ["fx-new"] });
+
+    await expect(publishSnapshot(fixture.store, { actorAccountId: "owner-1", manifest }))
+      .rejects.toThrow("PUBLISH_FX_OVERRIDE_SET_STALE");
     expect(fixture.state.current).toBe("snapshot-old");
   });
 

@@ -41,6 +41,8 @@ export interface WorkflowInput {
   readonly batch?: WorkflowBatchState;
   readonly calculation?: WorkflowCalculationState;
   readonly latestExport?: WorkflowExportState;
+  readonly workerAvailable?: boolean;
+  readonly terminalRecoveryBlocked?: boolean;
 }
 
 export function workflowDownloadAvailable(input: WorkflowInput): boolean {
@@ -102,9 +104,12 @@ export function deriveWorkflowSteps(input: WorkflowInput): { currentStep: Workfl
   const batch = input.batch;
   const canManage = input.shopStatus === "ACTIVE" && input.access !== "CUSTOMER";
   const historicalPublished = !batch && input.hasPublishedSnapshot;
+  const workerUnavailable = input.workerAvailable === false;
+  const terminalRecoveryBlocked = input.terminalRecoveryBlocked === true;
 
   const receiveComplete = Boolean(batch) || historicalPublished;
   const receiveInProgress = Boolean(batch && ["DRAFT", "UPLOADING"].includes(batch.status));
+  const receiveBlocking = terminalRecoveryBlocked && receiveInProgress;
   const receiveProgress = receiveComplete
     ? (receiveInProgress && batch ? percent(batch.receivedBytes, batch.declaredBytes) : "100")
     : null;
@@ -114,6 +119,8 @@ export function deriveWorkflowSteps(input: WorkflowInput): { currentStep: Workfl
   const preflightInProgress = Boolean(batch && ["ANALYZING", "AWAITING_FILES", "AWAITING_MAPPING", "RETRYING"].includes(batch.status));
   const preflightBlocking = Boolean(batch && (
     ["AWAITING_FILES", "AWAITING_MAPPING"].includes(batch.status)
+    || (workerUnavailable && ["ANALYZING", "RETRYING"].includes(batch.status))
+    || (terminalRecoveryBlocked && preflightInProgress)
     || batch.blockingCount > 0
     || (batch.status === "FAILED" && !/COMMIT|CALCULAT|PUBLISH/u.test(`${batch.stage}:${batch.failureCode ?? ""}`))
   ));
@@ -127,24 +134,33 @@ export function deriveWorkflowSteps(input: WorkflowInput): { currentStep: Workfl
   const commitComplete = historicalPublished || Boolean(batch && (COMMIT_COMPLETED.has(batch.status) || failedAfterCommit));
   const commitInProgress = Boolean(batch && batch.status === "COMMITTING");
   const commitBlocking = Boolean(hardExclusionConfirmationRequired
+    || (workerUnavailable && batch?.status === "COMMITTING")
+    || (terminalRecoveryBlocked && commitInProgress)
     || (batch && batch.status === "FAILED" && /COMMIT|COPY|DATABASE_CAPACITY/u.test(`${batch.stage}:${batch.failureCode ?? ""}`)));
 
   const calculationComplete = historicalPublished || Boolean(batch && ["READY_FOR_REVIEW", "RESULT_PUBLISHING", "RESULT_PUBLISHED"].includes(batch.status));
   const calculationInProgress = Boolean(batch && ["COMMITTED", "COMMITTED_WITH_EXCLUSIONS", "CALCULATING"].includes(batch.status));
   const calculationBlocking = !hardExclusionConfirmationRequired && (input.calculation?.status === "BLOCKED" || input.calculation?.status === "FAILED"
+    || (workerUnavailable && Boolean(batch && ["COMMITTED", "COMMITTED_WITH_EXCLUSIONS", "CALCULATING"].includes(batch.status)))
+    || (terminalRecoveryBlocked && calculationInProgress)
     || Boolean(batch && batch.status === "FAILED" && /CALCULAT/u.test(`${batch.stage}:${batch.failureCode ?? ""}`)));
 
   const publishComplete = historicalPublished || batch?.status === "RESULT_PUBLISHED";
   const publishInProgress = Boolean(batch && ["READY_FOR_REVIEW", "RESULT_PUBLISHING"].includes(batch.status) && !batch.failureCode);
   const publishBlocking = Boolean(batch && (
     batch.failureCode === "AUTO_PUBLISH_FAILED"
+    || (workerUnavailable && ["READY_FOR_REVIEW", "RESULT_PUBLISHING"].includes(batch.status) && !batch.failureCode)
+    || (terminalRecoveryBlocked && publishInProgress)
     || (batch.status === "FAILED" && /PUBLISH/u.test(`${batch.stage}:${batch.failureCode ?? ""}`))
   ));
 
   const downloadReady = workflowDownloadAvailable(input);
+  const exportInProgress = Boolean(input.latestExport && ["QUEUED", "RUNNING"].includes(input.latestExport.status));
+  const exportBlocking = exportInProgress && (workerUnavailable || terminalRecoveryBlocked);
 
   const steps: WorkflowStepSummary[] = [
-    step("RECEIVE", receiveInProgress ? "IN_PROGRESS" : receiveComplete ? "COMPLETED" : "NOT_STARTED", "NONE", receiveProgress, canManage),
+    step("RECEIVE", receiveInProgress ? "IN_PROGRESS" : receiveComplete ? "COMPLETED" : "NOT_STARTED", receiveBlocking ? "BLOCKING" : "NONE",
+      receiveProgress, canManage, 0, receiveBlocking ? 1 : 0),
     step("PREFLIGHT", preflightInProgress ? "IN_PROGRESS" : preflightComplete ? "COMPLETED" : "NOT_STARTED", preflightSeverity,
       preflightProgress, canManage && Boolean(batch), preflightWarnings, preflightBlocking ? Math.max(1, batch?.blockingCount ?? 0) : 0),
     step("COMMIT", commitInProgress ? "IN_PROGRESS" : commitComplete ? "COMPLETED" : "NOT_STARTED", commitBlocking ? "BLOCKING" : "NONE",
@@ -153,8 +169,8 @@ export function deriveWorkflowSteps(input: WorkflowInput): { currentStep: Workfl
       calculationComplete ? "100" : null, canManage && (commitComplete || calculationInProgress), 0, calculationBlocking ? 1 : 0),
     step("PUBLISH", publishInProgress ? "IN_PROGRESS" : publishComplete ? "COMPLETED" : "NOT_STARTED", publishBlocking ? "BLOCKING" : "NONE",
       publishComplete ? "100" : null, input.hasPublishedSnapshot || (canManage && (calculationComplete || publishInProgress)), 0, publishBlocking ? 1 : 0),
-    step("EXPORT", downloadReady ? "COMPLETED" : "NOT_STARTED", "NONE",
-      downloadReady ? "100" : null, downloadReady),
+    step("EXPORT", exportInProgress ? "IN_PROGRESS" : downloadReady ? "COMPLETED" : "NOT_STARTED", exportBlocking ? "BLOCKING" : "NONE",
+      exportInProgress ? input.latestExport?.progress ?? null : downloadReady ? "100" : null, downloadReady, 0, exportBlocking ? 1 : 0),
   ];
 
   const active = steps.find((candidate) => candidate.state !== "COMPLETED" && candidate.clickable)

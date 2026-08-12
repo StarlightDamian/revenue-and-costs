@@ -4,8 +4,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createOutboxDispatchScheduler,
   dispatchOutbox,
-  listenForOutboxNotifications,
-  OUTBOX_NOTIFY_CHANNEL,
 } from "../../src/worker/outbox-dispatcher";
 
 describe("outbox dispatcher", () => {
@@ -37,30 +35,33 @@ describe("outbox dispatcher", () => {
     expect(client.release).toHaveBeenCalledOnce();
   });
 
-  it("wakes only for the committed outbox channel and releases the fixed listener", async () => {
-    const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    const client = {
-      query: vi.fn(async () => ({ rows: [], rowCount: null })),
-      on: vi.fn((event: string, handler: (...arguments_: unknown[]) => void) => { handlers.set(event, handler); }),
-      off: vi.fn((event: string) => { handlers.delete(event); }),
-      release: vi.fn(),
+  it("persists a safe failed-attempt marker after the claim transaction rolls back", async () => {
+    const event = {
+      id: "00000000-0000-4000-8000-000000000001",
+      topic: "calculation.requested",
+      business_key: "batch-1",
+      payload: { batchId: "batch-1" },
     };
-    const wake = vi.fn();
-    const reportError = vi.fn();
-    const stop = await listenForOutboxNotifications(
-      { connect: vi.fn(async () => client) } as unknown as Pool,
-      wake,
-      reportError,
-    );
+    const transactionQuery = vi.fn(async (sql: string) => {
+      if (["BEGIN", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: null };
+      if (sql.includes("FROM outbox_event")) return { rows: [event], rowCount: 1 };
+      throw new Error(`UNEXPECTED_QUERY:${sql}`);
+    });
+    const diagnosticQuery = vi.fn(async (sql: string, parameters?: readonly unknown[]) => {
+      void sql;
+      void parameters;
+      return { rows: [], rowCount: 1 };
+    });
+    const client = { query: transactionQuery, release: vi.fn() } as unknown as PoolClient;
+    const pool = { connect: vi.fn(async () => client), query: diagnosticQuery } as unknown as Pool;
+    const boss = { insert: vi.fn(async () => { throw new Error("ECONNRESET"); }) } as unknown as PgBoss;
 
-    handlers.get("notification")?.({ channel: "unrelated" });
-    handlers.get("notification")?.({ channel: OUTBOX_NOTIFY_CHANNEL });
-    expect(wake).toHaveBeenCalledOnce();
-    expect(reportError).not.toHaveBeenCalled();
+    await expect(dispatchOutbox(pool, boss, 50)).rejects.toThrow("ECONNRESET");
 
-    await stop();
-    expect(client.query).toHaveBeenCalledWith(`UNLISTEN ${OUTBOX_NOTIFY_CHANNEL}`);
-    expect(client.release).toHaveBeenCalledOnce();
+    expect(transactionQuery).toHaveBeenCalledWith("ROLLBACK");
+    expect(diagnosticQuery).toHaveBeenCalledOnce();
+    expect(diagnosticQuery.mock.calls[0]?.[0]).toContain("attempt_count=attempt_count+1");
+    expect(diagnosticQuery.mock.calls[0]?.[1]).toEqual([[event.id], "OUTBOX_DISPATCH_FAILED"]);
   });
 
   it("coalesces overlapping wakes but drains a notification received during dispatch", async () => {

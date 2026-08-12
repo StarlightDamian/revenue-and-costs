@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ReportFilter } from "../../src/api/routes/reports.js";
+import type { ReportFilter } from "../../src/modules/publishing/publish.js";
 import { PostgresReportService } from "../../src/modules/publishing/postgres-service.js";
 import type { SqlClient } from "../../src/modules/authorization/index.js";
 
 describe("report filtering", () => {
   function exportContextReports(rows: Array<{ requested_date: string; currency: string; cny_rate: string | null; invalid: boolean }>) {
     const query = vi.fn(async (sql: string) => {
-      if (sql.includes("SELECT cr.id,cr.status,e.name enterprise_name")) {
-        return { rows: [{ id: "run-1", status: "READY", enterprise_name: "示例企业" }] };
+      if (sql.includes("SELECT cr.id,cr.status,s.name shop_name")) {
+        return { rows: [{ id: "run-1", status: "READY", shop_name: "做账公司" }] };
       }
       if (sql.includes("WITH selected_conversion")) return { rows };
       throw new Error(`UNEXPECTED_QUERY:${sql}`);
@@ -25,14 +25,15 @@ describe("report filtering", () => {
 
     await expect(reports.getIntermediateExportContext("shop-1", "TRANSACTION")).resolves.toMatchObject({
       calculationRunId: "run-1",
+      shopName: "做账公司",
       frozenRates: new Map(),
     });
   });
 
   it("rejects export until the latest calculation run is ready", async () => {
     const query = vi.fn(async (sql: string) => {
-      if (sql.includes("SELECT cr.id,cr.status,e.name enterprise_name")) {
-        return { rows: [{ id: "run-1", status: "RUNNING", enterprise_name: "示例企业" }] };
+      if (sql.includes("SELECT cr.id,cr.status,s.name shop_name")) {
+        return { rows: [{ id: "run-1", status: "RUNNING", shop_name: "做账公司" }] };
       }
       throw new Error(`UNEXPECTED_QUERY:${sql}`);
     });
@@ -71,8 +72,8 @@ describe("report filtering", () => {
 
   it("loads intermediate FX rates without constructing a PostgreSQL text value containing NUL", async () => {
     const query = vi.fn(async (sql: string) => {
-      if (sql.includes("SELECT cr.id,cr.status,e.name enterprise_name")) {
-        return { rows: [{ id: "run-1", status: "READY", enterprise_name: "示例企业" }] };
+      if (sql.includes("SELECT cr.id,cr.status,s.name shop_name")) {
+        return { rows: [{ id: "run-1", status: "READY", shop_name: "做账公司" }] };
       }
       if (sql.includes("FROM transaction_fact tf")) {
         return {

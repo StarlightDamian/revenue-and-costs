@@ -6,6 +6,8 @@ import { matchHeader, normalizeHeader } from "../mappings/validate.js";
 import type { FieldMappingDefinition } from "../mappings/types.js";
 import type { PrefixAnalysis } from "./analyze-prefix.js";
 
+const MAX_DELIMITED_RECORD_SIZE = 16 * 1024 * 1024;
+
 export interface MappedImportRow {
   readonly sourceRowNumber: string;
   readonly rowHash: string;
@@ -69,6 +71,7 @@ export async function parseMappedDelimitedStream(input: {
     delimiter: input.analysis.delimiter,
     bom: true,
     relax_column_count: false,
+    max_record_size: MAX_DELIMITED_RECORD_SIZE,
   });
   const headerRecords: string[][] = [];
   for await (const record of headerParser) headerRecords.push(record as string[]);
@@ -85,6 +88,7 @@ export async function parseMappedDelimitedStream(input: {
     skip_empty_lines: true,
     relax_column_count: false,
     info: true,
+    max_record_size: MAX_DELIMITED_RECORD_SIZE,
   });
   Readable.from(decodeChunks(input.chunks, input.analysis.encoding)).pipe(parser);
 
@@ -93,7 +97,8 @@ export async function parseMappedDelimitedStream(input: {
   const profiling = input.profile
     ? { headerCellsExamined: 0, headerMatchMs: 0, projectionMs: 0, rowHashMs: 0, onRowMs: 0 }
     : undefined;
-  for await (const rawRecord of parser) {
+  try {
+    for await (const rawRecord of parser) {
     const parsed = rawRecord as { record: string[]; info: { lines: number } };
     const record = parsed.record;
     const headerStarted = profiling ? performance.now() : 0;
@@ -120,7 +125,13 @@ export async function parseMappedDelimitedStream(input: {
     parsedRows += 1n;
     const onRowStarted = profiling ? performance.now() : 0;
     await input.onRow({ sourceRowNumber: String(parsed.info.lines), rowHash, values });
-    if (profiling) profiling.onRowMs += performance.now() - onRowStarted;
+      if (profiling) profiling.onRowMs += performance.now() - onRowStarted;
+    }
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "CSV_MAX_RECORD_SIZE") {
+      throw new Error("IMPORT_DELIMITED_RECORD_TOO_LARGE", { cause: error });
+    }
+    throw error;
   }
   return {
     parsedRows: parsedRows.toString(),

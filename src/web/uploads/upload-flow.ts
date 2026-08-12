@@ -5,13 +5,15 @@ export interface UploadFileItem {
   readonly path: string;
   readonly size: number;
   remoteId: string;
-  readonly source: Pick<Blob, "size" | "slice">;
+  initialOffset?: string;
+  readonly source: Pick<Blob, "size" | "slice" | "type">;
   state: UploadFileState;
   error?: string;
 }
 
 export interface UploadFlowDependencies {
   readonly chunkBytes: number;
+  readonly fileConcurrency?: number;
   getOffset(remoteId: string): Promise<string>;
   uploadChunk(remoteId: string, offset: string, chunk: Blob): Promise<{ readonly offset: string }>;
   onProgress?(sent: number): void;
@@ -38,22 +40,27 @@ export async function uploadFilesContinuing(
   dependencies: UploadFlowDependencies,
 ): Promise<UploadFlowResult> {
   if (!Number.isSafeInteger(dependencies.chunkBytes) || dependencies.chunkBytes < 1) throw new Error("上传分片大小无效");
+  const fileConcurrency = dependencies.fileConcurrency ?? 1;
+  if (!Number.isSafeInteger(fileConcurrency) || fileConcurrency < 1 || fileConcurrency > 4) {
+    throw new Error("上传文件并发数无效");
+  }
   let completed = items.filter((item) => item.state === "complete").length;
   let failed = 0;
   let sent = items.filter((item) => item.state === "complete").reduce((sum, item) => sum + item.size, 0);
   dependencies.onProgress?.(sent);
 
-  for (const item of items) {
-    if (item.state === "complete" || item.state === "skipped") continue;
+  async function uploadFile(item: UploadFileItem): Promise<void> {
     try {
+      const initialOffset = item.state === "pending" ? item.initialOffset : undefined;
+      delete item.initialOffset;
       item.state = "uploading";
       delete item.error;
       dependencies.onStateChange?.(item);
-      let offset = validOffset(await dependencies.getOffset(item.remoteId), item.size);
+      let offset = validOffset(initialOffset ?? await dependencies.getOffset(item.remoteId), item.size);
       sent += offset;
       dependencies.onProgress?.(sent);
       while (offset < item.size) {
-        const chunk = item.source.slice(offset, Math.min(offset + dependencies.chunkBytes, item.size));
+        const chunk = item.source.slice(offset, Math.min(offset + dependencies.chunkBytes, item.size), item.source.type);
         const next = await dependencies.uploadChunk(item.remoteId, String(offset), chunk);
         const nextOffset = validOffset(next.offset, item.size);
         if (nextOffset <= offset) throw new Error("服务端返回了无效的上传 offset");
@@ -71,6 +78,19 @@ export async function uploadFilesContinuing(
       dependencies.onStateChange?.(item);
     }
   }
+
+  let nextIndex = 0;
+  async function uploadNext(): Promise<void> {
+    while (nextIndex < items.length) {
+      const item = items[nextIndex];
+      nextIndex += 1;
+      if (!item || item.state === "complete" || item.state === "skipped") continue;
+      await uploadFile(item);
+    }
+  }
+
+  const workerCount = Math.min(fileConcurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, uploadNext));
   return { completed, failed };
 }
 
@@ -98,5 +118,5 @@ export function uploadBatchConclusion(items: readonly Pick<UploadFileItem, "stat
   if (items.length > 0 && complete === items.length) {
     return { tone: "success", title: "文件上传完成", detail: "全部文件已接收，正在进入预检。" };
   }
-  return { tone: "neutral", title: "等待选择", detail: "选择文件后会自动开始分片上传。" };
+  return { tone: "neutral", title: "等待选择", detail: "可继续追加文件；确认清单后点击“开始上传”。" };
 }

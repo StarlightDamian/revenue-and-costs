@@ -13,12 +13,18 @@ const me = {
   roles: ["ACCOUNTANT"],
   theme: "comfort",
   customerShopCount: 0,
+  isFirstLogin: true,
 };
 
 test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分开标识", async ({ page }, testInfo) => {
   let putLegacyFirst = false;
   let downloadTokenExportId = "";
+  let onboardingRequests = 0;
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
+  await page.route("**/api/v1/me/onboarding**", (route) => {
+    onboardingRequests += 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ dismissed: false }) });
+  });
   await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{
     id: shopId, enterpriseId, createdByAccountId: me.id, lastOperatedByAccountId: me.id,
     name: "导出验收公司", access: "ENTERPRISE", accountingStatus: "SUBMITTED", status: "ACTIVE", termStart: "2026-08-02", termEndExclusive: "2027-08-02", renameAvailable: true,
@@ -75,10 +81,9 @@ test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分�
   await page.goto(`/shops/${shopId}/workflow/export`);
 
   await expect(page.getByRole("navigation", { name: "公司数据处理阶段" }).getByRole("link")).toHaveCount(3);
-  await expect(page.getByRole("heading", { name: "第一次进入公司" })).toBeVisible();
   const onboarding = page.locator("body > .onboarding-overlay");
-  await expect(onboarding).toHaveCSS("position", "fixed");
-  await expect(onboarding.getByRole("heading", { level: 3 })).toHaveText(["上传资料", "系统自动处理", "核对并下载"]);
+  await expect(onboarding).toHaveCount(0);
+  expect(onboardingRequests).toBe(0);
   const sheetList = page.getByRole("list", { name: "导出工作簿结构" });
   await expect(sheetList.getByRole("listitem")).toHaveCount(5);
   await expect(sheetList).toContainText("成本核算表-人民币");

@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { TransactionRunner, SqlClient } from "../authorization/index.js";
-import type { ImportRouteServices } from "../../api/routes/imports.js";
 
 const RETRYABLE_COMMIT_FAILURES = new Set([
   "IMPORT_DATABASE_CAPACITY_UNAVAILABLE",
@@ -26,7 +25,7 @@ export function describeImportIssue(code: string, count: number, fieldName: stri
   };
 }
 
-export class PostgresImportService implements ImportRouteServices {
+export class PostgresImportService {
   constructor(private readonly transactions: TransactionRunner, private readonly database: SqlClient) {}
 
   async getLatestBatch(shopId: string) {
@@ -210,8 +209,16 @@ export class PostgresImportService implements ImportRouteServices {
         `SELECT dv.id AS dataset_version_id,
                 CASE WHEN dv.status='INCOMPLETE' THEN 'HARD_INCOMPLETE' ELSE 'SOFT_RECONCILIATION_WARNING' END AS issue_kind,
                 $2::text AS issue_code,
-                (SELECT id FROM marketplace_policy_version WHERE normalized_marketplace='UNKNOWN' ORDER BY effective_from DESC LIMIT 1) AS policy_id
+                policy.id AS policy_id
            FROM dataset_version dv JOIN dataset_slice ds ON ds.id=dv.dataset_slice_id
+           JOIN LATERAL (
+             SELECT candidate.id
+               FROM marketplace_policy_version candidate
+              WHERE candidate.normalized_marketplace=ds.normalized_marketplace
+                AND candidate.effective_from<=dv.created_at
+                AND (candidate.effective_to IS NULL OR candidate.effective_to>dv.created_at)
+              ORDER BY candidate.effective_from DESC,candidate.id DESC LIMIT 1
+           ) policy ON true
           WHERE dv.id=$1 AND ds.shop_id=$3`,
         [issueId, "ACCOUNTANT_ACKNOWLEDGED", shopId],
       );

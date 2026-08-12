@@ -6,6 +6,15 @@ export function normalizePhone(phone: string): string {
   return normalized;
 }
 
+export function maskPhone(phone: string): string {
+  const normalized = phone.trim();
+  const chineseNationalNumber = /^\+86([0-9]{11})$/u.exec(normalized)?.[1];
+  if (chineseNationalNumber) {
+    return `+86 ${chineseNationalNumber.slice(0, 3)}****${chineseNationalNumber.slice(-4)}`;
+  }
+  return normalized.length <= 7 ? '***' : `${normalized.slice(0, 4)}****${normalized.slice(-4)}`;
+}
+
 export function createOtpCode(): string {
   return randomInt(0, 1_000_000).toString().padStart(6, '0');
 }

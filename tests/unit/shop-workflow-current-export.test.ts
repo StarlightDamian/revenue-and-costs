@@ -32,6 +32,9 @@ describe("shop workflow current export projection", () => {
         }], rowCount: 1 };
       }
       if (sql.includes("FROM import_batch ib")) return { rows: [], rowCount: 0 };
+      if (sql.includes("worker.terminal-reconcile")) {
+        return { rows: [{ available: true, terminal_recovery_blocked: false }], rowCount: 1 };
+      }
       if (sql.includes("FROM export_request")) {
         return { rows: [{ id: exportId, published_snapshot_id: snapshotId, status: "SUCCEEDED" }], rowCount: 1 };
       }
@@ -42,6 +45,7 @@ describe("shop workflow current export projection", () => {
 
     await expect(service.getWorkflow(actor, shopId)).resolves.toMatchObject({
       diagnosticId: expect.stringMatching(/^E[0-9A-Za-z]{22}$/u),
+      processingHealth: { workerAvailable: true, terminalRecoveryBlocked: false },
       download: { latestExport: { id: exportId, status: "SUCCEEDED" } },
     });
     const exportCall = reader.query.mock.calls.find((call) => String(call[0]).includes("FROM export_request"));
@@ -50,5 +54,12 @@ describe("shop workflow current export projection", () => {
     expect(String(exportCall?.[0])).toContain("minimum_sales_cost_rate IS NOT DISTINCT FROM");
     expect(String(exportCall?.[0])).toContain("continent_prefixes =");
     expect(exportCall?.[1]).toEqual([shopId, actor.accountId, snapshotId, REPORT_EXPORT_FORMAT]);
+    const recoveryCall = reader.query.mock.calls.find((call) => String(call[0]).includes("worker.terminal-reconcile"));
+    expect(String(recoveryCall?.[0])).toContain("recovery.progress->>'outcome'='ACTIVE_CALLBACK'");
+    expect(String(recoveryCall?.[0])).toContain("recovery.progress->>'outcome'='RECOVERY_FAILED'");
+    expect(String(recoveryCall?.[0])).toContain("LEFT JOIN pgboss.job");
+    expect(String(recoveryCall?.[0])).toContain("recovery_identity.business_field='exportId'");
+    expect(String(recoveryCall?.[0])).toContain("recovery_identity.business_id=$3::text");
+    expect(recoveryCall?.[1]).toEqual([null, null, exportId]);
   });
 });

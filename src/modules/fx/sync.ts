@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { normalizeOfficialQuote } from "./normalize.js";
 import { parseChinaMoneyPage, type ChinaMoneyRange, type ChinaMoneySource } from "./chinamoney.js";
+import { parseUnambiguousDate } from "./date.js";
 
 export type FxSyncKind = "FULL_HISTORY" | "RECENT_SEVEN_DAYS" | "MANUAL_RETRY";
 
@@ -73,19 +74,35 @@ async function persistPage(client: PoolClient, runId: string, source: ChinaMoney
       [parsed.explicitNonTradingDates,snapshotId],
     );
   }
-  if (source.sourceName === "ChinaMoneyXlsx") {
-    const requestedFrom = page.request.from;
-    const requestedTo = page.request.to;
-    if (!requestedFrom || !requestedTo) throw new Error("CHINAMONEY_XLSX_RANGE_EVIDENCE_MISSING");
+  if (page.request.allPairs === "true") {
+    const requestedFrom = page.request.from ? parseUnambiguousDate(page.request.from) : undefined;
+    const requestedTo = page.request.to ? parseUnambiguousDate(page.request.to) : undefined;
+    const absentThrough = page.request.allPairsAbsentThrough;
+    if (!requestedFrom || !requestedTo || requestedFrom > requestedTo || !absentThrough) {
+      throw new Error("CHINAMONEY_ALL_PAIRS_RANGE_EVIDENCE_INVALID");
+    }
+    const evidencedDates = [...openDates, ...parsed.explicitNonTradingDates];
+    if (evidencedDates.some((date) => date < requestedFrom || date > requestedTo)) {
+      throw new Error("CHINAMONEY_ALL_PAIRS_RANGE_EVIDENCE_INVALID");
+    }
+    if (absentThrough === "none") {
+      if (openDates.length > 0) throw new Error("CHINAMONEY_ALL_PAIRS_RANGE_EVIDENCE_INVALID");
+      return evidencedDates;
+    }
+    const parsedAbsentThrough = parseUnambiguousDate(absentThrough);
+    if (!parsedAbsentThrough || parsedAbsentThrough < requestedFrom || parsedAbsentThrough > requestedTo
+      || openDates.some((date) => date > parsedAbsentThrough)) {
+      throw new Error("CHINAMONEY_ALL_PAIRS_RANGE_EVIDENCE_INVALID");
+    }
     await client.query(
       `INSERT INTO fx_market_day(valid_date,status,evidence_type,snapshot_id,reason)
        SELECT day::date,'NON_TRADING','ALL_OFFICIAL_PAIRS_ABSENT',$3,
-              'ChinaMoney 官方全币种历史表在请求范围内当日无任何币对报价'
+              'ChinaMoney 官方全币对请求在安全证据范围内当日无任何报价'
          FROM generate_series($1::date,$2::date,interval '1 day') AS day
         WHERE NOT (day::date=ANY($4::date[]))
           AND NOT (day::date=ANY($5::date[]))
        ON CONFLICT DO NOTHING`,
-      [requestedFrom,requestedTo,snapshotId,openDates,parsed.explicitNonTradingDates],
+      [requestedFrom,parsedAbsentThrough,snapshotId,openDates,parsed.explicitNonTradingDates],
     );
   }
   return [...parsed.quotes.map((quote) => quote.validDate), ...parsed.explicitNonTradingDates];
@@ -101,7 +118,7 @@ export async function syncChinaMoney(pool: Pool, source: ChinaMoneySource, kind:
     const dates: string[] = [];
     const responseHashes = new Set<string>();
     for (let pageNumber = 1; pageNumber <= 10_000; pageNumber += 1) {
-      const page = await source.fetchPage(range,pageNumber,500);
+      const page = await source.fetchPage(range,pageNumber,source.pageSize ?? 500);
       const responseHash = createHash("sha256").update(page.rawBody).digest("hex");
       if (responseHashes.has(responseHash)) throw new Error("CHINAMONEY_PAGINATION_STALLED");
       responseHashes.add(responseHash);

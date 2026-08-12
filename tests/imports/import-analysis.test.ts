@@ -38,6 +38,38 @@ describe("导入前缀分析", () => {
     expect(matchHeader(headers, builtinTransactionMapping)).toBeDefined();
   });
 
+  it.each([
+    "fulfillment", "fulfilment", "Versand", "cumplimiento", "Gestione", "フルフィルメント",
+    "traitement", "realizacja", "gestión logística", "expédition", "leverans", "gönderim", "atendimento",
+  ])("把已验证配送表头 %s 精确映射为可选 fulfillment", (fulfillmentHeader) => {
+    const headers = [
+      "date/time", "type", "description", "marketplace", "product sales", "selling fees",
+      "fba fees", "other transaction fees", "other", "total", fulfillmentHeader,
+    ];
+    expect(matchHeader(headers, builtinTransactionMapping)?.get("fulfillment")).toBe(10);
+  });
+
+  it("配送表头缺失时仍匹配普通交易模板", () => {
+    const headers = [
+      "date/time", "type", "description", "marketplace", "product sales", "selling fees",
+      "fba fees", "other transaction fees", "other", "total",
+    ];
+    const matched = matchHeader(headers, builtinTransactionMapping);
+    expect(matched).toBeDefined();
+    expect(matched?.has("fulfillment")).toBe(false);
+  });
+
+  it("按样本语义匹配 AU、PL、ES、NL 和 UK 的 FMB 金额列", () => {
+    const aliases = new Map(builtinTransactionMapping.fields.map((mappingField) => [mappingField.canonical, mappingField.sourceHeaders]));
+    expect(aliases.get("fba_fees")).toContain("fulfilment by amazon fees");
+    expect(aliases.get("product_sales_tax")).toContain("pobrany podatek od sprzedaży");
+    expect(aliases.get("marketplace_withheld_tax")).toContain("Podatek od transakcji Marketplace Facilitator");
+    expect(aliases.get("shipping_credits")).toEqual(expect.arrayContaining(["postage credits", "Verzendtegoeden", "abonos de envío"]));
+    expect(aliases.get("gift_wrap_credits")).toEqual(expect.arrayContaining(["kredietpunten cadeauverpakking", "abonos de envoltorio para regalo"]));
+    expect(aliases.get("promotional_rebates")).toEqual(expect.arrayContaining(["promotiekortingen", "devoluciones promocionales"]));
+    expect(aliases.get("product_sales_tax")).not.toEqual(expect.arrayContaining(["sales tax collected", "geïnde omzetbelasting"]));
+  });
+
   it("精确匹配 Amazon 英文配送报告的必需表头", () => {
     const headers = [
       "Amazon Order Id", "Shipment Date", "Merchant SKU", "Shipped Quantity", "Currency",
@@ -144,5 +176,19 @@ describe("导入前缀分析", () => {
     expect(result.parsedRows).toBe("200");
     expect(fieldReads).toBeLessThan(10);
     expect(result.profiling?.headerCellsExamined).toBe(200);
+  });
+  it("rejects a logical record larger than the bounded parser budget", async () => {
+    const header = shipment.fields.map((field) => field.sourceHeaders[0]).join(",");
+    const text = `${header}\nAmazon.de,"${"x".repeat(16 * 1024 * 1024)}",SKU-1\n`;
+    const bytes = new TextEncoder().encode(text);
+    const analysis = analyzeDelimitedPrefix(bytes.subarray(0, 512 * 1024), [{ id: "mapping-v1", definition: shipment }]);
+    await expect(parseMappedDelimitedStream({
+      chunks: (async function* () {
+        for (let offset = 0; offset < bytes.length; offset += 64 * 1024) yield bytes.subarray(offset, offset + 64 * 1024);
+      })(),
+      analysis,
+      mapping: shipment,
+      onRow: async () => undefined,
+    })).rejects.toThrow("IMPORT_DELIMITED_RECORD_TOO_LARGE");
   });
 });

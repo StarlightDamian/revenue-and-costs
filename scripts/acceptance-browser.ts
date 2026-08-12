@@ -394,9 +394,8 @@ async function exerciseRole(input: {
     pages.push(await screenshotPage(page, { name: `${suffix}-apps`, route: "/admin/apps", heading: "应用管理" }));
     pages.push(await screenshotPage(page, { name: `${suffix}-operations`, route: "/admin/operations", heading: "运营状态" }));
   } else if (input.role === "USER") {
-    pages.push(await screenshotPage(page, { name: `${suffix}-upload`, route: `/shops/${input.fixture.shopId}/upload`, heading: "上传与预检" }));
-    pages.push(await screenshotPage(page, { name: `${suffix}-integrity`, route: `/shops/${input.fixture.shopId}/integrity`, heading: "完整性检查" }));
-    pages.push(await screenshotPage(page, { name: `${suffix}-results`, route: `/shops/${input.fixture.shopId}/results`, heading: "测算结果" }));
+    pages.push(await screenshotPage(page, { name: `${suffix}-commit`, route: `/shops/${input.fixture.shopId}/workflow/commit`, heading: "资料准备" }));
+    pages.push(await screenshotPage(page, { name: `${suffix}-calculate`, route: `/shops/${input.fixture.shopId}/workflow/calculate`, heading: "计算复核" }));
     await page.goto(`${baseUrl}/admin/users`, { waitUntil: "networkidle" });
     await page.waitForURL(/\/sales-cost$/u);
     const direct = await apiRequest(page, "/api/v1/admin/users");
@@ -410,7 +409,7 @@ async function exerciseRole(input: {
     for (const hidden of ["上传与预检", "完整性", "创建店铺 · 20.00 元/年"]) {
       if (await page.getByText(hidden, { exact: true }).count()) throw new Error(`CUSTOMER_ACTION_VISIBLE:${hidden}`);
     }
-    pages.push(await screenshotPage(page, { name: `${suffix}-results`, route: `/shops/${input.fixture.shopId}/results`, heading: "测算结果" }));
+    pages.push(await screenshotPage(page, { name: `${suffix}-calculate`, route: `/shops/${input.fixture.shopId}/workflow/calculate`, heading: "计算复核" }));
     for (const hidden of ["完整性", "导出", "发布正式结果"]) {
       if (await page.getByText(hidden, { exact: true }).count()) throw new Error(`CUSTOMER_RESULT_ACTION_VISIBLE:${hidden}`);
     }

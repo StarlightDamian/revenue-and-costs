@@ -2,14 +2,31 @@ import { Type, type Static } from "@sinclair/typebox";
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { AppError } from "../../shared/errors";
 import { IsoDateSchema, UuidSchema } from "../../shared/contracts.js";
-import type { SnapshotManifest } from "../../modules/publishing";
+import type { ReportFilter, SnapshotManifest } from "../../modules/publishing";
 import type { Actor, ShopCapability } from "../../modules/authorization/index.js";
 import { requireIdempotencyKey } from "../idempotency.js";
-import { PassThrough } from "node:stream";
+import { Transform, type TransformCallback } from "node:stream";
 import { structuredLog } from "../../shared/structured-logger.js";
 import { formatMarketplaceForExport, type ContinentPrefix } from "../../modules/accounting-preferences/index.js";
 import { intermediateFileName, writeIntermediateWorkbook } from "../../modules/publishing/intermediate-export.js";
 import type { IntermediateFilter, IntermediateReportKind } from "../../shared/intermediate-report.js";
+import type { IntermediateExportLease } from "../intermediate-export-capacity.js";
+
+const MAX_INTERMEDIATE_EXPORT_ROWS = 100_000;
+const MAX_INTERMEDIATE_EXPORT_BYTES = 256 * 1024 * 1024;
+
+class BoundedExportStream extends Transform {
+  private bytes = 0;
+
+  override _transform(chunk: Buffer, encoding: BufferEncoding, callback: TransformCallback): void {
+    this.bytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, encoding);
+    if (this.bytes > MAX_INTERMEDIATE_EXPORT_BYTES) {
+      callback(new AppError("INTERMEDIATE_EXPORT_TOO_LARGE", "中间结果导出文件超过 256MB 上限", 413));
+      return;
+    }
+    callback(null, chunk);
+  }
+}
 
 export interface ReportRouteServices {
   getCurrent(shopId: string, filter: ReportFilter): Promise<unknown>;
@@ -17,8 +34,8 @@ export interface ReportRouteServices {
   requestCalculation(shopId: string, input: { actorAccountId: string; idempotencyKey: string }): Promise<unknown>;
   publish(manifest: SnapshotManifest, input: { actorAccountId: string; idempotencyKey: string }): Promise<unknown>;
   getIntermediate(shopId: string, kind: IntermediateReportKind, limit: number, afterId?: string, filter?: IntermediateFilter, calculationRunId?: string, frozenRates?: ReadonlyMap<string, string>): Promise<{ items: Array<Record<string, string>>; nextCursor?: string }>;
-  getIntermediateSummary(shopId: string, kind: IntermediateReportKind, filter?: IntermediateFilter): Promise<unknown>;
-  getIntermediateExportContext(shopId: string, kind: IntermediateReportKind, filter?: IntermediateFilter): Promise<{ enterpriseName: string; calculationRunId: string; frozenRates: ReadonlyMap<string, string> }>;
+  getIntermediateSummary(shopId: string, kind: IntermediateReportKind, filter?: IntermediateFilter): Promise<{ matchedRows: string; [key: string]: unknown }>;
+  getIntermediateExportContext(shopId: string, kind: IntermediateReportKind, filter?: IntermediateFilter): Promise<{ shopName: string; calculationRunId: string; frozenRates: ReadonlyMap<string, string> }>;
 }
 
 export interface ReportRouteOptions {
@@ -33,6 +50,7 @@ export interface ReportRouteOptions {
     filter: ReportFilter,
   ): Promise<void>;
   getContinentPrefixes?(accountId: string): Promise<readonly ContinentPrefix[]>;
+  acquireIntermediateExport?(accountId: string): Promise<IntermediateExportLease>;
 }
 
 const ShopParams = Type.Object({ shopId: UuidSchema });
@@ -42,11 +60,6 @@ const ReportQuerySchema = Type.Object({
   marketplace: Type.Optional(Type.String({ minLength: 1, maxLength: 120, pattern: "\\S" })),
 });
 type ReportQuery = Static<typeof ReportQuerySchema>;
-export interface ReportFilter {
-  readonly start?: string;
-  readonly end?: string;
-  readonly marketplace?: string;
-}
 const PublishBody = Type.Object({
   calculationRunId: UuidSchema,
   slices: Type.Array(Type.Object({
@@ -131,12 +144,27 @@ export const reportRoutes: FastifyPluginAsync<ReportRouteOptions> = async (app, 
     async (request, reply) => {
       const actor = await options.authenticate(request);
       await options.authorize(actor, request.params.shopId, "DRAFT_RESULT_READ");
+      if (!options.acquireIntermediateExport) {
+        throw new AppError("INTERMEDIATE_EXPORT_CAPACITY_NOT_CONFIGURED", "中间结果导出容量门禁未配置", 503);
+      }
+      const lease = await options.acquireIntermediateExport(actor.accountId);
+      let released = false;
+      const release = async () => {
+        if (released) return;
+        released = true;
+        await lease.release();
+      };
       const startedAt = Date.now();
       const filter = intermediateFilter(request.query);
-      let context: { enterpriseName: string; calculationRunId: string; frozenRates: ReadonlyMap<string, string> };
+      let context: { shopName: string; calculationRunId: string; frozenRates: ReadonlyMap<string, string> };
       try {
+        const summary = await options.services.getIntermediateSummary(request.params.shopId, request.query.kind, filter);
+        if (!/^\d+$/u.test(summary.matchedRows) || BigInt(summary.matchedRows) > BigInt(MAX_INTERMEDIATE_EXPORT_ROWS)) {
+          throw new AppError("INTERMEDIATE_EXPORT_ROW_LIMIT", `中间结果导出最多支持 ${MAX_INTERMEDIATE_EXPORT_ROWS} 行`, 413);
+        }
         context = await options.services.getIntermediateExportContext(request.params.shopId, request.query.kind, filter);
       } catch (error) {
+        await release();
         if (error instanceof Error && error.message === "INTERMEDIATE_FX_NOT_FIXED") {
           throw new AppError("INTERMEDIATE_FX_NOT_FIXED", "计算运行缺少唯一冻结汇率，暂不能导出", 409);
         }
@@ -145,19 +173,32 @@ export const reportRoutes: FastifyPluginAsync<ReportRouteOptions> = async (app, 
       const prefixes = await options.getContinentPrefixes?.(actor.accountId) ?? ["EU"];
       const rows = async function* () {
         let after: string | undefined;
+        let count = 0;
         do {
           const page = await options.services.getIntermediate(request.params.shopId, request.query.kind, 200, after, filter, context.calculationRunId, context.frozenRates);
-          for (const item of page.items) yield { ...item, marketplace: formatMarketplaceForExport(item.marketplace ?? "", prefixes) };
+          for (const item of page.items) {
+            count += 1;
+            if (count > MAX_INTERMEDIATE_EXPORT_ROWS) {
+              throw new AppError("INTERMEDIATE_EXPORT_ROW_LIMIT", `中间结果导出最多支持 ${MAX_INTERMEDIATE_EXPORT_ROWS} 行`, 413);
+            }
+            yield { ...item, marketplace: formatMarketplaceForExport(item.marketplace ?? "", prefixes) };
+          }
           after = page.nextCursor;
         } while (after);
       };
-      const stream = new PassThrough();
-      void writeIntermediateWorkbook({ output: stream, kind: request.query.kind, enterpriseName: context.enterpriseName, rows: rows() })
+      const stream = new BoundedExportStream();
+      reply.raw.once("close", () => {
+        if (!stream.destroyed) stream.destroy(new Error("INTERMEDIATE_EXPORT_CLIENT_DISCONNECTED"));
+        void release();
+      });
+      void writeIntermediateWorkbook({ output: stream, kind: request.query.kind, shopName: context.shopName, rows: rows() })
         .then((count) => structuredLog("info", "api", "intermediate_report_exported", { reportKind: request.query.kind, rowCount: count, durationMs: Date.now() - startedAt }))
-        .catch((error: unknown) => stream.destroy(error instanceof Error ? error : new Error("INTERMEDIATE_EXPORT_FAILED")));
-      const fileName = intermediateFileName(request.query.kind, context.enterpriseName);
+        .catch((error: unknown) => stream.destroy(error instanceof Error ? error : new Error("INTERMEDIATE_EXPORT_FAILED")))
+        .finally(() => release());
+      const fileName = intermediateFileName(request.query.kind, context.shopName);
       return reply.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         .header("Content-Disposition", `attachment; filename="intermediate.xlsx"; filename*=UTF-8''${encodeURIComponent(fileName)}`)
+        .header("X-Accel-Buffering", "no")
         .send(stream);
     },
   );

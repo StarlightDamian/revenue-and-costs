@@ -36,4 +36,34 @@ describe('Web/API 适配契约', () => {
     expect(() => cnyToCents('100.001')).toThrow();
     expect(() => cnyToCents('-1')).toThrow();
   });
+
+  it('充值响应丢失时仅使用同一幂等键重放一次', async () => {
+    const keys: string[] = [];
+    let calls = 0;
+    vi.stubGlobal('document', { cookie: '' });
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      calls += 1;
+      keys.push(new Headers(init?.headers).get('Idempotency-Key') ?? '');
+      if (calls === 1) throw new TypeError('response lost after commit');
+      return Response.json({ orderId: 'order-1', status: 'PAID' });
+    }));
+
+    await expect(api.createRecharge('enterprise-1', '10000.00')).resolves.toEqual({ orderId: 'order-1', status: 'PAID' });
+
+    expect(calls).toBe(2);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  it('充值传输持续失败时重放一次后立即返回错误', async () => {
+    let calls = 0;
+    vi.stubGlobal('document', { cookie: '' });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      throw new TypeError('network unavailable');
+    }));
+
+    await expect(api.createRecharge('enterprise-1', '10000.00')).rejects.toThrow('network unavailable');
+    expect(calls).toBe(2);
+  });
 });

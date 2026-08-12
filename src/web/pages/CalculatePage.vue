@@ -33,18 +33,25 @@ const selectedCurrencies = ref<string[]>([]);
 const selectedColumnKeys = ref<string[]>([]);
 const filterBar = ref<globalThis.HTMLElement | null>(null);
 let timer: number | undefined;
+let reloadInFlight = false;
 
 const calculation = computed(() => current.value?.steps.find((step) => step.code === "CALCULATE"));
 const publication = computed(() => current.value?.steps.find((step) => step.code === "PUBLISH"));
 const canManage = computed(() => Boolean(current.value && current.value.shop.access !== "CUSTOMER"));
 const requiresHardExclusionConfirmation = computed(() => current.value?.latestBatch?.failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
+const requiresDateAttributionReplay = computed(() => current.value?.latestBatch?.failureCode === "CALCULATION_DATE_ATTRIBUTION_MODE_MIXED");
+const fxCoverageFailure = computed(() => /^(FX_DATA_GAP|FX_NO_AVAILABLE_QUOTE)(?::([A-Z]{3}):(\d{4}-\d{2}-\d{2}))?$/u.exec(current.value?.latestBatch?.failureCode ?? ""));
+const requiresFxCoverage = computed(() => Boolean(fxCoverageFailure.value));
+const fxCoverageSubject = computed(() => fxCoverageFailure.value?.[2] && fxCoverageFailure.value[3]
+  ? `${fxCoverageFailure.value[3]} ${fxCoverageFailure.value[2]}/CNY`
+  : "报表日期对应币种");
 const missingCoverageRows = computed(() => projectCommitCoverage(completeness.value));
 const showResults = computed(() => !canManage.value || calculation.value?.state === "COMPLETED" || publication.value?.state === "IN_PROGRESS" || publication.value?.state === "COMPLETED");
 const allColumns = computed(() => INTERMEDIATE_REPORT_COLUMNS[intermediateKind.value]);
 const visibleColumns = computed(() => allColumns.value.filter((column) => selectedColumnKeys.value.includes(column.key)));
 const blockingCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.blockingCount, 0) ?? 0);
 const warningCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.warningCount, 0) ?? 0);
-const stateText = computed(() => requiresHardExclusionConfirmation.value ? "资料缺失待确认" : calculation.value?.severity === "BLOCKING" ? "计算被阻断" : calculation.value?.state === "COMPLETED" ? "计算完成" : calculation.value?.state === "IN_PROGRESS" ? "计算中" : "等待资料");
+const stateText = computed(() => requiresHardExclusionConfirmation.value ? "资料缺失待确认" : requiresDateAttributionReplay.value ? "日期口径待统一" : requiresFxCoverage.value ? "汇率数据待补齐" : calculation.value?.severity === "BLOCKING" ? "计算被阻断" : calculation.value?.state === "COMPLETED" ? "计算完成" : calculation.value?.state === "IN_PROGRESS" ? "计算中" : "等待资料");
 
 function decimalDisplay(value: string, scale = 2): string {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
@@ -161,10 +168,13 @@ async function nextIntermediate() { if (intermediateNext.value) { intermediateHi
 async function previousIntermediate() { const prior = intermediateHistory.value.pop(); if (prior !== undefined) await loadIntermediate(prior || undefined); }
 
 async function reload() {
+  if (reloadInFlight) return;
+  reloadInFlight = true;
   try {
     current.value = await api.getShopWorkflow(shopId.value); error.value = ""; emit("workflowChange");
     completeness.value = requiresHardExclusionConfirmation.value ? await api.getCompleteness(shopId.value) : [];
   } catch (caught) { error.value = caught instanceof Error ? caught.message : "无法读取计算状态"; }
+  finally { reloadInFlight = false; }
 }
 
 async function confirmHardExclusions() {
@@ -207,14 +217,26 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
       <template #actions><button class="secondary-button compact" type="button" @click="reload">刷新状态</button></template>
     </PageHeader>
 
-    <section v-if="canManage" class="calculation-status-strip" :data-severity="requiresHardExclusionConfirmation ? 'BLOCKING' : calculation?.severity">
+    <section v-if="canManage" class="calculation-status-strip" :data-severity="requiresHardExclusionConfirmation || requiresDateAttributionReplay ? 'BLOCKING' : calculation?.severity">
       <div><span>运行状态</span><b>{{ stateText }}</b></div><div><span>输入版本</span><b>{{ current?.latestBatch?.calculationRunId?.slice(0, 8) || current?.latestBatch?.id.slice(0, 8) || "—" }}</b></div><div><span>覆盖日期</span><b>{{ summary?.coverage.start || "—" }} 至 {{ summary?.coverage.end || "—" }}</b></div>
       <div><span>站点 / 币种</span><b>{{ summary?.options.marketplaces.length ?? 0 }} / {{ summary?.options.currencies.length ?? 0 }}</b></div><div><span>筛选行数</span><b>{{ summary?.matchedRows ?? "0" }}</b></div>
       <div><span>阻断 / 警告</span><b>{{ blockingCount }} / {{ warningCount }}</b></div><div><span>发布状态</span><b>{{ publication?.state === "COMPLETED" ? "已发布" : publication?.state === "IN_PROGRESS" ? "发布中" : "待发布" }}</b></div>
       <a v-if="requiresHardExclusionConfirmation" class="primary-button compact" href="#review-blocker">处理资料缺失</a>
+      <RouterLink v-else-if="requiresDateAttributionReplay" class="primary-button compact" :to="`/shops/${shopId}/workflow/commit`">重传同口径资料</RouterLink>
+      <RouterLink v-else-if="requiresFxCoverage" class="primary-button compact" to="/fx">查看汇率覆盖</RouterLink>
       <a v-else-if="showResults" class="primary-button compact" href="#review-result">{{ publication?.state === 'COMPLETED' ? "查看正式结果" : "核对并发布" }}</a>
       <RouterLink v-else-if="calculation?.state === 'NOT_STARTED'" class="secondary-button compact" :to="`/shops/${shopId}/workflow/commit`">返回资料准备</RouterLink>
       <span v-else class="status-next">下一步：等待计算完成</span>
+    </section>
+
+    <section v-if="requiresDateAttributionReplay" class="surface-section quality-blocker" aria-labelledby="date-attribution-blocker-title">
+      <h2 id="date-attribution-blocker-title">当前数据日期口径不一致</h2>
+      <p>同一正式结果不能混用时区换算和报表字面日期。请返回资料准备，按报表字面日期口径完整重传当前数据范围；此阻断不能确认绕过。</p>
+    </section>
+
+    <section v-if="requiresFxCoverage" class="surface-section quality-blocker" aria-labelledby="fx-coverage-blocker-title">
+      <h2 id="fx-coverage-blocker-title">计算所需汇率缺失</h2>
+      <p>{{ fxCoverageSubject }} 没有可用报价。请由管理员依据授权来源补齐汇率后重新导入；系统不会借用旧报价或猜测汇率。</p>
     </section>
 
     <section v-if="requiresHardExclusionConfirmation" id="review-blocker" class="surface-section workflow-commit-panel">

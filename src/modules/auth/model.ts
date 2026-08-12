@@ -83,7 +83,7 @@ export interface AuthRepository {
     readonly expiresAt: Date;
     readonly actorRoles: readonly PlatformRole[];
     readonly requestId: string;
-  }): Promise<{ readonly sessionId: string; readonly loginSequence: string }>;
+  }, client?: SqlClient): Promise<{ readonly sessionId: string; readonly loginSequence: string }>;
   recordLoginFailure(input: {
     readonly actorAccountId: string | null;
     readonly actorRoles: readonly PlatformRole[];
@@ -96,6 +96,7 @@ export interface AuthRepository {
   revokeSession(sessionId: string): Promise<void>;
   updateTheme(accountId: string, themeId: AccountRecord['themeId']): Promise<void>;
   updateAvatar(accountId: string, avatarId: number): Promise<void>;
+  updateDisplayName(accountId: string, displayName: string | null): Promise<void>;
   bootstrapAdministrator(phoneE164: string, verifiedAt: Date): Promise<AccountRecord>;
   completePhoneChange(input: {
     readonly accountId: string;
@@ -109,6 +110,7 @@ export interface AuthRepository {
 }
 
 export interface SmsProvider {
-  readonly kind: 'SANDBOX' | 'PRODUCTION';
+  readonly kind: 'SANDBOX' | 'TEMPORARY_ADMIN' | 'PRODUCTION';
+  validateOtpRequest?(input: { readonly phoneE164: string; readonly purpose: OtpPurpose }): void;
   sendOtp(input: { readonly phoneE164: string; readonly purpose: OtpPurpose; readonly code: string }): Promise<void>;
 }

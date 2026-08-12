@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectDroppedFiles } from "../../src/web/uploads/dropped-files";
+import { collectDroppedFiles, mergeFileSelections } from "../../src/web/uploads/dropped-files";
 
 describe("collectDroppedFiles", () => {
   it("recursively preserves a dropped folder path", async () => {
@@ -43,5 +43,78 @@ describe("collectDroppedFiles", () => {
     } as unknown as DataTransfer;
 
     await expect(collectDroppedFiles(transfer)).resolves.toEqual([{ file: source, relativePath: "report.csv" }]);
+  });
+
+  it("collects multiple dropped folder roots in one action", async () => {
+    const us = new File(["us"], "transaction.csv", { type: "text/csv" });
+    const de = new File(["de"], "shipment.csv", { type: "text/csv" });
+    const directory = (name: string, file: File) => {
+      let readCount = 0;
+      return {
+        isFile: false,
+        isDirectory: true,
+        name,
+        fullPath: `/${name}`,
+        createReader: () => ({
+          readEntries: (success: (entries: unknown[]) => void) => {
+            readCount += 1;
+            success(readCount === 1 ? [{
+              isFile: true,
+              isDirectory: false,
+              name: file.name,
+              fullPath: `/${name}/${file.name}`,
+              file: (resolve: (selected: File) => void) => resolve(file),
+            }] : []);
+          },
+        }),
+      };
+    };
+    const transfer = {
+      items: [directory("US", us), directory("DE", de)].map((entry) => ({
+        kind: "file",
+        webkitGetAsEntry: () => entry,
+        getAsFile: () => null,
+      })),
+      files: [],
+    } as unknown as DataTransfer;
+
+    await expect(collectDroppedFiles(transfer)).resolves.toEqual([
+      { file: de, relativePath: "DE/shipment.csv" },
+      { file: us, relativePath: "US/transaction.csv" },
+    ]);
+  });
+});
+
+describe("mergeFileSelections", () => {
+  it("appends later selections while preserving prior relative paths", () => {
+    const us = new File(["us"], "transaction.csv");
+    const de = new File(["de"], "shipment.csv");
+
+    expect(mergeFileSelections(
+      [{ file: us, relativePath: "US/transaction.csv" }],
+      [{ file: de, relativePath: "DE/shipment.csv" }],
+    )).toEqual({
+      files: [
+        { file: us, relativePath: "US/transaction.csv" },
+        { file: de, relativePath: "DE/shipment.csv" },
+      ],
+      added: 1,
+      replaced: 0,
+    });
+  });
+
+  it("normalizes paths and lets the last selection replace a same-path conflict", () => {
+    const first = new File(["old"], "report.csv");
+    const replacement = new File(["replacement"], "report.csv");
+    const result = mergeFileSelections(
+      [{ file: first, relativePath: "A\u030A/report.csv" }],
+      [{ file: replacement, relativePath: "Å\\report.csv" }],
+    );
+
+    expect(result).toEqual({
+      files: [{ file: replacement, relativePath: "Å/report.csv" }],
+      added: 0,
+      replaced: 1,
+    });
   });
 });

@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 const shopId = "10000000-0000-4000-8000-000000000009";
@@ -82,6 +82,9 @@ test("资料准备页只展示缺失月份，并在当前页确认阻断", async
 
   await page.goto(`/shops/${shopId}/workflow/commit`);
 
+  const blocker = page.getByRole("alertdialog", { name: "资料缺失，等待处理" });
+  await expect(blocker).toContainText("I0000000000000000000009");
+  await blocker.getByRole("button", { name: "我知道了" }).click();
   await expect(page.getByRole("heading", { name: "资料准备" })).toBeVisible();
   await expect(page.locator("input[webkitdirectory]")).toHaveCount(1);
   await expect(page.getByText("选择文件夹", { exact: true })).toBeVisible();
@@ -141,4 +144,118 @@ test("资料完整时不展示月份行，并给出两类报告齐全反馈", as
   const completeState = page.locator(".workflow-commit-panel .warning-panel[data-tone='success']").filter({ hasText: "资料已齐全" });
   await expect(completeState.getByText("资料已齐全", { exact: true })).toBeVisible();
   await expect(completeState.getByText("当前站点与月份均同时包含交易报告和配送货件，可以继续核算。", { exact: true })).toBeVisible();
+});
+
+test("上传前可连续追加文件夹和文件，并以最后一次选择解决同路径冲突", async ({ page }, testInfo) => {
+  let uploadBatchRequests = 0;
+  let uploadedPaths: string[] = [];
+  let failNextChunk = true;
+  let restoredPreviewRequests = 0;
+  let releaseRestoredPreview!: () => void;
+  const restoredPreviewGate = new Promise<void>((resolveGate) => { releaseRestoredPreview = resolveGate; });
+  const restoredPreview = { id: batchId, status: "READY", progress: "100", stage: "PREFLIGHT_READY", failureCode: null, files: [], ignored: [], issues: [], affectedVersions: [] };
+  await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
+  await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{
+    id: shopId, enterpriseId, createdByAccountId: me.id, lastOperatedByAccountId: me.id,
+    name: "测试9", access: "ENTERPRISE", accountingStatus: "NOT_STARTED", status: "ACTIVE", termStart: "2026-08-02", termEndExclusive: "2027-08-02", renameAvailable: true,
+  }]) }));
+  await page.route(`**/api/v1/shops/${shopId}/workflow`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+    shop: { id: shopId, name: "测试9", access: "ENTERPRISE", status: "ACTIVE", canEdit: true },
+    diagnosticId: "I0000000000000000000010",
+    currentStep: "RECEIVE",
+    steps: [],
+    latestBatch: null,
+    download: { available: false, usesPreviousPublishedVersion: false },
+  }) }));
+  await page.route(`**/api/v1/imports/shops/${shopId}/batches/latest`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(restoredPreview) }));
+  await page.route("**/api/v1/uploads/batches", async (route) => {
+    uploadBatchRequests += 1;
+    if (uploadBatchRequests === 1) {
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ code: "TEMPORARY_UNAVAILABLE", message: "temporary unavailable" }) });
+    }
+    const payload = route.request().postDataJSON() as { files?: Array<{ relativePath: string }> };
+    uploadedPaths = (payload.files ?? []).map((file) => file.relativePath);
+    return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({
+      id: batchId,
+      files: (payload.files ?? []).map((file, index) => ({ id: `file-${index}`, relativePath: file.relativePath, offset: "0" })),
+    }) });
+  });
+  await page.route("**/api/v1/uploads/files/*", (route) => {
+    if (route.request().method() === "HEAD") {
+      return route.fulfill({ status: 204, headers: { "Upload-Offset": "0", "Tus-Resumable": "1.0.0" } });
+    }
+    if (route.request().method() !== "PATCH") return route.fallback();
+    if (failNextChunk) {
+      failNextChunk = false;
+      return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ code: "TEMPORARY_UNAVAILABLE", message: "temporary unavailable" }) });
+    }
+    const headers = route.request().headers();
+    const offset = Number(headers["upload-offset"] ?? "0");
+    const bytes = Number(headers["upload-uncompressed-length"] ?? route.request().postDataBuffer()?.length ?? 0);
+    return route.fulfill({ status: 204, headers: { "Upload-Offset": String(offset + bytes), "Tus-Resumable": "1.0.0" } });
+  });
+  await page.route(`**/api/v1/uploads/batches/${batchId}/complete`, (route) => route.fulfill({
+    status: 202,
+    contentType: "application/json",
+    body: JSON.stringify({ id: batchId, status: "QUEUED" }),
+  }));
+  await page.route(`**/api/v1/imports/shops/${shopId}/batches/${batchId}`, async (route) => {
+    restoredPreviewRequests += 1;
+    if (restoredPreviewRequests === 1) await restoredPreviewGate;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(restoredPreview) });
+  });
+  await page.route("**/api/v1/imports/completeness?**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+
+  const usFolder = testInfo.outputPath("US");
+  const deFolder = testInfo.outputPath("DE");
+  await mkdir(usFolder, { recursive: true });
+  await mkdir(deFolder, { recursive: true });
+  await writeFile(resolve(usFolder, "transaction.csv"), "one");
+  await writeFile(resolve(deFolder, "transaction.csv"), "three");
+  await writeFile(resolve(deFolder, "shipment.csv"), "four");
+
+  await page.goto(`/shops/${shopId}/workflow/commit`);
+  const folderInput = page.locator('input[webkitdirectory]');
+  const fileInput = page.locator('input[type="file"]:not([webkitdirectory])');
+
+  await expect.poll(() => restoredPreviewRequests).toBe(1);
+  await expect(folderInput).toBeDisabled();
+  await expect(fileInput).toBeDisabled();
+  releaseRestoredPreview();
+  await expect(folderInput).toBeEnabled();
+  await expect(fileInput).toBeEnabled();
+  await expect(page.getByRole("heading", { name: "当前批次" })).toBeVisible();
+
+  await folderInput.setInputFiles(usFolder);
+
+  await expect(page.getByRole("button", { name: "开始上传" })).toBeVisible();
+  await expect(folderInput).toHaveValue("");
+  expect(uploadBatchRequests).toBe(0);
+
+  await folderInput.setInputFiles(deFolder);
+  await writeFile(resolve(usFolder, "transaction.csv"), "replaced");
+  await folderInput.setInputFiles(usFolder);
+  await expect(page.locator('p.action-help[role="status"]')).toContainText("替换 1 个同路径文件");
+  await fileInput.setInputFiles({ name: "notes.pdf", mimeType: "application/pdf", buffer: Buffer.from("metadata") });
+
+  await expect(folderInput).toHaveValue("");
+  await expect(fileInput).toHaveValue("");
+  await expect(page.locator(".selection-summary")).toContainText("4 个文件");
+  await expect(page.getByRole("region", { name: "待上传文件" })).toContainText("DE/transaction.csv");
+  await expect(page.getByRole("region", { name: "待上传文件" })).toContainText("notes.pdf");
+  await expect(page.getByRole("region", { name: "待上传文件" }).locator("div").filter({ hasText: "US/transaction.csv" })).toContainText("8 B");
+  expect(uploadBatchRequests).toBe(0);
+
+  await page.getByRole("button", { name: "开始上传" }).click();
+  await expect.poll(() => uploadBatchRequests).toBe(1);
+  await expect(page.getByRole("button", { name: "重试开始上传" })).toBeVisible();
+  await page.getByRole("button", { name: "重试开始上传" }).click();
+  await expect.poll(() => uploadBatchRequests).toBe(2);
+  await expect(page.getByRole("button", { name: "继续上传" })).toBeVisible();
+  await expect(folderInput).toBeDisabled();
+  await expect(fileInput).toBeDisabled();
+  expect([...uploadedPaths].sort()).toEqual(["US/transaction.csv", "DE/transaction.csv", "DE/shipment.csv", "notes.pdf"].sort());
+  await page.getByRole("button", { name: "继续上传" }).click();
+  await expect(page.getByRole("heading", { name: "当前批次" })).toBeVisible();
+  expect(uploadBatchRequests).toBe(2);
 });

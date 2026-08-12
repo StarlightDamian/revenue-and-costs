@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
+import { gunzipSync, gzipSync } from "node:zlib";
 import Fastify from "fastify";
 import { describe, expect, it, vi } from "vitest";
 import { registerUploadRoutes } from "../../src/api/routes/uploads.js";
@@ -12,6 +15,108 @@ const actor: Actor = {
 };
 
 describe("upload file failure HTTP contract", () => {
+  it("creates a batch and registers its files atomically in input order", async () => {
+    const createBatchWithFiles = vi.fn(async () => ({
+      id: "30000000-0000-4000-8000-000000000003",
+      files: [
+        { id: "40000000-0000-4000-8000-000000000004", relativePath: "part-1.csv", offset: "0" },
+        { id: "50000000-0000-4000-8000-000000000005", relativePath: "docs/summary.pdf", offset: "0" },
+      ],
+    }));
+    const authorize = vi.fn(async () => actor);
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: { createBatchWithFiles } as unknown as UploadService,
+      objectStore: {} as EncryptedObjectStore,
+      authorize,
+      async auditOriginalDownload() {},
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches",
+      headers: { "idempotency-key": "bulk-registration-key" },
+      payload: {
+        shopId: "20000000-0000-4000-8000-000000000002",
+        fileCount: 2,
+        files: [
+          { relativePath: "part-1.csv", declaredSize: "12", contentType: "text/csv" },
+          { relativePath: "docs/summary.pdf", declaredSize: "0", contentType: "application/pdf", metadataOnly: true },
+        ],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(authorize).toHaveBeenCalledWith(expect.anything(), "20000000-0000-4000-8000-000000000002", "upload");
+    expect(createBatchWithFiles).toHaveBeenCalledWith(
+      "20000000-0000-4000-8000-000000000002",
+      actor.accountId,
+      "bulk-registration-key",
+      [
+        { relativePath: "part-1.csv", declaredSize: 12n, contentType: "text/csv" },
+        { relativePath: "docs/summary.pdf", declaredSize: 0n, contentType: "application/pdf", metadataOnly: true },
+      ],
+    );
+    expect(response.json()).toEqual({
+      id: "30000000-0000-4000-8000-000000000003",
+      files: [
+        { id: "40000000-0000-4000-8000-000000000004", relativePath: "part-1.csv", offset: "0" },
+        { id: "50000000-0000-4000-8000-000000000005", relativePath: "docs/summary.pdf", offset: "0" },
+      ],
+    });
+    await app.close();
+  });
+
+  it("rejects mismatched or unbounded bulk registration bodies before authorization", async () => {
+    const createBatchWithFiles = vi.fn();
+    const authorize = vi.fn(async () => actor);
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: { createBatchWithFiles } as unknown as UploadService,
+      objectStore: {} as EncryptedObjectStore,
+      authorize,
+      async auditOriginalDownload() {},
+    });
+
+    const mismatch = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches",
+      headers: { "idempotency-key": "bulk-registration-key" },
+      payload: {
+        shopId: "20000000-0000-4000-8000-000000000002",
+        fileCount: 2,
+        files: [{ relativePath: "part-1.csv", declaredSize: "12" }],
+      },
+    });
+    const pathTooLong = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches",
+      headers: { "idempotency-key": "bulk-registration-key" },
+      payload: {
+        shopId: "20000000-0000-4000-8000-000000000002",
+        fileCount: 1,
+        files: [{ relativePath: "x".repeat(1025), declaredSize: "12" }],
+      },
+    });
+    const fileCountTooLarge = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches",
+      headers: { "idempotency-key": "bulk-registration-key" },
+      payload: {
+        shopId: "20000000-0000-4000-8000-000000000002",
+        fileCount: 20_001,
+        files: [{ relativePath: "part-1.csv", declaredSize: "12" }],
+      },
+    });
+
+    expect(mismatch.statusCode).toBe(400);
+    expect(pathTooLong.statusCode).toBe(400);
+    expect(fileCountTooLarge.statusCode).toBe(400);
+    expect(authorize).not.toHaveBeenCalled();
+    expect(createBatchWithFiles).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it("registers a PDF as metadata-only without uploading its bytes", async () => {
     const resolveBatchShop = vi.fn(async () => "20000000-0000-4000-8000-000000000002");
     const createFile = vi.fn(async () => "30000000-0000-4000-8000-000000000003");
@@ -132,6 +237,69 @@ describe("upload file failure HTTP contract", () => {
     await app.close();
   });
 
+  it("passes bounded gzip transport metadata to the upload service", async () => {
+    const raw = Buffer.from("date,amount\n2026-08-10,123.45\n".repeat(100));
+    const compressed = gzipSync(raw);
+    const appendChunk = vi.fn(async () => BigInt(raw.length));
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: {
+        async resolveFileShop() { return "20000000-0000-4000-8000-000000000002"; },
+        appendChunk,
+      } as unknown as UploadService,
+      objectStore: {} as EncryptedObjectStore,
+      async authorize() { return actor; },
+      async auditOriginalDownload() {},
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/uploads/files/30000000-0000-4000-8000-000000000003",
+      headers: {
+        "content-type": "application/offset+octet-stream",
+        "upload-offset": "0",
+        "upload-checksum": `sha256 ${createHash("sha256").update(raw).digest("base64")}`,
+        "upload-content-encoding": "gzip",
+        "upload-uncompressed-length": String(raw.length),
+      },
+      payload: compressed,
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers["upload-offset"]).toBe(String(raw.length));
+    expect(appendChunk).toHaveBeenCalledWith(expect.objectContaining({ contentEncoding: "gzip", length: raw.length }));
+    await app.close();
+  });
+
+  it("rejects incomplete compressed-upload header pairs before appending bytes", async () => {
+    const appendChunk = vi.fn();
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: {
+        async resolveFileShop() { return "20000000-0000-4000-8000-000000000002"; },
+        appendChunk,
+      } as unknown as UploadService,
+      objectStore: {} as EncryptedObjectStore,
+      async authorize() { return actor; },
+      async auditOriginalDownload() {},
+    });
+    const baseHeaders = {
+      "content-type": "application/offset+octet-stream",
+      "upload-offset": "0",
+      "upload-checksum": `sha256 ${Buffer.alloc(32).toString("base64")}`,
+    };
+
+    for (const headers of [
+      { ...baseHeaders, "upload-content-encoding": "gzip" },
+      { ...baseHeaders, "upload-uncompressed-length": "1" },
+    ]) {
+      const response = await app.inject({ method: "PATCH", url: "/api/v1/uploads/files/30000000-0000-4000-8000-000000000003", headers, payload: Buffer.from("x") });
+      expect(response.statusCode).toBe(400);
+    }
+    expect(appendChunk).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it("rejects an invalid original-download token before reading the file", async () => {
     const original = vi.fn();
     const authorize = vi.fn(async () => actor);
@@ -151,6 +319,41 @@ describe("upload file failure HTTP contract", () => {
     expect(response.statusCode).toBe(400);
     expect(original).not.toHaveBeenCalled();
     expect(authorize).not.toHaveBeenCalled();
+    await app.close();
+  });
+
+  it("streams compressible original downloads through nginx without response buffering", async () => {
+    const raw = Buffer.from("date,amount\n2026-08-10,123.45\n".repeat(1_000));
+    const original = {
+      shopId: "20000000-0000-4000-8000-000000000002",
+      relativePath: "report.csv",
+      storagePath: "encrypted.esdk",
+      encryptionContext: {},
+      plaintextSize: String(raw.length),
+    };
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: {
+        async original() { return original; },
+        async consumeOriginalDownloadGrant() { return original; },
+      } as unknown as UploadService,
+      objectStore: { createDecryptionStream: () => Readable.from(raw) } as unknown as EncryptedObjectStore,
+      async authorize() { return actor; },
+      async auditOriginalDownload() {},
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/v1/uploads/files/30000000-0000-4000-8000-000000000003/original?token=${"a".repeat(43)}`,
+      headers: { "accept-encoding": "gzip" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-encoding"]).toBe("gzip");
+    expect(response.headers["x-accel-buffering"]).toBe("no");
+    expect(response.headers["cache-control"]).toBe("private, no-store, max-age=0");
+    expect(response.headers.pragma).toBe("no-cache");
+    expect(gunzipSync(response.rawPayload)).toEqual(raw);
     await app.close();
   });
 

@@ -46,6 +46,7 @@ export interface TransactionFact extends FactIdentity {
   readonly kind: "TRANSACTION";
   readonly type: string;
   readonly description: string;
+  readonly fulfillmentMode: "AMAZON" | "MERCHANT" | "BLANK";
   readonly amounts: Readonly<Record<RefundField, string>> & {
     readonly promotionalRebatesTax: string;
     readonly marketplaceWithheldTax: string;
@@ -85,6 +86,21 @@ export interface CalculationFactResult {
   readonly amountOriginal: string;
   readonly amountCny: string;
   readonly fx: FactFxConversion;
+}
+
+export interface FeeClassificationAudit {
+  readonly factId: string;
+  readonly sourceColumn: "sellingFees" | "fbaFees" | "otherTransactionFees" | "other";
+  readonly category: "PLATFORM_FEE" | "FBA_FULFILLMENT_FEE" | "ADVERTISING_FEE" | "FBA_STORAGE_FEE" | "OTHER_DEDUCTION" | "EXCLUDED_TRANSFER_DEBT";
+  readonly reason: string;
+  readonly amountOriginal: string;
+}
+
+export interface TransactionFeeFact {
+  readonly id: string;
+  readonly type: string;
+  readonly description: string;
+  readonly amounts: Pick<TransactionFact["amounts"], "sellingFees" | "fbaFees" | "otherTransactionFees" | "other">;
 }
 
 export interface FinancialSummary {

@@ -5,6 +5,41 @@ const original = { ...process.env };
 afterEach(() => { process.env = { ...original }; });
 
 describe("production configuration", () => {
+  it("validates explicit application base paths", () => {
+    const base = {
+      ...original,
+      NODE_ENV: "test",
+      DATABASE_URL: "postgres://invalid",
+      OTP_HMAC_KEY: "x".repeat(32),
+      SESSION_HMAC_KEY: "x".repeat(32),
+      FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+    };
+    process.env = { ...base, APP_BASE_PATH: "/custom-app" };
+    expect(loadConfig().appBasePath).toBe("/custom-app");
+
+    process.env = { ...base, APP_BASE_PATH: "/custom-app/" };
+    expect(() => loadConfig()).toThrow("APP_BASE_PATH");
+
+    process.env = { ...base, APP_BASE_PATH: "/../admin" };
+    expect(() => loadConfig()).toThrow("APP_BASE_PATH");
+  });
+
+  it("rejects a PUBLIC_ORIGIN path and non-HTTPS production origin", () => {
+    const base = {
+      ...original,
+      NODE_ENV: "test",
+      DATABASE_URL: "postgres://invalid",
+      OTP_HMAC_KEY: "x".repeat(32),
+      SESSION_HMAC_KEY: "x".repeat(32),
+      FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+    };
+    process.env = { ...base, PUBLIC_ORIGIN: "https://www.googcci.com.cn/revenue-costs" };
+    expect(() => loadConfig()).toThrow("PUBLIC_ORIGIN");
+
+    process.env = { ...base, NODE_ENV: "production", PUBLIC_ORIGIN: "http://www.googcci.com.cn" };
+    expect(() => loadConfig()).toThrow("PUBLIC_ORIGIN");
+  });
+
   it("resolves an explicit database capacity path for host-level free-space checks", () => {
     process.env = {
       ...original,
@@ -41,9 +76,11 @@ describe("production configuration", () => {
       ...original,
       NODE_ENV: "production",
       DATABASE_URL: "postgres://invalid",
+      PUBLIC_ORIGIN: "https://revenue.example.test",
       OTP_HMAC_KEY: "x".repeat(32),
       SESSION_HMAC_KEY: "x".repeat(32),
       FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+      EXPORT_OUTPUT_ROOT: ".work/exports",
       PAYMENT_PROVIDER: "configured-payment",
       SMS_PROVIDER: "configured-sms",
       SANDBOX_OTP_CODE: "246810",
@@ -51,11 +88,100 @@ describe("production configuration", () => {
     expect(() => loadConfig()).toThrow("生产环境禁止固定验证码和注册即授予管理员");
   });
 
+  it("accepts explicit public registration in temporary production mode without external integrations", () => {
+    process.env = {
+      ...original,
+      NODE_ENV: "production",
+      DATABASE_URL: "postgres://invalid",
+      DATABASE_CAPACITY_PATH: ".work/postgres-data",
+      PUBLIC_ORIGIN: "https://www.googcci.com.cn",
+      OTP_HMAC_KEY: "x".repeat(32),
+      SESSION_HMAC_KEY: "y".repeat(32),
+      FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+      EXPORT_OUTPUT_ROOT: ".work/exports",
+      TEMPORARY_DEGRADED_PRODUCTION: "true",
+      TEMPORARY_PUBLIC_REGISTRATION: "true",
+      SMS_PROVIDER: "temporary-admin-fixed",
+      TEMPORARY_ADMIN_OTP_CODE: "246810",
+      REGISTRATION_ADMIN_PHONE: "+8613800000000",
+      PAYMENT_PROVIDER: "temporary-manual",
+      CHINAMONEY_ENABLED: "false",
+      STORAGE_POLICY: "LOCAL_VERIFIED",
+      STORAGE_REPLICA_ROOT: "",
+      REMOTE_BACKUP_TARGET: "",
+    };
+
+    expect(loadConfig()).toMatchObject({
+      mode: "production",
+      appBasePath: "/revenue-costs",
+      temporaryDegradedProduction: true,
+      temporaryPublicRegistration: true,
+      temporaryAdminOtpCode: "246810",
+      registrationAdminPhoneE164: "+8613800000000",
+      smsProvider: "temporary-admin-fixed",
+      paymentProvider: "temporary-manual",
+      chinaMoneyEnabled: false,
+      storagePolicy: "LOCAL_VERIFIED",
+    });
+  });
+
+  it("rejects the sandbox payment adapter in temporary production mode", () => {
+    process.env = {
+      ...original,
+      NODE_ENV: "production",
+      DATABASE_URL: "postgres://invalid",
+      DATABASE_CAPACITY_PATH: ".work/postgres-data",
+      PUBLIC_ORIGIN: "https://www.googcci.com.cn",
+      OTP_HMAC_KEY: "x".repeat(32),
+      SESSION_HMAC_KEY: "y".repeat(32),
+      FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+      EXPORT_OUTPUT_ROOT: ".work/exports",
+      TEMPORARY_DEGRADED_PRODUCTION: "true",
+      SMS_PROVIDER: "temporary-admin-fixed",
+      TEMPORARY_ADMIN_OTP_CODE: "246810",
+      REGISTRATION_ADMIN_PHONE: "+8613800000000",
+      PAYMENT_PROVIDER: "sandbox",
+      CHINAMONEY_ENABLED: "false",
+      STORAGE_POLICY: "LOCAL_VERIFIED",
+    };
+
+    expect(() => loadConfig()).toThrow("临时生产模式必须使用受限固定验证码");
+  });
+
+  it("rejects temporary public registration outside temporary production mode", () => {
+    process.env = {
+      ...original,
+      NODE_ENV: "test",
+      DATABASE_URL: "postgres://invalid",
+      OTP_HMAC_KEY: "x".repeat(32),
+      SESSION_HMAC_KEY: "y".repeat(32),
+      FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+      TEMPORARY_PUBLIC_REGISTRATION: "true",
+    };
+
+    expect(() => loadConfig()).toThrow("TEMPORARY_PUBLIC_REGISTRATION 只允许用于临时 production 模式");
+  });
+
+  it("rejects the controlled recharge adapter outside temporary production mode", () => {
+    process.env = {
+      ...original,
+      NODE_ENV: "test",
+      DATABASE_URL: "postgres://invalid",
+      OTP_HMAC_KEY: "x".repeat(32),
+      SESSION_HMAC_KEY: "y".repeat(32),
+      FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+      PAYMENT_PROVIDER: "temporary-manual",
+    };
+
+    expect(() => loadConfig()).toThrow("PAYMENT_PROVIDER=temporary-manual 只允许用于临时 production 模式");
+  });
+
   it("fails closed while sandbox providers are active", () => {
     process.env = {
       ...original,
       NODE_ENV: "production",
       DATABASE_URL: "postgres://invalid",
+      PUBLIC_ORIGIN: "https://revenue.example.test",
       OTP_HMAC_KEY: "x".repeat(32),
       SESSION_HMAC_KEY: "x".repeat(32),
       FILE_KEK_BASE64: "eA==",
@@ -124,6 +250,7 @@ describe("production configuration", () => {
       ...original,
       NODE_ENV: "production",
       DATABASE_URL: "postgres://invalid",
+      PUBLIC_ORIGIN: "https://revenue.example.test",
       OTP_HMAC_KEY: "x".repeat(32),
       SESSION_HMAC_KEY: "x".repeat(32),
       FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
@@ -146,10 +273,12 @@ describe("production configuration", () => {
       ...original,
       NODE_ENV: "production",
       DATABASE_URL: "postgres://invalid",
+      DATABASE_CAPACITY_PATH: ".work/postgres-data",
       PUBLIC_ORIGIN: "https://revenue.example.test",
       OTP_HMAC_KEY: "x".repeat(32),
       SESSION_HMAC_KEY: "x".repeat(32),
       FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
+      EXPORT_OUTPUT_ROOT: ".work/exports",
       PAYMENT_PROVIDER: "configured-payment",
       SMS_PROVIDER: "configured-sms",
       STORAGE_POLICY: "REMOTE_REQUIRED",
@@ -162,6 +291,7 @@ describe("production configuration", () => {
     };
     expect(loadConfig()).toMatchObject({
       mode: "production",
+      appBasePath: "/revenue-costs",
       chinaMoneyEnabled: true,
       chinaMoneyHistoryStart: "2006-01-04",
       storagePolicy: "REMOTE_REQUIRED",

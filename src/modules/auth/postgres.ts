@@ -1,6 +1,10 @@
 import type { PlatformRole, SqlClient, TransactionRunner } from '../authorization/index.js';
 import type { AccountRecord, AuthRepository, OtpChallengeRecord, SessionRecord } from './model.js';
 import { AppError } from '../../shared/errors.js';
+import {
+  activateShopMembership,
+  type MembershipArtifactInvalidator,
+} from '../memberships/activation.js';
 
 interface AccountRow extends Record<string, unknown> {
   id: string;
@@ -37,7 +41,11 @@ async function hydrateAccount(client: SqlClient, row: AccountRow): Promise<Accou
   };
 }
 
-async function activatePendingRelationships(client: SqlClient, row: AccountRow): Promise<void> {
+async function activatePendingRelationships(
+  client: SqlClient,
+  row: AccountRow,
+  artifactInvalidator: MembershipArtifactInvalidator,
+): Promise<void> {
   await client.query(
     `UPDATE enterprise_member pending
         SET status='REVOKED',revoked_at=clock_timestamp(),revoke_reason='手机号换绑后与既有成员关系合并',
@@ -74,30 +82,22 @@ async function activatePendingRelationships(client: SqlClient, row: AccountRow):
     [row.phone_e164],
   );
   for (const invitation of invitations.rows) {
-    const membership = await client.query<{ id: string }>(
-      `INSERT INTO shop_membership
-        (shop_id, account_id, export_allowed, invitation_id, granted_by)
-       VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (shop_id, account_id) DO UPDATE
-         SET status = 'ACTIVE', export_allowed = EXCLUDED.export_allowed,
-             authorization_epoch = shop_membership.authorization_epoch + 1,
-             invitation_id = EXCLUDED.invitation_id, granted_by = EXCLUDED.granted_by,
-             granted_at = clock_timestamp(), revoked_at = NULL, revoke_reason = NULL,
-             updated_at = clock_timestamp()
-       RETURNING id`,
-      [invitation.shop_id, row.id, invitation.export_allowed, invitation.id, invitation.invited_by],
-    );
+    const membership = await activateShopMembership(client, artifactInvalidator, {
+      shopId: invitation.shop_id,
+      accountId: row.id,
+      exportAllowed: invitation.export_allowed,
+      invitationId: invitation.id,
+      grantedBy: invitation.invited_by,
+    });
     await client.query(
       `UPDATE shop_invitation SET status='ACTIVE', accepted_by=$2, accepted_at=clock_timestamp()
         WHERE id=$1 AND status='PENDING'`,
       [invitation.id, row.id],
     );
-    const membershipId = membership.rows[0]?.id;
-    if (!membershipId) throw new Error('自动激活客户授权失败');
     await client.query(
       `INSERT INTO audit_event(actor_account_id,action,object_type,object_id,metadata)
        VALUES($1,'CUSTOMER_INVITATION_ACCEPTED','shop_membership',$2,$3::jsonb)`,
-      [row.id, membershipId, JSON.stringify({ shopId: invitation.shop_id, automatic: 'registration' })],
+      [row.id, membership.id, JSON.stringify({ shopId: invitation.shop_id, automatic: 'registration' })],
     );
   }
 }
@@ -106,6 +106,7 @@ export class PostgresAuthRepository implements AuthRepository {
   constructor(
     private readonly transactions: TransactionRunner,
     private readonly reader: SqlClient,
+    private readonly artifactInvalidator: MembershipArtifactInvalidator,
   ) {}
 
   async createOtpChallengeAfterRateCheck(input: Parameters<AuthRepository['createOtpChallengeAfterRateCheck']>[0]): Promise<void> {
@@ -231,7 +232,7 @@ export class PostgresAuthRepository implements AuthRepository {
     const row = inserted.rows[0];
     if (!row) return this.findLoginAccount(client, phoneE164);
     await client.query(`INSERT INTO account_role(account_id,role) VALUES($1,'ACCOUNTANT')`, [row.id]);
-    await activatePendingRelationships(client, row);
+    await activatePendingRelationships(client, row, this.artifactInvalidator);
     await client.query(
       `INSERT INTO audit_event(actor_account_id,action,object_type,object_id,metadata)
        VALUES($1,'ACCOUNT_REGISTERED','account',$1,$2::jsonb)`,
@@ -281,7 +282,7 @@ export class PostgresAuthRepository implements AuthRepository {
        VALUES ($1,$2)`,
       [row.id, role],
     );
-    await activatePendingRelationships(client, row);
+    await activatePendingRelationships(client, row, this.artifactInvalidator);
     await client.query(
       `INSERT INTO audit_event(actor_account_id,action,object_type,object_id,metadata)
        VALUES($1,'ACCOUNT_REGISTERED','account',$1,$2::jsonb)`,
@@ -296,8 +297,11 @@ export class PostgresAuthRepository implements AuthRepository {
     return row ? hydrateAccount(this.reader, row) : null;
   }
 
-  async createSessionWithLoginAudit(input: Parameters<AuthRepository['createSessionWithLoginAudit']>[0]): Promise<{ sessionId: string; loginSequence: string }> {
-    return this.transactions.transaction(async (client) => {
+  async createSessionWithLoginAudit(
+    input: Parameters<AuthRepository['createSessionWithLoginAudit']>[0],
+    existingClient?: SqlClient,
+  ): Promise<{ sessionId: string; loginSequence: string }> {
+    const create = async (client: SqlClient) => {
       const login = await client.query<{ login_sequence: string }>(
         `UPDATE account
             SET successful_login_count=successful_login_count+1,
@@ -329,7 +333,8 @@ export class PostgresAuthRepository implements AuthRepository {
         })],
       );
       return { sessionId: id, loginSequence };
-    });
+    };
+    return existingClient ? create(existingClient) : this.transactions.transaction(create);
   }
 
   async recordLoginFailure(input: Parameters<AuthRepository['recordLoginFailure']>[0]): Promise<void> {
@@ -401,6 +406,13 @@ export class PostgresAuthRepository implements AuthRepository {
     ]);
   }
 
+  async updateDisplayName(accountId: string, displayName: string | null): Promise<void> {
+    await this.reader.query('UPDATE account SET display_name = $2, updated_at = clock_timestamp() WHERE id = $1', [
+      accountId,
+      displayName,
+    ]);
+  }
+
   async bootstrapAdministrator(phoneE164: string, verifiedAt: Date): Promise<AccountRecord> {
     return this.transactions.transaction(async (client) => {
       const guard = await client.query<{ completed_at: Date | null }>(
@@ -410,9 +422,11 @@ export class PostgresAuthRepository implements AuthRepository {
         throw new AppError('ADMIN_BOOTSTRAP_CLOSED', '首位管理员初始化入口已永久关闭', 409);
       }
       const inserted = await client.query<AccountRow>(
-        `INSERT INTO account (phone_e164, phone_verified_at)
-         VALUES ($1,$2)
-         ON CONFLICT (phone_e164) DO UPDATE SET phone_verified_at = EXCLUDED.phone_verified_at
+        `INSERT INTO account (phone_e164, phone_verified_at, registered_at)
+         VALUES ($1,$2,$2)
+         ON CONFLICT (phone_e164) DO UPDATE
+           SET phone_verified_at = EXCLUDED.phone_verified_at,
+               registered_at = COALESCE(account.registered_at, EXCLUDED.registered_at)
          RETURNING *`,
         [phoneE164, verifiedAt],
       );
@@ -493,7 +507,7 @@ export class PostgresAuthRepository implements AuthRepository {
       );
       const updatedAccount = updated.rows[0];
       if (!updatedAccount) throw new Error('手机号换绑失败');
-      await activatePendingRelationships(client, updatedAccount);
+      await activatePendingRelationships(client, updatedAccount, this.artifactInvalidator);
       const nextGeneration = updatedAccount.session_generation;
       await client.query(
         'UPDATE auth_session SET revoked_at = COALESCE(revoked_at, $2) WHERE account_id = $1',

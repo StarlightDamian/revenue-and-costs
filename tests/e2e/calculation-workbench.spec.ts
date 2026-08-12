@@ -61,7 +61,7 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
   await expect(phaseLinks.nth(2)).toHaveAttribute("href", `/shops/${shopId}/workflow/export`);
   await expect(page.locator(".workflow-phases small")).toHaveCount(0);
   expect(await page.locator(".workflow-phases").evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(3);
-  const diagnostic = page.getByRole("button", { name: "ID:I0000000000000000000001" });
+  const diagnostic = page.getByRole("button", { name: "复制诊断ID: I0000000000000000000001" });
   await diagnostic.click();
   await expect(diagnostic).toContainText("已复制");
   await expect(page.locator(".calculation-status-strip")).toContainText("30000000");
@@ -71,6 +71,7 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
   const completeState = page.locator("#review-result .warning-panel[data-tone='success']");
   await expect(completeState.getByText("资料已齐全", { exact: true })).toBeVisible();
   await expect(completeState.getByText("当前站点与月份均同时包含交易报告和配送货件，可以继续发布。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "报表日期" })).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "交易说明" })).toBeVisible();
   await expect(page.getByText("-1.60", { exact: true })).toBeVisible();
   await expect(page.locator(".table-footer-actions")).toContainText("原币金额按币种分别合计");
@@ -131,6 +132,7 @@ test("旧发布地址进入计算复核，并在当前页面确认资料缺失",
   await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([shop]) }));
   await page.route(`**/api/v1/shops/${shopId}/workflow`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
     shop: { id: shopId, name: shop.name, access: "ENTERPRISE", status: "ACTIVE", canEdit: true },
+    diagnosticId: "I0000000000000000000029",
     currentStep: "COMMIT",
     latestBatch: { id: batchId, status: "FAILED", stage: "CALCULATION_BLOCKED", failureCode: "HARD_INCOMPLETE_CONFIRMATION_REQUIRED" },
     steps: [
@@ -154,6 +156,9 @@ test("旧发布地址进入计算复核，并在当前页面确认资料缺失",
 
   await page.goto(`/shops/${shopId}/workflow/publish`);
   await expect(page).toHaveURL(new RegExp(`/shops/${shopId}/workflow/calculate$`));
+  const blocker = page.getByRole("alertdialog", { name: "资料缺失，等待处理" });
+  await expect(blocker).toContainText("I0000000000000000000029");
+  await blocker.getByRole("button", { name: "我知道了" }).click();
   await expect(page.getByRole("heading", { name: "资料缺失，确认后继续" })).toBeVisible();
   await expect(page.getByRole("region", { name: "计算复核缺失资料" })).toContainText("BE");
   await page.getByRole("button", { name: "确认排除并继续" }).click();

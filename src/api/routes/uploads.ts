@@ -1,12 +1,14 @@
 import { Readable } from "node:stream";
 import { basename } from "node:path";
+import { createGzip } from "node:zlib";
 import type { FastifyInstance } from "fastify";
 import { Type } from "@sinclair/typebox";
 import type { Actor } from "../../modules/authorization";
 import type { EncryptedObjectStore } from "../../modules/storage/encrypted-object-store";
-import { MAX_CHUNK_BYTES, type UploadService } from "../../modules/uploads/service";
+import { MAX_CHUNK_BYTES, MAX_UPLOAD_FILES, type UploadService } from "../../modules/uploads/service";
 import { CLIENT_UPLOAD_FAILURE_CODES, type ClientUploadFailureCode } from "../../modules/uploads/partial-failure.js";
 import { UuidSchema } from "../../shared/contracts.js";
+import { AppError } from "../../shared/errors.js";
 import { requireIdempotencyKey } from "../idempotency.js";
 
 export interface UploadRouteDependencies {
@@ -17,23 +19,60 @@ export interface UploadRouteDependencies {
 }
 
 const UploadByteCount = Type.String({ pattern: "^(?:0|[1-9][0-9]{0,9})$" });
+const UploadRegistrationFile = Type.Object({
+  relativePath: Type.String({ minLength: 1, maxLength: 1024 }),
+  declaredSize: UploadByteCount,
+  contentType: Type.Optional(Type.String({ minLength: 1, maxLength: 255 })),
+  metadataOnly: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false });
+const CreateBatchBody = Type.Object({
+  shopId: UuidSchema,
+  fileCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_UPLOAD_FILES })),
+  files: Type.Optional(Type.Array(UploadRegistrationFile, { minItems: 1, maxItems: MAX_UPLOAD_FILES })),
+}, { additionalProperties: false });
 const BatchParams = Type.Object({ batchId: UuidSchema });
 const FileParams = Type.Object({ fileId: UuidSchema });
 const OriginalDownloadQuery = Type.Object({ token: Type.String({ pattern: "^[A-Za-z0-9_-]{43}$" }) });
 const ChunkHeaders = Type.Object({
   "upload-offset": UploadByteCount,
   "content-length": Type.String({ pattern: "^(?:0|[1-9][0-9]{0,7})$" }),
+  "upload-content-encoding": Type.Optional(Type.Literal("gzip")),
+  "upload-uncompressed-length": Type.Optional(UploadByteCount),
 });
+
+function acceptsGzip(value: string | string[] | undefined): boolean {
+  return String(value ?? "").split(",").some((item) => {
+    const [coding, ...parameters] = item.trim().toLowerCase().split(";");
+    return coding === "gzip" && !parameters.some((parameter) => /^q=0(?:\.0*)?$/u.test(parameter.trim()));
+  });
+}
 
 export async function registerUploadRoutes(app: FastifyInstance, deps: UploadRouteDependencies): Promise<void> {
   app.addContentTypeParser("application/offset+octet-stream", (_request, payload, done) => done(null, payload));
-  app.post("/api/v1/uploads/batches", { schema: { body: Type.Object({ shopId: UuidSchema }) } }, async (request) => {
-    const body = request.body as { shopId: string };
+  app.post("/api/v1/uploads/batches", {
+    // 20k entries at the 1024-byte path and 255-byte content-type limits fit,
+    // including JSON escaping, while the request remains explicitly bounded.
+    bodyLimit: 64 * 1024 * 1024,
+    schema: { body: CreateBatchBody },
+  }, async (request) => {
+    const body = request.body as { shopId: string; fileCount?: number; files?: Array<{ relativePath: string; declaredSize: string; contentType?: string; metadataOnly?: boolean }> };
+    if ((body.files === undefined) !== (body.fileCount === undefined)
+      || (body.files !== undefined && body.fileCount !== body.files.length)) {
+      throw new AppError("UPLOAD_FILE_COUNT_MISMATCH", "文件数量与请求声明不一致", 400);
+    }
     const actor = await deps.authorize(request, body.shopId, "upload");
     const key = requireIdempotencyKey(request);
+    if (body.files) {
+      return deps.service.createBatchWithFiles(body.shopId, actor.accountId, key, body.files.map((file) => ({
+        relativePath: file.relativePath,
+        declaredSize: BigInt(file.declaredSize),
+        ...(file.contentType ? { contentType: file.contentType } : {}),
+        ...(file.metadataOnly ? { metadataOnly: true } : {}),
+      })));
+    }
     return { id: await deps.service.createBatch(body.shopId, actor.accountId, key) };
   });
-  app.post("/api/v1/uploads/batches/:batchId/files", { schema: { params: BatchParams, body: Type.Object({ relativePath: Type.String(), declaredSize: UploadByteCount, contentType: Type.Optional(Type.String()), metadataOnly: Type.Optional(Type.Boolean()) }) } }, async (request, reply) => {
+  app.post("/api/v1/uploads/batches/:batchId/files", { schema: { params: BatchParams, body: UploadRegistrationFile } }, async (request, reply) => {
     const body = request.body as { relativePath: string; declaredSize: string; contentType?: string; metadataOnly?: boolean };
     const batchId = (request.params as { batchId: string }).batchId;
     await deps.authorize(request, await deps.service.resolveBatchShop(batchId), "upload");
@@ -48,10 +87,19 @@ export async function registerUploadRoutes(app: FastifyInstance, deps: UploadRou
     await deps.authorize(request, await deps.service.resolveFileShop(fileId), "upload");
     const offset = BigInt(String(request.headers["upload-offset"] ?? "-1"));
     const checksum = String(request.headers["upload-checksum"] ?? "").replace(/^sha256\s+/i, "");
-    const length = Number(request.headers["content-length"] ?? -1);
+    const wireLength = Number(request.headers["content-length"] ?? -1);
+    const contentEncoding = request.headers["upload-content-encoding"] === "gzip" ? "gzip" : undefined;
+    const uncompressedHeader = request.headers["upload-uncompressed-length"];
+    if ((contentEncoding && uncompressedHeader === undefined) || (!contentEncoding && uncompressedHeader !== undefined)) {
+      throw new AppError("UPLOAD_ENCODING_HEADERS_INVALID", "上传压缩请求头不完整", 400);
+    }
+    const length = contentEncoding ? Number(uncompressedHeader) : wireLength;
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_CHUNK_BYTES) {
+      throw new AppError("UPLOAD_CHUNK_SIZE_LIMIT", "上传分片超出限额", 413);
+    }
     const body = request.body;
     if (!(body instanceof Readable)) throw new Error("UPLOAD_BODY_STREAM_REQUIRED");
-    const next = await deps.service.appendChunk({ fileId, expectedOffset: offset, expectedSha256: checksum, length, body });
+    const next = await deps.service.appendChunk({ fileId, expectedOffset: offset, expectedSha256: checksum, length, ...(contentEncoding ? { contentEncoding } : {}), body });
     return reply.code(204).header("Tus-Resumable", "1.0.0").header("Upload-Offset", next.toString()).send();
   });
   app.head("/api/v1/uploads/files/:fileId", { schema: { params: FileParams } }, async (request, reply) => {
@@ -104,9 +152,17 @@ export async function registerUploadRoutes(app: FastifyInstance, deps: UploadRou
     const original = await deps.service.consumeOriginalDownloadGrant(request.params.fileId, actor.accountId, request.query.token);
     await deps.auditOriginalDownload(actor, request.params.fileId, original.reason);
     const fileName = basename(original.relativePath).replaceAll(/[\r\n"]/g, "_");
-    return reply
+    const stream = deps.objectStore.createDecryptionStream(original.storagePath, original.encryptionContext);
+    const gzip = /\.(?:csv|txt)$/iu.test(original.relativePath) && acceptsGzip(request.headers["accept-encoding"]);
+    const response = reply
       .header("Content-Type", "application/octet-stream")
       .header("Content-Disposition", `attachment; filename="source"; filename*=UTF-8''${encodeURIComponent(fileName)}`)
-      .send(deps.objectStore.createDecryptionStream(original.storagePath, original.encryptionContext));
+      .header("Cache-Control", "private, no-store, max-age=0")
+      .header("Pragma", "no-cache")
+      .header("X-Accel-Buffering", "no");
+    if (gzip) {
+      return response.header("Content-Encoding", "gzip").header("Vary", "Accept-Encoding").send(stream.pipe(createGzip({ level: 1 })));
+    }
+    return response.header("Content-Length", original.plaintextSize).send(stream);
   });
 }

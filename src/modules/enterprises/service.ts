@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Actor, SqlClient, TransactionRunner, TransactionSideEffects } from '../authorization/index.js';
-import { normalizePhone } from '../auth/crypto.js';
+import { maskPhone, normalizePhone } from '../auth/crypto.js';
 import { AppError } from '../../shared/errors.js';
 
 export interface EnterpriseView {
@@ -42,10 +42,6 @@ function normalizeCreditCode(value: string): string {
     throw new AppError('ENTERPRISE_CREDIT_CODE_INVALID', '统一社会信用代码必须为 18 位数字或大写字母', 400, 'unifiedSocialCreditCode');
   }
   return code;
-}
-
-function maskPhone(value: string): string {
-  return value.length <= 7 ? '***' : `${value.slice(0, 4)}****${value.slice(-4)}`;
 }
 
 export class EnterpriseService {

@@ -12,12 +12,12 @@ import type { EncryptedObjectStore } from "../storage/encrypted-object-store.js"
 import type { FieldMappingDefinition } from "../mappings/types.js";
 import { parseMappedDelimitedStream, type MappedImportRow } from "./stream-parser.js";
 import { parseMappedXlsxStream, XLSX_IMPORT_ENCODING } from "./xlsx-stream.js";
-import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeReportDate, normalizeTransactionDescription, normalizeTransactionType, SingleSiteMarketplaceInference, type MarketplaceProfile } from "./normalize-row.js";
+import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeFulfillment, normalizeReportDate, normalizeTransactionDescription, normalizeTransactionType, SingleSiteMarketplaceInference, type MarketplaceProfile } from "./normalize-row.js";
 
 const STAGE_COLUMNS = [
   "report_kind", "file_id", "row_number", "row_hash", "date_text", "parsed_at", "source_timezone",
   "fx_date", "local_date", "local_month", "marketplace", "raw_marketplace", "order_id", "sku", "currency",
-  "quantity", "type", "description", "product_sales", "product_sales_tax", "shipping_credits",
+  "quantity", "type", "description", "fulfillment_mode", "product_sales", "product_sales_tax", "shipping_credits",
   "shipping_credits_tax", "gift_wrap_credits", "gift_wrap_credits_tax", "regulatory_fee",
   "tax_on_regulatory_fee", "promotional_rebates", "promotional_rebates_tax", "marketplace_withheld_tax",
   "selling_fees", "fba_fees", "other_transaction_fees", "other_amount", "product_price", "product_tax",
@@ -81,6 +81,7 @@ const SAFE_COMMIT_CODES = new Set([
   ...SAFE_NORMALIZATION_CODES,
   "IMPORT_DATABASE_CAPACITY_INSUFFICIENT",
   "IMPORT_DATABASE_CAPACITY_UNAVAILABLE",
+  "IMPORT_DELIMITED_RECORD_TOO_LARGE",
   "NO_USABLE_IMPORT_ROWS",
 ]);
 const MAX_RECORDED_ROW_ISSUE_GROUPS_PER_FILE = 100;
@@ -179,8 +180,70 @@ function safeFailure(error: unknown): { code: string; fileId: string | null; row
   return undefined;
 }
 
+export function safeImportCommitFailureCode(error: unknown): string | undefined {
+  return safeFailure(error)?.code;
+}
+
 export function isPersistedImportCommitFailure(error: unknown): boolean {
-  return safeFailure(error) !== undefined;
+  return safeImportCommitFailureCode(error) !== undefined;
+}
+
+export interface ImportCommitFailureProjection {
+  readonly status: string;
+  readonly currentStage: string | null;
+  readonly failureCode: string | null;
+  readonly transitioned: boolean;
+}
+
+export async function markImportCommitFailed(
+  pool: Pool,
+  batchId: string,
+  failureCode = "IMPORT_COMMIT_FAILED",
+): Promise<ImportCommitFailureProjection> {
+  const result = await pool.query<{
+    status: string;
+    current_stage: string | null;
+    failure_code: string | null;
+    transitioned: boolean;
+  }>(
+    `WITH failed_batch AS (
+       UPDATE import_batch
+          SET status='FAILED',current_stage='COMMIT_FAILED',failure_code=$2,updated_at=clock_timestamp()
+        WHERE id=$1 AND status='COMMITTING'
+       RETURNING id,status,current_stage,failure_code
+     ), recorded_issue AS (
+       INSERT INTO import_issue(import_batch_id,severity,issue_code,safe_context)
+       SELECT failed.id,'ERROR',$2,'{"phase":"COMMIT","source":"WORKER_RETRY_EXHAUSTED"}'::jsonb
+         FROM failed_batch failed
+        WHERE NOT EXISTS (
+          SELECT 1 FROM import_issue issue
+           WHERE issue.import_batch_id=failed.id AND issue.issue_code=$2
+             AND issue.safe_context->>'source'='WORKER_RETRY_EXHAUSTED'
+        )
+       RETURNING id
+     )
+     SELECT failed.status,failed.current_stage,failed.failure_code,true AS transitioned,
+            (SELECT count(*) FROM recorded_issue) AS recorded_issues
+       FROM failed_batch failed
+     UNION ALL
+     SELECT batch.status,batch.current_stage,batch.failure_code,false AS transitioned,
+            (SELECT count(*) FROM recorded_issue) AS recorded_issues
+       FROM import_batch batch
+      WHERE batch.id=$1 AND NOT EXISTS (SELECT 1 FROM failed_batch)`,
+    [batchId, failureCode],
+  );
+  const row = result.rows[0];
+  return row ? {
+    status: row.status,
+    currentStage: row.current_stage,
+    failureCode: row.failure_code,
+    transitioned: row.transitioned,
+  } : {
+    status: "NOT_FOUND",
+    currentStage: null,
+    failureCode: null,
+    transitioned: false,
+  };
 }
 
 async function persistSafeFailure(
@@ -190,22 +253,24 @@ async function persistSafeFailure(
 ): Promise<void> {
   await client.query("BEGIN");
   try {
-    await client.query(
-      "UPDATE import_batch SET status='FAILED',current_stage='COMMIT_FAILED',failure_code=$2,updated_at=clock_timestamp() WHERE id=$1",
+    const failed = await client.query<{ id: string }>(
+      "UPDATE import_batch SET status='FAILED',current_stage='COMMIT_FAILED',failure_code=$2,updated_at=clock_timestamp() WHERE id=$1 AND status='COMMITTING' RETURNING id",
       [batchId, failure.code],
     );
-    await client.query(
-      `INSERT INTO import_issue(import_batch_id,import_file_id,severity,issue_code,row_number,field_name,safe_context)
-       SELECT $1,$2,'ERROR',$3,$4,$5,'{"phase":"COMMIT_PREFLIGHT"}'::jsonb
-       WHERE NOT EXISTS (
-         SELECT 1 FROM import_issue
-          WHERE import_batch_id=$1 AND issue_code=$3
-            AND import_file_id IS NOT DISTINCT FROM $2::uuid
-            AND row_number IS NOT DISTINCT FROM $4::bigint
-            AND field_name IS NOT DISTINCT FROM $5
-       )`,
-      [batchId, failure.fileId, failure.code, failure.rowNumber, failure.fieldName],
-    );
+    if (failed.rowCount) {
+      await client.query(
+        `INSERT INTO import_issue(import_batch_id,import_file_id,severity,issue_code,row_number,field_name,safe_context)
+         SELECT $1,$2,'ERROR',$3,$4,$5,'{"phase":"COMMIT_PREFLIGHT"}'::jsonb
+         WHERE NOT EXISTS (
+           SELECT 1 FROM import_issue
+            WHERE import_batch_id=$1 AND issue_code=$3
+              AND import_file_id IS NOT DISTINCT FROM $2::uuid
+              AND row_number IS NOT DISTINCT FROM $4::bigint
+              AND field_name IS NOT DISTINCT FROM $5
+         )`,
+        [batchId, failure.fileId, failure.code, failure.rowNumber, failure.fieldName],
+      );
+    }
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -355,12 +420,13 @@ async function copyImportFiles(client: PoolClient, store: EncryptedObjectStore, 
         const textStarted = breakdown ? performance.now() : 0;
         const transactionType = normalizeTransactionType(values.type ?? "");
         const transactionDescription = normalizeTransactionDescription(values.description ?? "");
+        const fulfillmentMode = normalizeFulfillment(values.fulfillment);
         if (breakdown) breakdown.transactionTextMs += performance.now() - textStarted;
         const fields = [
           file.classification, file.id, row.sourceRowNumber, `\\x${row.rowHash}`, dateText, date.parsedAt, date.sourceTimezone,
           date.fxDate, date.localDate, date.localMonth, profile.code, rawMarketplace, values.order_id ?? "", values.sku ?? "", currency,
           file.classification === "SHIPMENT" ? requiredAmount("quantity") : amount("quantity"),
-          transactionType, transactionDescription,
+          transactionType, transactionDescription, fulfillmentMode,
           amount("product_sales"), amount("product_sales_tax"), amount("shipping_credits"),
           amount("shipping_credits_tax"), amount("gift_wrap_credits"), amount("gift_wrap_credits_tax"),
           amount("regulatory_fee"), amount("tax_on_regulatory_fee"), amount("promotional_rebates"),
@@ -477,7 +543,7 @@ export async function materializeImportSlices(
   client: PoolClient,
   batchId: string,
   actorAccountId: string,
-): Promise<Array<{ marketplace: string; local_month: string }>> {
+): Promise<Array<{ marketplace: string; local_month: string; retired: boolean }>> {
   await client.query(`CREATE TEMP TABLE import_version_stage (
     marketplace text NOT NULL,
     local_month date NOT NULL,
@@ -487,13 +553,56 @@ export async function materializeImportSlices(
     version_id uuid NOT NULL,
     version_no integer NOT NULL,
     complete boolean NOT NULL,
+    transaction_only_fmb boolean NOT NULL,
+    retired boolean NOT NULL,
     mapping_version_id uuid,
     PRIMARY KEY(marketplace,local_month)
   ) ON COMMIT DROP`);
-  const slices = await client.query<{ marketplace: string; local_month: string }>(
-    `WITH slice_input AS (
-       SELECT marketplace,local_month,array_agg(DISTINCT report_kind ORDER BY report_kind) kinds
+  const slices = await client.query<{ marketplace: string; local_month: string; retired: boolean }>(
+    `WITH replay_objects AS (
+       SELECT DISTINCT stored_object_id
+         FROM import_file
+        WHERE import_batch_id=$1 AND parse_status='PARSED' AND stored_object_id IS NOT NULL
+     ), staged_slice_input AS (
+       SELECT marketplace,local_month,array_agg(DISTINCT report_kind ORDER BY report_kind) kinds,
+              bool_or(report_kind='TRANSACTION' AND type='ORDER' AND fulfillment_mode='MERCHANT') has_merchant_order,
+              bool_or(report_kind='TRANSACTION' AND type='ORDER' AND fulfillment_mode IS DISTINCT FROM 'MERCHANT') has_non_merchant_order
          FROM import_stage GROUP BY marketplace,local_month
+     ), replayed_current_slices AS (
+       SELECT slice.normalized_marketplace marketplace,slice.local_month
+         FROM import_batch batch
+         JOIN dataset_slice slice ON slice.shop_id=batch.shop_id
+         JOIN dataset_version current_version ON current_version.id=slice.current_version_id
+        WHERE batch.id=$1
+          AND EXISTS (
+            SELECT 1
+              FROM dataset_source_binding binding
+              JOIN import_file prior_file ON prior_file.id=binding.import_file_id
+              JOIN replay_objects replay ON replay.stored_object_id=prior_file.stored_object_id
+             WHERE binding.dataset_version_id=current_version.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM dataset_source_binding binding
+              JOIN import_file prior_file ON prior_file.id=binding.import_file_id
+             WHERE binding.dataset_version_id=current_version.id
+               AND NOT EXISTS (
+                 SELECT 1 FROM replay_objects replay
+                  WHERE replay.stored_object_id=prior_file.stored_object_id
+               )
+          )
+     ), slice_input AS (
+       SELECT marketplace,local_month,kinds,false retired,
+              cardinality(kinds)=1 AND kinds @> ARRAY['TRANSACTION']::text[]
+                AND has_merchant_order AND NOT has_non_merchant_order transaction_only_fmb
+         FROM staged_slice_input
+       UNION ALL
+       SELECT replayed.marketplace,replayed.local_month,ARRAY[]::text[] kinds,true retired,false transaction_only_fmb
+         FROM replayed_current_slices replayed
+        WHERE NOT EXISTS (
+          SELECT 1 FROM staged_slice_input staged
+           WHERE staged.marketplace=replayed.marketplace AND staged.local_month=replayed.local_month
+        )
      ), mapping_input AS (
        SELECT DISTINCT ON (stage.marketplace,stage.local_month)
               stage.marketplace,stage.local_month,file.mapping_version_id
@@ -510,22 +619,24 @@ export async function materializeImportSlices(
      )
      INSERT INTO import_version_stage(
        marketplace,local_month,kinds,dataset_slice_id,supersedes_version_id,
-       version_id,version_no,complete,mapping_version_id
+       version_id,version_no,complete,transaction_only_fmb,retired,mapping_version_id
      )
      SELECT input.marketplace,input.local_month,input.kinds,upserted.id,upserted.current_version_id,
             gen_random_uuid(),
             (SELECT COALESCE(max(version.version_no),0)+1 FROM dataset_version version WHERE version.dataset_slice_id=upserted.id),
-            cardinality(input.kinds)=2 AND input.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[],
-            mapping.mapping_version_id
+             (cardinality(input.kinds)=2 AND input.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[])
+               OR input.transaction_only_fmb,
+             input.transaction_only_fmb,input.retired,mapping.mapping_version_id
        FROM slice_input input
        JOIN upserted USING(marketplace,local_month)
        LEFT JOIN mapping_input mapping USING(marketplace,local_month)
       ORDER BY input.local_month,input.marketplace
-     RETURNING marketplace,local_month::text AS local_month`,
+     RETURNING marketplace,local_month::text AS local_month,retired`,
     [batchId],
   );
   await client.query(
-    `INSERT INTO dataset_version(
+    `WITH inserted_version AS (
+     INSERT INTO dataset_version(
        id,dataset_slice_id,import_batch_id,version_no,status,manifest_sha256,
        supersedes_version_id,activated_at,created_by
      )
@@ -533,10 +644,22 @@ export async function materializeImportSlices(
             CASE WHEN complete THEN 'ACTIVE' ELSE 'INCOMPLETE' END,
             digest(convert_to(jsonb_build_object(
               'batchId',$1::uuid::text,'sliceId',dataset_slice_id::text,'marketplace',marketplace,
-              'localMonth',local_month::text,'kinds',to_jsonb(kinds)
+               'localMonth',local_month::text,'kinds',to_jsonb(kinds),
+               'transactionOnlyFmb',transaction_only_fmb,'retiredBySourceReplay',retired
             )::text,'UTF8'),'sha256'),
             supersedes_version_id,clock_timestamp(),$2::uuid
-       FROM import_version_stage ORDER BY local_month,marketplace`,
+       FROM import_version_stage ORDER BY local_month,marketplace
+     RETURNING id
+     )
+     INSERT INTO audit_event(actor_account_id,action,object_type,object_id,reason,metadata)
+     SELECT $2::uuid,'DATASET_SLICE_RETIRED_BY_SOURCE_REPLAY','dataset_version',stage.version_id,
+            '完整重放同一组源文件后，该站点月份不再由当前日期归属规则产生',
+            jsonb_build_object('batchId',$1::uuid::text,'sliceId',stage.dataset_slice_id::text,
+              'marketplace',stage.marketplace,'localMonth',stage.local_month::text,
+              'supersedesVersionId',stage.supersedes_version_id::text)
+       FROM import_version_stage stage
+       JOIN inserted_version inserted ON inserted.id=stage.version_id
+      WHERE stage.retired`,
     [batchId, actorAccountId],
   );
   await client.query(
@@ -572,35 +695,17 @@ export async function materializeImportSlices(
   );
   await client.query(
     `INSERT INTO transaction_fact(dataset_version_id,source_file_id,row_number,row_hash,original_datetime_text,parsed_at,source_timezone,
-      fx_date,marketplace_local_date,local_month,normalized_marketplace,normalized_type,normalized_description,order_id,sku,currency,quantity,
+      fx_date,marketplace_local_date,local_month,normalized_marketplace,normalized_type,normalized_description,fulfillment_mode,order_id,sku,currency,quantity,
       product_sales,product_sales_tax,shipping_credits,shipping_credits_tax,gift_wrap_credits,gift_wrap_credits_tax,regulatory_fee,
       tax_on_regulatory_fee,promotional_rebates,promotional_rebates_tax,marketplace_withheld_tax,selling_fees,fba_fees,other_transaction_fees,other_amount)
      SELECT version.version_id,stage.file_id,stage.row_number,stage.row_hash,stage.date_text,stage.parsed_at,stage.source_timezone,
-       stage.fx_date,stage.local_date,stage.local_month,stage.marketplace,upper(stage.type),stage.description,
+        stage.fx_date,stage.local_date,stage.local_month,stage.marketplace,upper(stage.type),stage.description,stage.fulfillment_mode,
        nullif(stage.order_id,''),nullif(stage.sku,''),stage.currency,stage.quantity,stage.product_sales,stage.product_sales_tax,
        stage.shipping_credits,stage.shipping_credits_tax,stage.gift_wrap_credits,stage.gift_wrap_credits_tax,stage.regulatory_fee,
        stage.tax_on_regulatory_fee,stage.promotional_rebates,stage.promotional_rebates_tax,stage.marketplace_withheld_tax,
        stage.selling_fees,stage.fba_fees,stage.other_transaction_fees,stage.other_amount
        FROM import_stage stage JOIN import_version_stage version USING(marketplace,local_month)
       WHERE stage.report_kind='TRANSACTION'`,
-  );
-  await client.query(
-    `INSERT INTO transaction_fee_component(transaction_fact_id,source_column,category,amount_original,mapping_version_id)
-     SELECT fact.id,component.source_column,
-       CASE WHEN component.source_column='selling_fees' THEN 'PLATFORM_FEE'
-            WHEN component.source_column='fba_fees' THEN 'FBA_FULFILLMENT_FEE'
-            WHEN lower(fact.normalized_description) ~ '(advert|werbung|publicidad|publicité|広告)' THEN 'ADVERTISING_FEE'
-            WHEN lower(fact.normalized_description) ~ '(storage|lager|stockage|almacen|保管)' THEN 'FBA_STORAGE_FEE'
-            ELSE 'OTHER_DEDUCTION' END,
-       component.amount,file.mapping_version_id
-       FROM transaction_fact fact
-       JOIN import_version_stage version ON version.version_id=fact.dataset_version_id
-       JOIN import_file file ON file.id=fact.source_file_id
-       CROSS JOIN LATERAL (VALUES
-         ('selling_fees',fact.selling_fees),('fba_fees',fact.fba_fees),
-         ('other_transaction_fees',fact.other_transaction_fees),('other_amount',fact.other_amount)
-       ) component(source_column,amount)
-      WHERE component.amount<>0`,
   );
   await client.query(
     `WITH shipment_totals AS (
@@ -610,7 +715,8 @@ export async function materializeImportSlices(
      ), transaction_totals AS (
        SELECT dataset_version_id,sum(quantity) quantity
          FROM transaction_fact fact JOIN import_version_stage version ON version.version_id=fact.dataset_version_id
-        WHERE normalized_type IN ('ORDER','BESTELLUNG','注文','PEDIDO','COMMANDE','ORDINE','SIPARIŞ')
+         WHERE normalized_type IN ('ORDER','BESTELLUNG','注文','PEDIDO','COMMANDE','ORDINE','SIPARIŞ')
+           AND fulfillment_mode IS DISTINCT FROM 'MERCHANT'
         GROUP BY dataset_version_id
      )
      INSERT INTO reconciliation_result(dataset_version_id,mapping_version_id,applicable,shipment_quantity,transaction_quantity,
@@ -649,7 +755,7 @@ export async function commitImportBatch(
     await client.query(`CREATE TEMP TABLE import_stage (
       report_kind text,file_id uuid,row_number bigint,row_hash bytea,date_text text,parsed_at timestamptz,source_timezone text,
       fx_date date,local_date date,local_month date,marketplace text,raw_marketplace text,order_id text,sku text,currency text,
-      quantity numeric(30,8),type text,description text,product_sales numeric(30,8),product_sales_tax numeric(30,8),
+      quantity numeric(30,8),type text,description text,fulfillment_mode text,product_sales numeric(30,8),product_sales_tax numeric(30,8),
       shipping_credits numeric(30,8),shipping_credits_tax numeric(30,8),gift_wrap_credits numeric(30,8),gift_wrap_credits_tax numeric(30,8),
       regulatory_fee numeric(30,8),tax_on_regulatory_fee numeric(30,8),promotional_rebates numeric(30,8),promotional_rebates_tax numeric(30,8),
       marketplace_withheld_tax numeric(30,8),selling_fees numeric(30,8),fba_fees numeric(30,8),other_transaction_fees numeric(30,8),
@@ -677,13 +783,22 @@ export async function commitImportBatch(
       ...(copied.breakdown ? { breakdown: copied.breakdown } : {}),
       durationMs: copyMs,
     });
+    // A source replay can retire current slices that disappear under a new
+    // date rule. Lock only for pointer proof/materialization, after streaming
+    // parsing, so long imports do not block shop reads and publishing.
+    await client.query(
+      `SELECT shop.id FROM import_batch batch JOIN shop ON shop.id=batch.shop_id
+        WHERE batch.id=$1 FOR UPDATE OF shop`,
+      [batchId],
+    );
     const materializeStarted = performance.now();
     const slices = await materializeImportSlices(client, batchId, actorAccountId);
     const materializeMs = performance.now() - materializeStarted;
-    if (slices.length === 0) throw new Error("NO_USABLE_IMPORT_ROWS");
+    if (!slices.some((slice) => !slice.retired)) throw new Error("NO_USABLE_IMPORT_ROWS");
     structuredLog("info", "worker", "import_commit_materialization_completed", {
       batchId,
       slices: slices.length,
+      retiredSlices: slices.filter((slice) => slice.retired).length,
       durationMs: materializeMs,
     });
     const finalizeStarted = performance.now();

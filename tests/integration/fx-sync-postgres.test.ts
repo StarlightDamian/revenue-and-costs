@@ -1,19 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { migrate } from "../../src/db/migrate.js";
 import { FixtureChinaMoneySource, syncChinaMoney, type ChinaMoneySource } from "../../src/modules/fx/index.js";
+import { createPostgresTestSchema, type PostgresTestSchema } from "./postgres-harness.js";
 
-const databaseUrl = process.env.FX_INTEGRATION_DATABASE_URL;
-const describeWithDatabase = databaseUrl ? describe : describe.skip;
-
-describeWithDatabase("ChinaMoney PostgreSQL sync", () => {
-  const pool = new Pool({ connectionString: databaseUrl });
+describe("ChinaMoney PostgreSQL sync", () => {
+  let database: PostgresTestSchema | undefined;
+  let pool!: PostgresTestSchema["pool"];
   const source = new FixtureChinaMoneySource(resolve("tests/fixtures/fx/chinamoney-sample.json"));
 
-  beforeAll(async () => { await migrate(pool); });
-  afterAll(async () => { await pool.end(); });
+  beforeAll(async () => {
+    database = await createPostgresTestSchema();
+    pool = database.pool;
+  });
+  afterAll(async () => { await database?.cleanup(); });
 
   it("links repeated immutable payloads to every successful run without duplicating quotes", async () => {
     const before = await pool.query<{ count: string }>("SELECT count(*)::text AS count FROM fx_quote");
@@ -117,14 +117,21 @@ describeWithDatabase("ChinaMoney PostgreSQL sync", () => {
       .rejects.toThrow("CHINAMONEY_CONFLICTING_NORMALIZED_QUOTE");
   });
 
-  it("records all-pairs-absent dates from an authoritative XLSX range as non-trading", async () => {
+  it("records all-pairs-absent dates from an explicitly marked authoritative range as non-trading", async () => {
     const payload = { records: [{ validDate: "2040-01-06", "USD/CNY": "7.10000000" }] };
     const rawBody = JSON.stringify(payload);
     const source: ChinaMoneySource = {
-      sourceName: "ChinaMoneyXlsx",
+      sourceName: "ChinaMoney",
       async fetchPage(_range, page, pageSize) {
         return {
-          request: { from: "2040-01-06", to: "2040-01-08", page: String(page), pageSize: String(pageSize), format: "xlsx" },
+          request: {
+            from: "2040-01-06",
+            to: "2040-01-08",
+            page: String(page),
+            pageSize: String(pageSize),
+            allPairs: "true",
+            allPairsAbsentThrough: "2040-01-08",
+          },
           status: 200,
           headers: { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
           rawBody,

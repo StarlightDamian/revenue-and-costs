@@ -1,10 +1,11 @@
 import { createWriteStream } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ZipArchive } from "archiver";
 import { afterEach, describe, expect, it } from "vitest";
-import { extractValidatedZip, validateZip } from "../../src/modules/archive/zip-validator";
+import { defaultZipLimits, extractValidatedZip, validateZip } from "../../src/modules/archive/zip-validator";
+import { PDF_HEADER_MAX_LEADING_BYTES } from "../../src/shared/pdf-header";
 
 const roots: string[] = [];
 
@@ -38,6 +39,27 @@ describe("ZIP safety and streaming extraction", () => {
     const entries = await extractValidatedZip(archive, destination, (path) => join(destination, path.replaceAll("/", "__")));
     expect(entries.map((entry) => entry.path)).toEqual(["reports/orders.csv", "reports/shipment.txt"]);
     await expect(readFile(entries[0]!.destinationPath, "utf8")).resolves.toContain("A,1");
+  });
+
+  it("runs the persistent-budget hook before creating any extracted file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zip-budget-"));
+    roots.push(root);
+    const archive = await makeZip(root, [{ name: "reports/orders.csv", body: "order,amount\nA,1\n" }]);
+    const destination = join(root, "out");
+    const target = join(destination, "orders.part");
+
+    await expect(extractValidatedZip(
+      archive,
+      destination,
+      () => target,
+      defaultZipLimits,
+      async (reports) => {
+        expect(reports.filter((entry) => !entry.directory).reduce((sum, entry) => sum + entry.expandedBytes, 0n)).toBeGreaterThan(0n);
+        await expect(access(target)).rejects.toThrow();
+        throw new Error("ZIP_BATCH_EXPANDED_LIMIT");
+      },
+    )).rejects.toThrow("ZIP_BATCH_EXPANDED_LIMIT");
+    await expect(access(target)).rejects.toThrow();
   });
 
   it("rejects traversal, nested archives, and ratios over the limit", async () => {
@@ -74,5 +96,35 @@ describe("ZIP safety and streaming extraction", () => {
       maxIdleMs: 1_000,
       maxDurationMs: 10_000,
     })).rejects.toThrow("ZIP_RATIO_OR_SIZE_LIMIT");
+  });
+
+  it("rejects PDF entries before extraction even when the file name hides the type", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zip-pdf-"));
+    roots.push(root);
+    const namedPdf = await makeZip(root, [{ name: "documents/invoice.PDF", body: "%PDF-1.7\nbody" }], "named-pdf.zip");
+    await expect(validateZip(namedPdf)).rejects.toThrow("ZIP_PDF_ENTRY_REQUIRES_FOLDER_UPLOAD");
+
+    const disguisedPdf = await makeZip(root, [{ name: "documents/report.csv", body: "%PDF-1.7\nbody" }], "disguised-pdf.zip");
+    const destination = join(root, "out");
+    await expect(extractValidatedZip(disguisedPdf, destination, (path) => join(destination, path.replaceAll("/", "__"))))
+      .rejects.toThrow("ZIP_PDF_ENTRY_REQUIRES_FOLDER_UPLOAD");
+    await expect(access(join(destination, "documents__report.csv"))).rejects.toThrow();
+
+    const prefixedPdf = await makeZip(root, [{
+      name: "documents/prefixed.csv",
+      body: Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from("\r\n \t"),
+        Buffer.alloc(PDF_HEADER_MAX_LEADING_BYTES - 7, 0x78),
+        Buffer.from("%PDF-1.7\nbody"),
+      ]),
+    }], "prefixed-pdf.zip");
+    await expect(validateZip(prefixedPdf)).rejects.toThrow("ZIP_PDF_ENTRY_REQUIRES_FOLDER_UPLOAD");
+
+    const laterMarker = await makeZip(root, [{
+      name: "documents/ordinary.csv",
+      body: `${"x".repeat(PDF_HEADER_MAX_LEADING_BYTES + 1)}%PDF- is ordinary text here`,
+    }], "later-marker.zip");
+    await expect(validateZip(laterMarker)).resolves.toHaveLength(1);
   });
 });

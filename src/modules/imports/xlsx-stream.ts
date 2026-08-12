@@ -11,6 +11,11 @@ const MAX_HEADER_ROWS = 200;
 const MAX_COLUMNS = 1_024;
 const MAX_SHARED_STRING_COUNT = 250_000;
 const MAX_SHARED_STRING_BYTES = 32 * 1024 * 1024;
+const MAX_CELL_BYTES = 4 * 1024 * 1024;
+const MAX_ROW_BYTES = 16 * 1024 * 1024;
+const MAX_WORKBOOK_CELL_BYTES = 512 * 1024 * 1024;
+const MAX_WORKBOOK_ROWS = 5_000_000;
+const MAX_WORKSHEETS = 256;
 
 export const XLSX_IMPORT_ENCODING = "xlsx";
 
@@ -95,10 +100,25 @@ function cellText(cell: ExcelJS.Cell): string {
   return cell.text;
 }
 
-function rowValues(row: ExcelJS.Row, minimumColumns = 0): string[] {
+interface WorkbookBudget { rows: number; cellBytes: number }
+
+function rowValues(row: ExcelJS.Row, budget: WorkbookBudget, minimumColumns = 0): string[] {
+  budget.rows += 1;
+  if (budget.rows > MAX_WORKBOOK_ROWS) throw new Error("XLSX_ROW_LIMIT");
   const columns = Math.max(row.cellCount, minimumColumns);
   if (columns > MAX_COLUMNS) throw new Error("XLSX_COLUMN_LIMIT");
-  return Array.from({ length: columns }, (_, index) => cellText(row.getCell(index + 1)));
+  let rowBytes = 0;
+  const record = Array.from({ length: columns }, (_, index) => {
+    const value = cellText(row.getCell(index + 1));
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes > MAX_CELL_BYTES) throw new Error("XLSX_CELL_LIMIT");
+    rowBytes += bytes;
+    if (rowBytes > MAX_ROW_BYTES) throw new Error("XLSX_ROW_SIZE_LIMIT");
+    return value;
+  });
+  budget.cellBytes += rowBytes;
+  if (budget.cellBytes > MAX_WORKBOOK_CELL_BYTES) throw new Error("XLSX_WORKBOOK_SIZE_LIMIT");
+  return record;
 }
 
 function nonEmpty(record: readonly string[]): boolean {
@@ -120,13 +140,15 @@ export async function analyzeXlsxStream(
   mappings: readonly MappingCandidate[],
 ): Promise<XlsxAnalysis> {
   const matches = new Map<string, { mappingVersionId: string; headerLineNumber: string }>();
+  const budget: WorkbookBudget = { rows: 0, cellBytes: 0 };
   try {
     let worksheetOrdinal = 0;
     for await (const worksheet of worksheets(openChunks)) {
       worksheetOrdinal += 1;
+      if (worksheetOrdinal > MAX_WORKSHEETS) throw new Error("XLSX_WORKSHEET_LIMIT");
       for await (const row of worksheet) {
         if (row.number > MAX_HEADER_ROWS) continue;
-        const record = rowValues(row);
+        const record = rowValues(row, budget);
         if (!nonEmpty(record) || record.length < 2) continue;
         for (const mapping of mappings) {
           if (!matchHeader(record, mapping.definition)) continue;
@@ -138,7 +160,7 @@ export async function analyzeXlsxStream(
       }
     }
   } catch (error) {
-    const reason = error instanceof Error && ["XLSX_SHARED_STRINGS_LIMIT", "XLSX_COLUMN_LIMIT"].includes(error.message)
+    const reason = error instanceof Error && /^XLSX_(?:SHARED_STRINGS|COLUMN|CELL|ROW|ROW_SIZE|WORKBOOK_SIZE|WORKSHEET)_LIMIT$/u.test(error.message)
       ? error.message
       : "XLSX_STRUCTURE_UNSUPPORTED";
     return { status: "UNSUPPORTED", reason };
@@ -161,15 +183,17 @@ export async function parseMappedXlsxStream(input: {
   let parsedRows = 0n;
   let repeatedHeaders = 0n;
   let worksheetOrdinal = 0;
+  const budget: WorkbookBudget = { rows: 0, cellBytes: 0 };
 
   for await (const worksheet of worksheets(input.openChunks)) {
     worksheetOrdinal += 1;
+    if (worksheetOrdinal > MAX_WORKSHEETS) throw new Error("XLSX_WORKSHEET_LIMIT");
     let mappingIndexes: ReadonlyMap<string, number> | undefined;
     let headers: string[] | undefined;
     let isRepeatedHeader: ((record: readonly string[]) => boolean) | undefined;
 
     for await (const row of worksheet) {
-      const record = rowValues(row, headers?.length ?? 0);
+      const record = rowValues(row, budget, headers?.length ?? 0);
       if (!nonEmpty(record)) continue;
 
       if (!mappingIndexes && row.number <= MAX_HEADER_ROWS) {

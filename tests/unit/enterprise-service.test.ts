@@ -84,7 +84,7 @@ describe('EnterpriseService', () => {
     })).resolves.toEqual({
       id: memberId,
       displayName: '小陈',
-      phoneMasked: '+861****1234',
+      phoneMasked: '+86 139****1234',
       status: 'PENDING',
       createdAt: '2026-08-04T00:00:00.000Z',
     });

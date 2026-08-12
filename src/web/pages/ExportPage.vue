@@ -17,14 +17,36 @@ const workflow = ref<ShopWorkflow | null>(null);
 const status = ref<"loading" | "ready" | "empty" | "error">("loading");
 const error = ref("");
 const actionError = ref("");
+const routeError = ref("");
 const busy = ref(false);
 const previewBusy = ref(false);
+const preferencesStatus = ref<"loading" | "ready" | "error">("loading");
+const preferencesError = ref("");
 const preview = ref<CostAccountingPreview | null>(null);
 const profitRate = ref("");
 const minimumSalesCostRate = ref("");
 const continentPrefixes = ref<AccountingPreferences["continentPrefixes"]>(["EU"]);
 const autoDownloaded = ref("");
 let timer: number | undefined;
+let reloadInFlight = false;
+let applyingLoadedDefaults = false;
+let profitRateEdited = false;
+let minimumSalesCostRateEdited = false;
+let assumptionRevision = 0;
+let previewRequestSequence = 0;
+
+watch(profitRate, () => {
+  if (applyingLoadedDefaults) return;
+  profitRateEdited = true;
+  assumptionRevision += 1;
+  preview.value = null;
+}, { flush: "sync" });
+watch(minimumSalesCostRate, () => {
+  if (applyingLoadedDefaults) return;
+  minimumSalesCostRateEdited = true;
+  assumptionRevision += 1;
+  preview.value = null;
+}, { flush: "sync" });
 
 const canCreateExport = computed(() => workflow.value?.download.available === true);
 const publishedLabel = computed(() => workflow.value?.publishedSnapshot?.publishedAt
@@ -45,6 +67,8 @@ function periodLabel(period: string): string {
 }
 
 async function reload(silent = false) {
+  if (reloadInFlight) return;
+  reloadInFlight = true;
   if (!silent) status.value = "loading";
   try {
     const [nextJobs, nextWorkflow] = await Promise.all([api.listExports(shopId.value), api.getShopWorkflow(shopId.value)]);
@@ -56,49 +80,79 @@ async function reload(silent = false) {
     const autoId = typeof route.query.auto === "string" ? route.query.auto : "";
     const autoJob = nextJobs.find((job) => job.id === autoId);
     if (autoJob && !autoJob.isCurrentFormat) {
-      actionError.value = "该链接指向旧版导出，请使用当前正式版本的下载入口";
+      routeError.value = "该链接指向旧版导出，请使用当前正式版本的下载入口";
       await router.replace({ name: "workflow-export", params: { shopId: shopId.value } });
     } else if (autoJob?.status === "SUCCEEDED" && autoDownloaded.value !== autoJob.id) {
       autoDownloaded.value = autoJob.id;
       await download(autoJob);
       await router.replace({ name: "workflow-export", params: { shopId: shopId.value } });
-    } else if (autoJob?.status === "FAILED") {
-      actionError.value = autoJob.error ? `导出失败：${autoJob.error}` : "导出生成失败，请重试";
+    } else if (autoId && !autoJob) {
+      routeError.value = "未找到该导出任务，请重新生成";
+      await router.replace({ name: "workflow-export", params: { shopId: shopId.value } });
+    } else if (autoJob && ["FAILED", "CANCELLED", "REVOKED"].includes(autoJob.status)) {
+      routeError.value = autoJob.status === "FAILED"
+        ? (autoJob.error ? `导出失败：${autoJob.error}` : "导出生成失败，请重试")
+        : autoJob.status === "CANCELLED" ? "导出任务已取消" : "导出授权已撤销";
+      await router.replace({ name: "workflow-export", params: { shopId: shopId.value } });
     }
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : "读取下载任务失败";
     status.value = "error";
-  }
+  } finally { reloadInFlight = false; }
 }
 
 async function refreshPreview() {
+  const sequence = ++previewRequestSequence;
+  const revision = assumptionRevision;
   actionError.value = "";
   previewBusy.value = true;
   try {
-    preview.value = await api.previewCostAccounting(shopId.value, currentAssumptions());
+    const nextPreview = await api.previewCostAccounting(shopId.value, currentAssumptions());
+    if (sequence !== previewRequestSequence || revision !== assumptionRevision) return;
+    preview.value = nextPreview;
   } catch (caught) {
+    if (sequence !== previewRequestSequence || revision !== assumptionRevision) return;
     preview.value = null;
     actionError.value = caught instanceof Error ? caught.message : "预览成本测算失败";
   } finally {
-    previewBusy.value = false;
+    if (sequence === previewRequestSequence) previewBusy.value = false;
+  }
+}
+
+async function loadAccountingPreferences() {
+  preferencesStatus.value = "loading";
+  preferencesError.value = "";
+  try {
+    const defaults = await api.getAccountingPreferences();
+    applyingLoadedDefaults = true;
+    try {
+      if (!profitRateEdited) profitRate.value = ratioToPercentInput(defaults.profitRate);
+      if (!minimumSalesCostRateEdited) minimumSalesCostRate.value = ratioToPercentInput(defaults.minimumSalesCostRate);
+      continentPrefixes.value = [...defaults.continentPrefixes];
+    } finally {
+      applyingLoadedDefaults = false;
+    }
+    await refreshPreview();
+    preferencesStatus.value = "ready";
+  } catch (caught) {
+    preferencesStatus.value = "error";
+    preferencesError.value = caught instanceof Error ? `读取默认测算参数失败：${caught.message}` : "读取默认测算参数失败";
   }
 }
 
 async function initialize() {
   await reload();
-  if (!canCreateExport.value || actionError.value) return;
-  try {
-    const defaults = await api.getAccountingPreferences();
-    profitRate.value = ratioToPercentInput(defaults.profitRate);
-    minimumSalesCostRate.value = ratioToPercentInput(defaults.minimumSalesCostRate);
-    continentPrefixes.value = [...defaults.continentPrefixes];
-    await refreshPreview();
-  } catch (caught) {
-    actionError.value = caught instanceof Error ? caught.message : "读取默认测算参数失败";
-  }
+  if (status.value === "error" || !canCreateExport.value) return;
+  await loadAccountingPreferences();
 }
 
 async function createExport() {
+  if (preferencesStatus.value !== "ready") {
+    actionError.value = preferencesStatus.value === "loading"
+      ? "正在读取默认测算参数，请稍候"
+      : "默认测算参数读取失败，请先重试";
+    return;
+  }
   actionError.value = "";
   busy.value = true;
   try {
@@ -174,6 +228,8 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
           <label class="form-field"><span>利润率（可选）</span><span class="suffix-input"><input v-model="profitRate" inputmode="decimal" autocomplete="off" placeholder="留空沿用平台结余" /><b>%</b></span></label>
           <label class="form-field"><span>最低销售成本率（可选）</span><span class="suffix-input"><input v-model="minimumSalesCostRate" inputmode="decimal" autocomplete="off" placeholder="留空不启用下限" /><b>%</b></span></label>
         </div>
+        <p v-if="preferencesStatus === 'loading'" class="sandbox-notice" role="status">正在读取默认测算参数，完成后才能生成报告。</p>
+        <div v-else-if="preferencesStatus === 'error'" class="warning-panel" role="alert"><span>{{ preferencesError }}</span><button class="secondary-button compact" type="button" @click="loadAccountingPreferences">重试读取默认参数</button></div>
         <div class="form-actions"><button class="secondary-button" type="button" :disabled="previewBusy" @click="refreshPreview">{{ previewBusy ? "正在预览" : "预览调整结果" }}</button></div>
         <div v-if="preview" class="cost-preview">
           <dl class="summary-list">
@@ -199,8 +255,8 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
           <p v-if="workflow?.download.usesPreviousPublishedVersion">新一轮数据仍在处理中。当前流程发布完成前，下载保持禁用。</p>
           <p v-else>发布快照与本次两项测算参数都会冻结到导出任务，后续修改不会改变已生成报告。</p>
         </div>
-        <button class="primary-button export-main-button" type="button" :disabled="busy || previewBusy" @click="createExport">{{ busy ? "正在准备" : "生成并下载" }}</button>
-        <p v-if="actionError" class="form-error" role="alert">{{ actionError }}</p>
+        <button class="primary-button export-main-button" type="button" :disabled="busy || previewBusy || preferencesStatus !== 'ready'" @click="createExport">{{ busy ? "正在准备" : "生成并下载" }}</button>
+        <p v-if="routeError" class="form-error" role="alert">{{ routeError }}</p><p v-if="actionError" class="form-error" role="alert">{{ actionError }}</p>
         <ol class="sheet-list" aria-label="导出工作簿结构"><li>口径说明（默认隐藏）</li><li>月度明细账单</li><li>季度明细账单</li><li>年度明细账单</li><li>成本核算表-人民币</li></ol>
       </section>
     </template>
@@ -208,8 +264,8 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
 
     <section class="surface-section">
       <div class="section-heading"><h2>下载任务</h2><p>只有发布快照、格式和两项测算参数完全一致时才会复用已有任务。</p></div>
-      <AsyncState :status="status" :error="error" empty-title="暂无下载任务" empty-message="点击“生成并下载”后，生成进度会显示在这里。" @retry="reload()">
-        <div class="table-scroll" tabindex="0"><table><thead><tr><th>创建时间</th><th>正式版本</th><th>测算参数</th><th>格式</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody><tr v-for="job in jobs" :key="job.id" :data-current="job.isCurrentFormat && job.snapshotId === workflow?.publishedSnapshot?.id ? 'true' : 'false'"><td>{{ new Date(job.createdAt).toLocaleString("zh-CN", { hour12: false }) }}</td><td>{{ versionLabel(job) }}</td><td>利润率 {{ formatRatio(job.profitRate ?? undefined) }} / 下限 {{ formatRatio(job.minimumSalesCostRate ?? undefined) }}</td><td>{{ job.format }}<span v-if="!job.isCurrentFormat">（旧版格式）</span></td><td>{{ job.status }}</td><td><strong>{{ job.progress }}%</strong><br /><small>{{ progressDetails(job) }}</small></td><td><div class="table-actions"><button v-if="['QUEUED','RUNNING'].includes(job.status)" class="secondary-button compact" type="button" @click="cancel(job)">取消</button><button v-if="job.status === 'SUCCEEDED'" class="primary-button compact" type="button" @click="download(job)">{{ job.isCurrentFormat ? "下载" : "下载旧版" }}</button><span v-if="job.status === 'REVOKED'">授权已撤销</span></div></td></tr></tbody></table></div>
+      <AsyncState :status="status" :error="error" empty-title="暂无下载任务" empty-message="点击“生成并下载”后，生成进度会显示在这里。" @retry="initialize()">
+        <div class="table-scroll" tabindex="0"><table><thead><tr><th>创建时间</th><th>正式版本</th><th>测算参数</th><th>格式</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody><tr v-for="job in jobs" :key="job.id" :data-current="job.isCurrentFormat && job.snapshotId === workflow?.publishedSnapshot?.id ? 'true' : 'false'"><td>{{ new Date(job.createdAt).toLocaleString("zh-CN", { hour12: false }) }}</td><td>{{ versionLabel(job) }}</td><td>利润率 {{ formatRatio(job.profitRate ?? undefined) }} / 下限 {{ formatRatio(job.minimumSalesCostRate ?? undefined) }}</td><td>{{ job.format }}<span v-if="!job.isCurrentFormat">（旧版格式）</span></td><td>{{ job.status }}<small v-if="job.status === 'FAILED'"><br />{{ job.error || "EXPORT_GENERATION_FAILED" }}</small></td><td><strong>{{ job.progress }}%</strong><br /><small>{{ progressDetails(job) }}</small></td><td><div class="table-actions"><button v-if="['QUEUED','RUNNING'].includes(job.status)" class="secondary-button compact" type="button" @click="cancel(job)">取消</button><button v-if="job.status === 'SUCCEEDED'" class="primary-button compact" type="button" @click="download(job)">{{ job.isCurrentFormat ? "下载" : "下载旧版" }}</button><button v-if="job.status === 'FAILED' && canCreateExport" class="secondary-button compact" type="button" :disabled="busy || preferencesStatus !== 'ready'" @click="createExport">重新生成</button><span v-if="job.status === 'REVOKED'">授权已撤销</span></div></td></tr></tbody></table></div>
       </AsyncState>
     </section>
   </section>

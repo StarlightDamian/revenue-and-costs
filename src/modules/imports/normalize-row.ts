@@ -1,33 +1,35 @@
 import { Temporal } from "@js-temporal/polyfill";
 import Decimal from "decimal.js";
+import { canonicalTransactionDescription, canonicalTransactionType } from "../calculation/fee-classification.js";
 
-export interface MarketplaceProfile { code: string; timezone: string; currency: string; nonAmazon: boolean }
+export interface MarketplaceProfile { code: string; sourceTimezone: string; currency: string; nonAmazon: boolean }
 
 const MARKETPLACES: Readonly<Record<string, Omit<MarketplaceProfile, "nonAmazon"> >> = {
-  "amazon.com": { code: "US", timezone: "America/Los_Angeles", currency: "USD" },
-  "amazon.ca": { code: "CA", timezone: "America/Toronto", currency: "CAD" },
-  "amazon.com.mx": { code: "MX", timezone: "America/Mexico_City", currency: "MXN" },
-  "amazon.com.br": { code: "BR", timezone: "America/Sao_Paulo", currency: "BRL" },
-  "amazon.co.uk": { code: "UK", timezone: "Europe/London", currency: "GBP" },
-  "amazon.de": { code: "DE", timezone: "Europe/Berlin", currency: "EUR" },
-  "amazon.fr": { code: "FR", timezone: "Europe/Paris", currency: "EUR" },
-  "amazon.it": { code: "IT", timezone: "Europe/Rome", currency: "EUR" },
-  "amazon.es": { code: "ES", timezone: "Europe/Madrid", currency: "EUR" },
-  "amazon.nl": { code: "NL", timezone: "Europe/Amsterdam", currency: "EUR" },
-  "amazon.com.be": { code: "BE", timezone: "Europe/Brussels", currency: "EUR" },
-  "amazon.ie": { code: "IE", timezone: "Europe/Dublin", currency: "EUR" },
-  "amazon.se": { code: "SE", timezone: "Europe/Stockholm", currency: "SEK" },
-  "amazon.pl": { code: "PL", timezone: "Europe/Warsaw", currency: "PLN" },
-  "amazon.co.jp": { code: "JP", timezone: "Asia/Tokyo", currency: "JPY" },
-  "amazon.jp": { code: "JP", timezone: "Asia/Tokyo", currency: "JPY" },
-  "amazon.ae": { code: "AE", timezone: "Asia/Dubai", currency: "AED" },
-  "amazon.sa": { code: "SA", timezone: "Asia/Riyadh", currency: "SAR" },
-  "amazon.com.tr": { code: "TR", timezone: "Europe/Istanbul", currency: "TRY" },
+  "amazon.com": { code: "US", sourceTimezone: "America/Los_Angeles", currency: "USD" },
+  "amazon.ca": { code: "CA", sourceTimezone: "America/Toronto", currency: "CAD" },
+  "amazon.com.mx": { code: "MX", sourceTimezone: "America/Mexico_City", currency: "MXN" },
+  "amazon.com.br": { code: "BR", sourceTimezone: "America/Sao_Paulo", currency: "BRL" },
+  "amazon.com.au": { code: "AU", sourceTimezone: "Australia/Sydney", currency: "AUD" },
+  "amazon.co.uk": { code: "UK", sourceTimezone: "Europe/London", currency: "GBP" },
+  "amazon.de": { code: "DE", sourceTimezone: "Europe/Berlin", currency: "EUR" },
+  "amazon.fr": { code: "FR", sourceTimezone: "Europe/Paris", currency: "EUR" },
+  "amazon.it": { code: "IT", sourceTimezone: "Europe/Rome", currency: "EUR" },
+  "amazon.es": { code: "ES", sourceTimezone: "Europe/Madrid", currency: "EUR" },
+  "amazon.nl": { code: "NL", sourceTimezone: "Europe/Amsterdam", currency: "EUR" },
+  "amazon.com.be": { code: "BE", sourceTimezone: "Europe/Brussels", currency: "EUR" },
+  "amazon.ie": { code: "IE", sourceTimezone: "Europe/Dublin", currency: "EUR" },
+  "amazon.se": { code: "SE", sourceTimezone: "Europe/Stockholm", currency: "SEK" },
+  "amazon.pl": { code: "PL", sourceTimezone: "Europe/Warsaw", currency: "PLN" },
+  "amazon.co.jp": { code: "JP", sourceTimezone: "Asia/Tokyo", currency: "JPY" },
+  "amazon.jp": { code: "JP", sourceTimezone: "Asia/Tokyo", currency: "JPY" },
+  "amazon.ae": { code: "AE", sourceTimezone: "Asia/Dubai", currency: "AED" },
+  "amazon.sa": { code: "SA", sourceTimezone: "Asia/Riyadh", currency: "SAR" },
+  "amazon.com.tr": { code: "TR", sourceTimezone: "Europe/Istanbul", currency: "TRY" },
 };
 
 export function marketplaceProfile(input: string): MarketplaceProfile {
   const key = input.normalize("NFKC").trim().toLocaleLowerCase("und").replace(/^https?:\/\//u, "").replace(/\/$/u, "");
-  if (/non[- ]?amazon/u.test(key)) return { code: "NON_AMAZON", timezone: "UTC", currency: "CNY", nonAmazon: true };
+  if (/non[- ]?amazon/u.test(key)) return { code: "NON_AMAZON", sourceTimezone: "UTC", currency: "CNY", nonAmazon: true };
   const known = MARKETPLACES[key];
   if (!known) throw new Error("IMPORT_UNKNOWN_MARKETPLACE");
   return { ...known, nonAmazon: false };
@@ -108,6 +110,14 @@ export function normalizedSparseDecimal(input: string | undefined): string {
   return !value || value === "-" ? "0.00000000" : normalizedDecimal(value);
 }
 
+export type FulfillmentMode = "AMAZON" | "MERCHANT" | "BLANK";
+
+export function normalizeFulfillment(input: string | undefined): FulfillmentMode {
+  const value = (input ?? "").normalize("NFKC").trim().toLocaleLowerCase("und");
+  if (!value) return "BLANK";
+  return value === "amazon" ? "AMAZON" : "MERCHANT";
+}
+
 const MONTHS: Readonly<Record<string, string>> = {
   jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
   jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
@@ -145,19 +155,31 @@ function displayedDate(value: string): string {
 export function normalizeReportDate(value: string, profile: MarketplaceProfile) {
   try {
     const fxDate = displayedDate(value);
-    const time = /(\d{1,2}):(\d{2}):(\d{2})/u.exec(value);
-    const plain = Temporal.PlainDateTime.from(`${fxDate}T${time ? `${time[1]!.padStart(2, "0")}:${time[2]}:${time[3]}` : "00:00:00"}`);
-    const isoOffset = /(?:T|\s)\d{2}:\d{2}:\d{2}(?:\.\d+)?(Z|[+-]\d{2}:\d{2})\s*$/u.exec(value)?.[1];
+    const time = /(\d{1,2}):(\d{2}):(\d{2})(?:\s*([ap])\.?\s*m\.?)?/iu.exec(value);
+    let hour = time?.[1];
+    const meridiem = time?.[4]?.toLocaleLowerCase("und");
+    if (hour && meridiem) {
+      const twelveHour = Number(hour);
+      if (twelveHour < 1 || twelveHour > 12) throw new Error("IMPORT_REPORT_DATE_INVALID");
+      hour = String((twelveHour % 12) + (meridiem === "p" ? 12 : 0));
+    }
+    const plain = Temporal.PlainDateTime.from(`${fxDate}T${time ? `${hour!.padStart(2, "0")}:${time[2]}:${time[3]}` : "00:00:00"}`);
+    const trailingOffset = /(Z|[+-]\d{2}:?\d{2})\s*$/iu.exec(value)?.[1]?.toUpperCase();
+    const isoOffset = trailingOffset && trailingOffset !== "Z" && !trailingOffset.includes(":")
+      ? `${trailingOffset.slice(0, 3)}:${trailingOffset.slice(3)}`
+      : trailingOffset;
     const gmtOffset = /\b(?:GMT|UTC)\s*([+-])(\d{1,2})(?::?(\d{2}))?\b/iu.exec(value);
     const offset = isoOffset === "Z" ? "UTC" : isoOffset
       ?? (gmtOffset ? `${gmtOffset[1]}${gmtOffset[2]!.padStart(2, "0")}:${gmtOffset[3] ?? "00"}` : undefined);
     const zone = offset ?? (/\bUTC\b/u.test(value) ? "UTC" : /\bJST\b/u.test(value) ? "Asia/Tokyo"
-      : /\bPDT\b/u.test(value) || /\bPST\b/u.test(value) ? "America/Los_Angeles" : profile.timezone);
+      : /\bPDT\b/u.test(value) || /\bPST\b/u.test(value) ? "America/Los_Angeles" : profile.sourceTimezone);
     const instant = offset
       ? Temporal.Instant.from(`${plain.toString()}${offset === "UTC" ? "Z" : offset}`)
       : plain.toZonedDateTime(zone).toInstant();
-    const local = instant.toZonedDateTimeISO(profile.timezone).toPlainDate().toString();
-    return { parsedAt: instant.toString(), sourceTimezone: zone, fxDate, localDate: local, localMonth: `${local.slice(0, 7)}-01` };
+    // localDate/localMonth are compatibility names. Financial grouping follows
+    // the date printed by the report; parsedAt preserves the audited instant
+    // without shifting a row into another report day or month.
+    return { parsedAt: instant.toString(), sourceTimezone: zone, fxDate, localDate: fxDate, localMonth: `${fxDate.slice(0, 7)}-01` };
   } catch (error) {
     if (error instanceof Error && error.message === "IMPORT_REPORT_DATE_INVALID") throw error;
     throw new Error("IMPORT_REPORT_DATE_INVALID", { cause: error });
@@ -165,17 +187,9 @@ export function normalizeReportDate(value: string, profile: MarketplaceProfile) 
 }
 
 export function normalizeTransactionType(value: string): string {
-  const canonical = value.normalize("NFKC").trim().toLocaleLowerCase("und");
-  if (/^(refund|erstattung|remboursement|rimborso|reembolso|zwrot|återbetalning|iade|返金)$/u.test(canonical)) return "REFUND";
-  if (/^(order|bestellung|bestelling|beställning|commande|ordine|pedido|zamówienie|sipariş|注文)$/u.test(canonical)) return "ORDER";
-  if (/(fba|amazon).*(inventory|lager|stockage|almac|保管)/u.test(canonical)) return "FBA_INVENTORY_FEE";
-  if (/(transfer|übertrag|transfert|trasfer|przelew|överför|transferencia|aktarım|振替)/u.test(canonical)) return "TRANSFER";
-  if (/(debt|schuld|dette|debito|dług|skuld|deuda|borç|債務)/u.test(canonical)) return "DEBT";
-  return canonical.replace(/[^\p{L}\p{N}]+/gu, "_").toUpperCase();
+  return canonicalTransactionType(value);
 }
 
 export function normalizeTransactionDescription(value: string): string {
-  const canonical = value.normalize("NFKC").trim().toLocaleLowerCase("und");
-  if (/(cost of advertising|advert|werbung|publicidad|publicité|pubblic|reklam|広告)/u.test(canonical)) return "COST_OF_ADVERTISING";
-  return canonical.replace(/[^\p{L}\p{N}]+/gu, "_").toUpperCase();
+  return canonicalTransactionDescription(value);
 }

@@ -7,6 +7,7 @@ import type { EncryptedObjectStore } from "../../src/modules/storage/encrypted-o
 
 const customer: Actor = { accountId: "customer", status: "ACTIVE", roles: new Set() };
 const owner: Actor = { accountId: "owner", status: "ACTIVE", roles: new Set(["ACCOUNTANT"]), enterpriseIds: new Set(["enterprise-1"]) };
+const administrator: Actor = { accountId: "administrator", status: "ACTIVE", roles: new Set(["ADMIN"]) };
 const assumptions = { profitRate: null, minimumSalesCostRate: null, continentPrefixes: ["EU"] } as const;
 
 function serviceWithClient(query: ReturnType<typeof vi.fn>) {
@@ -16,6 +17,7 @@ function serviceWithClient(query: ReturnType<typeof vi.fn>) {
     if (sql.startsWith("INSERT INTO audit_event")) return { rows: [], rowCount: 1 };
     throw new Error("AUTHORIZATION_ESCAPED_CREATE_TRANSACTION");
   });
+
   const pool = {
     connect: vi.fn(async () => client),
     query: poolQuery,
@@ -25,7 +27,7 @@ function serviceWithClient(query: ReturnType<typeof vi.fn>) {
 }
 
 describe("export create authorization serialization", () => {
-  it("locks membership and shop in the create transaction and stores the locked epoch", async () => {
+  it("locks shop then membership in the create transaction and stores the locked epoch", async () => {
     const query = vi.fn(async (sql: string, parameters?: readonly unknown[]) => {
       void parameters;
       if (["BEGIN", "COMMIT"].includes(sql)) return { rows: [], rowCount: null };
@@ -54,17 +56,48 @@ describe("export create authorization serialization", () => {
     const membershipIndex = sql.findIndex((statement) => statement.includes("FROM shop_membership"));
     const shopIndex = sql.findIndex((statement) => statement.includes("FROM shop WHERE"));
     const insertIndex = sql.findIndex((statement) => statement.startsWith("INSERT INTO export_request"));
-    expect(membershipIndex).toBeGreaterThan(sql.indexOf("BEGIN"));
+    expect(shopIndex).toBeGreaterThan(sql.indexOf("BEGIN"));
     expect(sql[membershipIndex]).toContain("FOR SHARE");
     expect(sql[shopIndex]).toContain("FOR SHARE");
-    expect(membershipIndex).toBeLessThan(shopIndex);
-    expect(shopIndex).toBeLessThan(insertIndex);
+    expect(shopIndex).toBeLessThan(membershipIndex);
+    expect(membershipIndex).toBeLessThan(insertIndex);
     expect(query.mock.calls[insertIndex]?.[1]?.[3]).toBe("7");
     expect(query.mock.calls[insertIndex]?.[1]?.[4]).toBe(`customer:${REPORT_EXPORT_FORMAT}:idempotency-key`);
     expect(query.mock.calls[insertIndex]?.[1]?.[5]).toBe(REPORT_EXPORT_FORMAT);
     const auditCall = query.mock.calls.find((call) => String(call[0]).startsWith("INSERT INTO audit_event"));
     expect(auditCall?.[1]?.[1]).toBe("EXPORT_CREATED");
     expect(pool.query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["enterprise member", owner],
+    ["administrator", administrator],
+  ] as const)("does not bind an %s export to an incidental customer membership", async (_label, actor) => {
+    const query = vi.fn(async (sql: string, parameters?: readonly unknown[]) => {
+      void parameters;
+      if (["BEGIN", "COMMIT"].includes(sql)) return { rows: [], rowCount: null };
+      if (sql.includes("FROM shop WHERE")) return { rows: [{ id: "shop", enterprise_id: "enterprise-1", status: "ACTIVE" }], rowCount: 1 };
+      if (sql.includes("FROM shop_membership")) {
+        return { rows: [{ id: "membership", status: "ACTIVE", export_allowed: true, authorization_epoch: "7" }], rowCount: 1 };
+      }
+      if (sql.includes("FROM published_snapshot")) return { rows: [{ id: "snapshot" }], rowCount: 1 };
+      if (sql.includes("pg_advisory_xact_lock")) return { rows: [{}], rowCount: 1 };
+      if (sql.includes("FROM export_request WHERE business_key")) return { rows: [], rowCount: 0 };
+      if (sql.startsWith("INSERT INTO export_request")) {
+        return { rows: [{ id: "export", shop_id: "shop", published_snapshot_id: "snapshot", status: "QUEUED", output_kind: null, format_version: REPORT_EXPORT_FORMAT, continent_prefixes: ["EU"], created_at: new Date("2026-07-28T00:00:00Z") }], rowCount: 1 };
+      }
+      if (sql.startsWith("INSERT INTO outbox_event") || sql.startsWith("INSERT INTO audit_event")) {
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`UNEXPECTED_QUERY:${sql}`);
+    });
+    const { service } = serviceWithClient(query);
+
+    await expect(service.create(actor, "shop", "snapshot", `idempotency-${actor.accountId}`, "request-create", assumptions))
+      .resolves.toMatchObject({ id: "export", status: "QUEUED" });
+
+    const insert = query.mock.calls.find((call) => String(call[0]).startsWith("INSERT INTO export_request"));
+    expect(insert?.[1]?.[3]).toBeNull();
   });
 
   it("names an idempotent replay without claiming that it created a second export", async () => {

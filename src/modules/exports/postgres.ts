@@ -442,9 +442,13 @@ export class PostgresExportService {
   }
 
   private async authorizeCreate(client: PoolClient, actor: Actor, shopId: string): Promise<ExportAccessRow> {
-    // Membership changes lock this row before updating its authorization epoch.
-    // Taking the same lock inside the create transaction prevents a revocation
-    // scan from completing before a stale-epoch export is inserted.
+    // Membership management locks the parent shop before changing membership.
+    // Keep the same order here, then hold both locks until export insertion so
+    // a revocation cannot complete before a stale-epoch export is inserted.
+    const shop = await client.query<{ id: string; enterprise_id: string; status: ShopStatus }>(
+      "SELECT id,enterprise_id,status FROM shop WHERE id=$1 FOR SHARE",
+      [shopId],
+    );
     const membership = await client.query<{
       id: string;
       status: MembershipStatus;
@@ -456,10 +460,6 @@ export class PostgresExportService {
         WHERE shop_id=$1 AND account_id=$2
         FOR SHARE`,
       [shopId, actor.accountId],
-    );
-    const shop = await client.query<{ id: string; enterprise_id: string; status: ShopStatus }>(
-      "SELECT id,enterprise_id,status FROM shop WHERE id=$1 FOR SHARE",
-      [shopId],
     );
     const shopRow = shop.rows[0];
     if (!shopRow) throw new AuthorizationError();
@@ -484,10 +484,14 @@ export class PostgresExportService {
     if (job.requested_by !== actor.accountId && !actor.roles.has("ADMIN") && !actor.enterpriseIds?.has(access.enterprise_id)) {
       throw new AuthorizationError();
     }
-    const usesCustomerMembership = !actor.enterpriseIds?.has(access.enterprise_id) && !actor.roles.has("ADMIN");
+    const usesCustomerMembership = this.usesCustomerMembership(actor, access);
     if (usesCustomerMembership && access.membership_id && job.membership_authorization_version !== access.authorization_epoch) {
       throw new AuthorizationError();
     }
+  }
+
+  private usesCustomerMembership(actor: Actor, access: ExportAccessRow): boolean {
+    return !actor.enterpriseIds?.has(access.enterprise_id) && !actor.roles.has("ADMIN");
   }
 
   async create(
@@ -501,6 +505,7 @@ export class PostgresExportService {
     try {
       return await withTransaction(this.pool,async(client)=>{
         const access=await this.authorizeCreate(client,actor,shopId);
+        const customerBinding=this.usesCustomerMembership(actor,access);
         const assumptions = await this.resolveAccountingAssumptions(actor.accountId, assumptionInput, client);
         const snap=await client.query("SELECT id FROM published_snapshot WHERE id=$1 AND shop_id=$2",[snapshotId,shopId]);
         if(!snap.rows[0]) throw new Error("SNAPSHOT_NOT_FOUND");
@@ -525,7 +530,7 @@ export class PostgresExportService {
             `INSERT INTO export_request(shop_id,requested_by,published_snapshot_id,membership_authorization_version,status,business_key,format_version,profit_rate,minimum_sales_cost_rate,continent_prefixes,expires_at)
              VALUES($1,$2,$3,$4,'QUEUED',$5,$6,$7::numeric,$8::numeric,$9::text[],clock_timestamp()+interval '7 days')
              RETURNING id,shop_id,published_snapshot_id,status,output_kind,format_version,created_at,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at`,
-            [shopId,actor.accountId,snapshotId,access.membership_id?access.authorization_epoch:null,businessKey,REPORT_EXPORT_FORMAT,assumptions.profitRate,assumptions.minimumSalesCostRate,assumptions.continentPrefixes],
+            [shopId,actor.accountId,snapshotId,customerBinding?access.authorization_epoch:null,businessKey,REPORT_EXPORT_FORMAT,assumptions.profitRate,assumptions.minimumSalesCostRate,assumptions.continentPrefixes],
           )).rows[0];
         }
         if(!row) throw new Error("EXPORT_CREATE_FAILED");
@@ -735,7 +740,7 @@ export class PostgresExportService {
         const exported=await client.query<{requested_by:string;membership_authorization_version:string|null;status:string}>("SELECT requested_by,membership_authorization_version::text,status FROM export_request WHERE id=$1 AND shop_id=$2 FOR UPDATE",[id,shopId]);
         const job=exported.rows[0];if(!job)throw new AuthorizationError();this.requireExportJobActor(actor,access,job);
         if(job.status!=="SUCCEEDED")throw new AppError("EXPORT_NOT_READY","导出尚未完成",409);
-        const customerBinding=!actor.enterpriseIds?.has(access.enterprise_id)&&!actor.roles.has("ADMIN");
+        const customerBinding=this.usesCustomerMembership(actor,access);
         await client.query(
           `INSERT INTO export_download_grant
             (export_request_id,shop_id,account_id,membership_id,membership_authorization_version,token_hash,expires_at)
@@ -762,13 +767,13 @@ export class PostgresExportService {
         const located=await client.query<{shop_id:string}>("SELECT shop_id FROM export_download_grant WHERE export_request_id=$1 AND token_hash=$2 AND account_id=$3",[id,tokenHash,actor.accountId]);
         const shopId=located.rows[0]?.shop_id;if(!shopId)throw new AuthorizationError();
         const access=await this.authorizeCreate(client,actor,shopId);
-        const exported=await client.query<{requested_by:string;membership_authorization_version:string|null;status:string;storage_path:string|null;output_kind:string|null;encryption_context:Record<string,string>|null;shop_name:string}>(
-          `SELECT er.requested_by,er.membership_authorization_version::text,er.status,so.storage_path,er.output_kind,so.encryption_context,s.name shop_name
+        const exported=await client.query<{requested_by:string;membership_authorization_version:string|null;status:string;storage_path:string|null;output_kind:string|null;encryption_context:Record<string,string>|null;plaintext_size:string|null;shop_name:string}>(
+          `SELECT er.requested_by,er.membership_authorization_version::text,er.status,so.storage_path,er.output_kind,so.encryption_context,so.plaintext_size,s.name shop_name
              FROM export_request er LEFT JOIN stored_object so ON so.id=er.output_object_id JOIN shop s ON s.id=er.shop_id
             WHERE er.id=$1 AND er.shop_id=$2 FOR SHARE OF er`,[id,shopId]);
         const job=exported.rows[0];if(!job)throw new AuthorizationError();this.requireExportJobActor(actor,access,job);
-        if(job.status!=="SUCCEEDED"||!job.storage_path||!job.output_kind||!job.encryption_context)throw new AuthorizationError();
-        const customerBinding=!actor.enterpriseIds?.has(access.enterprise_id)&&!actor.roles.has("ADMIN");
+        if(job.status!=="SUCCEEDED"||!job.storage_path||!job.output_kind||!job.encryption_context||!job.plaintext_size)throw new AuthorizationError();
+        const customerBinding=this.usesCustomerMembership(actor,access);
         const consumed=await client.query<{id:string}>(
           `UPDATE export_download_grant SET consumed_at=clock_timestamp()
             WHERE export_request_id=$1 AND token_hash=$2 AND account_id=$3
@@ -784,9 +789,9 @@ export class PostgresExportService {
           action: "EXPORT_DOWNLOAD_AUTHORIZED", result: "SUCCEEDED", reason: null, requestId,
           before: { tokenState: "ACTIVE" }, after: { tokenState: "CONSUMED" },
         });
-        return {storagePath:job.storage_path,outputKind:job.output_kind,encryptionContext:job.encryption_context,shopName:job.shop_name};
+        return {storagePath:job.storage_path,outputKind:job.output_kind,encryptionContext:job.encryption_context,contentLength:job.plaintext_size,shopName:job.shop_name};
       });
-      return {stream:this.store.createDecryptionStream(file.storagePath,file.encryptionContext),fileName:exportDownloadFileName(file.shopName,file.outputKind),mediaType:file.outputKind==='ZIP'?'application/zip':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'};
+      return {stream:this.store.createDecryptionStream(file.storagePath,file.encryptionContext),fileName:exportDownloadFileName(file.shopName,file.outputKind),mediaType:file.outputKind==='ZIP'?'application/zip':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',contentLength:file.contentLength};
     } catch (error) {
       await this.auditFailure(actor,"export_request",id,"EXPORT_DOWNLOAD_FAILED",requestId,{});
       throw error;

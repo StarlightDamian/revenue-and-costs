@@ -4,6 +4,17 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@9.15.4",
+  "pnpm": {
+    "overrides": {
+      "brace-expansion@<2.0.0": "1.1.18",
+      "brace-expansion@>=2.0.0 <3.0.0": "2.1.4",
+      "brace-expansion@>=4.0.0 <6.0.0": "5.0.9",
+      "fast-uri@>=3.0.0 <4.0.0": "3.1.5",
+      "fast-uri@>=4.0.0 <5.0.0": "4.1.2",
+      "nanoid@>=3.0.0 <4.0.0": "3.3.17",
+      "uuid@<11.1.1": "11.1.1"
+    }
+  },
   "engines": {
     "node": ">=24 <25",
     "pnpm": ">=9.15 <10"
@@ -18,16 +29,23 @@
     "db:status": "tsx scripts/db-status.ts",
     "db:bootstrap-admin": "tsx scripts/bootstrap-admin.ts",
     "db:bootstrap-mappings": "tsx scripts/bootstrap-mappings.ts",
-    "fx:sync": "tsx scripts/sync-fx.ts",
-    "test": "vitest run",
+    "db:assert-production-initial-state": "tsx scripts/assert-production-initial-state.ts",
+    "fx:sync": "node dist/cli/sync-fx.js",
+    "test": "vitest run --exclude \"tests/integration/**\"",
     "test:watch": "vitest",
-    "test:e2e": "playwright test",
+    "test:postgres": "vitest run tests/integration --exclude \"tests/integration/operations-recovery-runtime.test.ts\" --exclude \"tests/integration/report-acceptance-postgres.test.ts\"",
+    "test:report-acceptance": "vitest run tests/integration/report-acceptance-postgres.test.ts",
+    "test:recovery": "vitest run tests/integration/operations-recovery-runtime.test.ts",
+    "test:ui-contract": "playwright test",
+    "test:e2e": "pnpm test:ui-contract",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit && vue-tsc --noEmit",
     "build:web": "vite build",
     "build:server": "tsup src/api/index.ts src/worker/index.ts --format esm --sourcemap --out-dir dist/server --clean",
-    "build": "pnpm typecheck && pnpm build:web && pnpm build:server",
-    "verify": "pnpm test && pnpm lint && pnpm typecheck && pnpm build"
+    "build:cli": "tsup scripts/migrate.ts scripts/db-status.ts scripts/bootstrap-admin.ts scripts/bootstrap-mappings.ts scripts/assert-production-initial-state.ts scripts/sync-fx.ts --format esm --sourcemap --out-dir dist/cli --clean",
+    "build": "pnpm typecheck && pnpm build:web && pnpm build:server && pnpm build:cli",
+    "verify": "pnpm test && pnpm lint && pnpm typecheck && pnpm build",
+    "verify:release": "pnpm verify && pnpm test:postgres && pnpm test:ui-contract"
   },
   "dependencies": {
     "@aws-crypto/client-node": "5.0.2",
@@ -57,7 +75,7 @@
     "@types/pg": "8.20.0",
     "@types/yauzl": "3.4.0",
     "@vitejs/plugin-vue": "6.0.8",
-    "esbuild": "0.28.0",
+    "esbuild": "0.28.1",
     "eslint": "9.39.2",
     "eslint-plugin-vue": "10.10.0",
     "tsup": "8.5.0",

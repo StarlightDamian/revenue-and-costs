@@ -4,7 +4,7 @@ import shipmentMenuUrl from "../../../nas/image/配送货件1.png";
 import shipmentDownloadUrl from "../../../nas/image/配送货件2.png";
 import transactionMenuUrl from "../../../nas/image/交易报告1.png";
 import transactionRequestUrl from "../../../nas/image/交易报告2.png";
-import folderGuideUrl from "../../../nas/image/资料教程-站点文件夹-沈星回.png";
+import folderGuideUrl from "../../../nas/image/资料教程-站点文件夹-沈星回.webp";
 
 interface TutorialSlide {
   readonly stepIndex: number;

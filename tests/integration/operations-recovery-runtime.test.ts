@@ -7,35 +7,43 @@ import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { migrate } from '../../src/db/migrate.js';
 import { replicateStoredObject } from '../../src/modules/operations/replication.js';
+import { requireDedicatedTestDatabaseUrl } from './postgres-harness.js';
 
-const sourceDatabaseUrl = process.env.OPERATIONS_TEST_SOURCE_DATABASE_URL;
-const restoreDatabaseUrl = process.env.OPERATIONS_TEST_RESTORE_DATABASE_URL;
 const pgBin = process.env.OPERATIONS_TEST_PG_BIN ?? 'D:\\Program Files\\PostgreSQL\\17\\bin';
-const enabled = Boolean(sourceDatabaseUrl && restoreDatabaseUrl);
+const sourceDatabaseUrl = requireDedicatedTestDatabaseUrl('OPERATIONS_TEST_SOURCE_DATABASE_URL');
+const restoreDatabaseUrl = requireDedicatedTestDatabaseUrl('OPERATIONS_TEST_RESTORE_DATABASE_URL');
+const sourceTarget = new URL(sourceDatabaseUrl);
+const restoreTarget = new URL(restoreDatabaseUrl);
+if (`${sourceTarget.hostname}:${sourceTarget.port}${sourceTarget.pathname}` === `${restoreTarget.hostname}:${restoreTarget.port}${restoreTarget.pathname}`) {
+  throw new Error('OPERATIONS_TEST_DATABASES_MUST_DIFFER');
+}
 
-describe.skipIf(!enabled)('authenticated encrypted backup and isolated restore', () => {
-  const source = new Pool({ connectionString: sourceDatabaseUrl });
-  const restore = new Pool({ connectionString: restoreDatabaseUrl });
+describe('authenticated encrypted backup and isolated restore', () => {
+  let source: Pool | undefined;
+  let restore: Pool | undefined;
   let root = '';
 
   beforeAll(async () => {
+    source = new Pool({ connectionString: sourceDatabaseUrl });
+    restore = new Pool({ connectionString: restoreDatabaseUrl });
     await migrate(source);
     root = await mkdtemp(join(tmpdir(), 'revenue-recovery-'));
   });
 
   afterAll(async () => {
-    await Promise.all([source.end(), restore.end()]);
-    if (root) {
-      const clearReadonly = async (directory: string): Promise<void> => {
-        await chmod(directory, 0o700).catch(() => undefined);
-        for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
-          const path = join(directory, entry.name);
-          if (entry.isDirectory()) await clearReadonly(path);
-          else await chmod(path, 0o600).catch(() => undefined);
-        }
-      };
-      await clearReadonly(root);
+    try {
+      await Promise.all([source?.end(), restore?.end()]);
+    } finally {
       if (root) {
+        const clearReadonly = async (directory: string): Promise<void> => {
+          await chmod(directory, 0o700).catch(() => undefined);
+          for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+            const path = join(directory, entry.name);
+            if (entry.isDirectory()) await clearReadonly(path);
+            else await chmod(path, 0o600).catch(() => undefined);
+          }
+        };
+        await clearReadonly(root);
         await rm(root, { recursive: true, force: true });
       }
     }
@@ -56,6 +64,7 @@ describe.skipIf(!enabled)('authenticated encrypted backup and isolated restore',
   }
 
   it('authenticates the manifest, encrypts the dump, records failures, and verifies restored invariants', async () => {
+    if (!source || !restore) throw new Error('OPERATIONS_TEST_DATABASES_NOT_INITIALIZED');
     const backupRoot = join(root, 'backup');
     const controlledTemp = join(root, 'controlled-temp');
     const manifestKey = join(root, 'manifest.key');

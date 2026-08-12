@@ -3,6 +3,12 @@ export interface DroppedFile {
   readonly relativePath: string;
 }
 
+export interface MergedFileSelection {
+  readonly files: readonly DroppedFile[];
+  readonly added: number;
+  readonly replaced: number;
+}
+
 interface BrowserFileEntry {
   readonly isFile: true;
   readonly isDirectory: false;
@@ -25,8 +31,48 @@ interface BrowserDirectoryEntry {
 
 type BrowserEntry = BrowserFileEntry | BrowserDirectoryEntry;
 
+function normalizedRelativePath(value: string): string {
+  return value.replaceAll("\\", "/").normalize("NFC");
+}
+
+export function mergeFileSelections(
+  existing: readonly DroppedFile[],
+  incoming: readonly DroppedFile[],
+): MergedFileSelection {
+  const files: DroppedFile[] = [];
+  const indexByPath = new Map<string, number>();
+  for (const item of existing) {
+    const relativePath = normalizedRelativePath(item.relativePath);
+    const normalized = { file: item.file, relativePath };
+    const index = indexByPath.get(relativePath);
+    if (index === undefined) {
+      indexByPath.set(relativePath, files.length);
+      files.push(normalized);
+    } else {
+      files[index] = normalized;
+    }
+  }
+
+  let added = 0;
+  let replaced = 0;
+  for (const item of incoming) {
+    const relativePath = normalizedRelativePath(item.relativePath);
+    const normalized = { file: item.file, relativePath };
+    const index = indexByPath.get(relativePath);
+    if (index === undefined) {
+      indexByPath.set(relativePath, files.length);
+      files.push(normalized);
+      added += 1;
+    } else {
+      files[index] = normalized;
+      replaced += 1;
+    }
+  }
+  return { files, added, replaced };
+}
+
 function pathOf(entry: BrowserEntry, fallback: string): string {
-  const normalized = entry.fullPath.replaceAll("\\", "/").replace(/^\/+|\/+$/gu, "");
+  const normalized = normalizedRelativePath(entry.fullPath).replace(/^\/+|\/+$/gu, "");
   return normalized || fallback;
 }
 

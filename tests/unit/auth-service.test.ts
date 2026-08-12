@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   AuthService,
   SandboxSmsProvider,
+  TemporaryAdminSmsProvider,
   type AccountRecord,
   type AuthRepository,
   type OtpChallengeRecord,
@@ -27,6 +28,7 @@ class MemoryAuthRepository implements AuthRepository {
     readonly requestId: string;
   }> = [];
   failLoginAuditWrite = false;
+  sessionClients: Array<SqlClient | undefined> = [];
   account: AccountRecord = {
     id: '10000000-0000-4000-8000-000000000001',
     phoneE164: '+8613800000000',
@@ -102,7 +104,11 @@ class MemoryAuthRepository implements AuthRepository {
     return id === this.account.id ? this.account : null;
   }
 
-  async createSessionWithLoginAudit(input: Parameters<AuthRepository['createSessionWithLoginAudit']>[0]) {
+  async createSessionWithLoginAudit(
+    input: Parameters<AuthRepository['createSessionWithLoginAudit']>[0],
+    client?: SqlClient,
+  ) {
+    this.sessionClients.push(client);
     if (this.failLoginAuditWrite) throw new Error('audit unavailable');
     const id = `session-${this.sessions.size + 1}`;
     const loginSequence = String(this.sessions.size + 1);
@@ -150,6 +156,10 @@ class MemoryAuthRepository implements AuthRepository {
     this.account = { ...this.account, avatarId };
   }
 
+  async updateDisplayName(_accountId: string, displayName: string | null) {
+    this.account = { ...this.account, displayName };
+  }
+
   async bootstrapAdministrator() {
     return this.account;
   }
@@ -160,6 +170,106 @@ class MemoryAuthRepository implements AuthRepository {
 }
 
 describe('AuthService', () => {
+  it('limits the temporary fixed code to login for the configured administrator and never discloses it', async () => {
+    const repository = new MemoryAuthRepository();
+    const service = new AuthService(
+      repository,
+      new TemporaryAdminSmsProvider(repository.account.phoneE164),
+      {
+        otpSecret: Buffer.alloc(32, 1),
+        privacySecret: Buffer.alloc(32, 2),
+        temporaryAdminOtpCode: '246810',
+      },
+    );
+
+    const challenge = await service.requestOtp({
+      phone: repository.account.phoneE164,
+      purpose: 'LOGIN',
+      ip: '127.0.0.1',
+      deviceId: 'temporary-admin-login',
+    });
+    expect(challenge).not.toHaveProperty('sandboxCode');
+    await expect(service.verifyLogin({
+      challengeId: challenge.challengeId,
+      phone: repository.account.phoneE164,
+      code: '246810',
+      requestId: 'temporary-admin-login',
+    })).resolves.toMatchObject({ account: { id: repository.account.id } });
+
+    await expect(service.requestOtp({
+      phone: '+8613900000000',
+      purpose: 'LOGIN',
+      ip: '127.0.0.2',
+      deviceId: 'other-phone',
+    })).rejects.toMatchObject({ code: 'OTP_DELIVERY_UNAVAILABLE', statusCode: 503 });
+    await expect(service.requestOtp({
+      phone: repository.account.phoneE164,
+      purpose: 'REGISTER',
+      ip: '127.0.0.3',
+      deviceId: 'temporary-register',
+    })).rejects.toMatchObject({ code: 'OTP_DELIVERY_UNAVAILABLE', statusCode: 503 });
+    expect(repository.challenges.size).toBe(1);
+
+    const serialized = JSON.stringify(repository.loginAudits);
+    expect(serialized).not.toContain('246810');
+    expect(serialized).not.toContain(repository.account.phoneE164);
+  });
+
+  it('allows opt-in fixed-code registration and login while keeping phone changes disabled', async () => {
+    const repository = new MemoryAuthRepository();
+    const registeredPhone = '+8613900000000';
+    const service = new AuthService(
+      repository,
+      new TemporaryAdminSmsProvider(repository.account.phoneE164, true),
+      {
+        otpSecret: Buffer.alloc(32, 1),
+        privacySecret: Buffer.alloc(32, 2),
+        temporaryAdminOtpCode: '246810',
+      },
+    );
+
+    const registration = await service.requestOtp({
+      phone: registeredPhone,
+      purpose: 'REGISTER',
+      ip: '127.0.0.1',
+      deviceId: 'temporary-public-register',
+    });
+    expect(registration).not.toHaveProperty('sandboxCode');
+    const registeredSession = await service.verifyRegistration({
+      challengeId: registration.challengeId,
+      phone: registeredPhone,
+      code: '246810',
+      displayName: '新做账员',
+      requestId: 'temporary-public-registration',
+    });
+    expect(registeredSession).toMatchObject({
+      account: { displayName: '新做账员', phoneE164: registeredPhone },
+      isFirstLogin: true,
+    });
+    await expect(service.authenticate(registeredSession.sessionToken)).resolves.toMatchObject({ isFirstLogin: true });
+    expect(repository.account.roles).toEqual(new Set(['ACCOUNTANT']));
+
+    const login = await service.requestOtp({
+      phone: registeredPhone,
+      purpose: 'LOGIN',
+      ip: '127.0.0.2',
+      deviceId: 'temporary-public-login',
+    });
+    await expect(service.verifyLogin({
+      challengeId: login.challengeId,
+      phone: registeredPhone,
+      code: '246810',
+      requestId: 'temporary-public-login',
+    })).resolves.toMatchObject({ account: { phoneE164: registeredPhone }, isFirstLogin: false });
+
+    await expect(service.requestOtp({
+      phone: registeredPhone,
+      purpose: 'PHONE_CHANGE_NEW',
+      ip: '127.0.0.3',
+      deviceId: 'temporary-phone-change',
+    })).rejects.toMatchObject({ code: 'OTP_DELIVERY_UNAVAILABLE', statusCode: 503 });
+  });
+
   it('marks only the first successfully issued login session as initial', async () => {
     const repository = new MemoryAuthRepository();
     const sms = new SandboxSmsProvider();
@@ -182,7 +292,7 @@ describe('AuthService', () => {
     await expect(service.authenticate(second.sessionToken)).resolves.toMatchObject({ isFirstLogin: false });
   });
 
-  it('固定沙箱验证码完成实名注册后仍需重新登录', async () => {
+  it('固定沙箱验证码完成实名注册后直接签发首个正常会话', async () => {
     const repository = new MemoryAuthRepository();
     repository.account = { ...repository.account, displayName: null, registeredAt: null, roles: new Set() };
     const service = new AuthService(repository, new SandboxSmsProvider(), {
@@ -204,24 +314,27 @@ describe('AuthService', () => {
     const registration = await service.requestOtp({
       phone: '+8613800000000', purpose: 'REGISTER', ip: '127.0.0.1', deviceId: 'register-device',
     });
-    await expect(service.verifyRegistration({
+    const session = await service.verifyRegistration({
       challengeId: registration.challengeId,
       phone: '+8613800000000',
       code: '246810',
       displayName: '  注册管理员  ',
-    })).resolves.toMatchObject({ displayName: '注册管理员' });
+      requestId: 'registration-session',
+    });
+    expect(session).toMatchObject({ account: { displayName: '注册管理员' }, isFirstLogin: true });
     expect(repository.account.avatarId).toBeGreaterThanOrEqual(1);
     expect(repository.account.avatarId).toBeLessThanOrEqual(59);
     expect(repository.account.roles).toEqual(new Set(['ADMIN']));
-    expect(repository.sessions.size).toBe(0);
-
-    const login = await service.requestOtp({
-      phone: '+8613800000000', purpose: 'LOGIN', ip: '127.0.0.1', deviceId: 'login-after-register',
-    });
-    const session = await service.verifyLogin({
-      challengeId: login.challengeId, phone: '+8613800000000', code: '246810', requestId: 'login-after-registration',
-    });
+    expect(repository.sessions.size).toBe(1);
+    expect(repository.sessionClients).toEqual([dummyClient]);
     expect(session.account.displayName).toBe('注册管理员');
+    await expect(service.authenticate(session.sessionToken)).resolves.toMatchObject({ isFirstLogin: true });
+    await expect(service.verifyRegistration({
+      challengeId: registration.challengeId,
+      phone: '+8613800000000',
+      code: '246810',
+      requestId: 'registration-replay',
+    })).rejects.toMatchObject({ code: 'OTP_INVALID' });
     expect(repository.loginAudits).toEqual([
       expect.objectContaining({
         actorAccountId: null,
@@ -235,7 +348,7 @@ describe('AuthService', () => {
         objectType: 'account',
         objectId: repository.account.id,
         result: 'SUCCEEDED',
-        requestId: 'login-after-registration',
+        requestId: 'registration-session',
       }),
     ]);
     expect(JSON.stringify(repository.loginAudits)).not.toContain(repository.account.phoneE164);
@@ -243,6 +356,20 @@ describe('AuthService', () => {
     await expect(service.setAvatar(repository.account.id, 59)).resolves.toBeUndefined();
     expect(repository.account.avatarId).toBe(59);
     await expect(service.setAvatar(repository.account.id, 60)).rejects.toMatchObject({ code: 'AVATAR_INVALID' });
+    await expect(service.setDisplayName(repository.account.id, '  海\u0065\u0301  ')).resolves.toBeUndefined();
+    expect(repository.account.displayName).toBe('海é');
+    await expect(service.setDisplayName(repository.account.id, '   ')).resolves.toBeUndefined();
+    expect(repository.account.displayName).toBeNull();
+    await expect(service.setDisplayName(repository.account.id, '名'.repeat(81)))
+      .rejects.toMatchObject({ code: 'DISPLAY_NAME_INVALID', statusCode: 400 });
+    await expect(service.setDisplayName(repository.account.id, '😀'.repeat(80))).resolves.toBeUndefined();
+    expect(repository.account.displayName).toBe('😀'.repeat(80));
+    await expect(service.setDisplayName(repository.account.id, '😀'.repeat(81)))
+      .rejects.toMatchObject({ code: 'DISPLAY_NAME_INVALID', statusCode: 400 });
+    await expect(service.setDisplayName(repository.account.id, 'e\u0301'.repeat(80))).resolves.toBeUndefined();
+    expect(repository.account.displayName).toBe('é'.repeat(80));
+    await expect(service.setDisplayName(repository.account.id, '可见\u0000名称'))
+      .rejects.toMatchObject({ code: 'DISPLAY_NAME_INVALID', statusCode: 400 });
   });
 
   it('OTP 在事务语义下仅消费一次，并签发摘要会话和 CSRF', async () => {

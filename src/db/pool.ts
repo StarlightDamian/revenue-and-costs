@@ -1,4 +1,5 @@
 import pg, { type Pool, type PoolClient } from "pg";
+import { DATABASE_POOL_LIMITS, type DatabasePoolPurpose } from "./connection-budget.js";
 
 pg.types.setTypeParser(20, (value) => value);
 pg.types.setTypeParser(1700, (value) => value);
@@ -6,8 +7,14 @@ pg.types.setTypeParser(1700, (value) => value);
 // JavaScript Date silently introduces the process timezone.
 pg.types.setTypeParser(1082, (value) => value);
 
-export function createPool(connectionString: string): Pool {
-  return new pg.Pool({ connectionString, max: 12, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 });
+export function createPool(connectionString: string, purpose: DatabasePoolPurpose): Pool {
+  return new pg.Pool({
+    connectionString,
+    application_name: `revenue-costs-${purpose}`,
+    max: DATABASE_POOL_LIMITS[purpose],
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 5_000,
+  });
 }
 
 export type Transaction = PoolClient;

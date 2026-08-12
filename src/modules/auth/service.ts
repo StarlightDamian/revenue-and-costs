@@ -1,5 +1,5 @@
 import { randomInt, randomUUID } from 'node:crypto';
-import type { Actor, PlatformRole } from '../authorization/index.js';
+import type { Actor, PlatformRole, SqlClient } from '../authorization/index.js';
 import { constantTimeEqual, createOtpCode, normalizePhone, otpHmac, privacyDigest, randomToken, tokenDigest } from './crypto.js';
 import type { AccountRecord, AuthRepository, LoginFailureCode, OtpPurpose, SmsProvider } from './model.js';
 
@@ -11,6 +11,7 @@ export interface AuthServiceOptions {
   readonly now?: () => Date;
   readonly allowSandboxCodeDisclosure?: boolean;
   readonly sandboxOtpCode?: string;
+  readonly temporaryAdminOtpCode?: string;
   readonly registrationAdminPhoneE164?: string;
 }
 
@@ -21,6 +22,14 @@ export interface SessionCredentials {
   readonly expiresAt: string;
   readonly account: AccountRecord;
   readonly isFirstLogin: boolean;
+}
+
+function hasUnsupportedDisplayNameCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      (codePoint >= 0xd800 && codePoint <= 0xdfff);
+  });
 }
 
 export class AuthFailure extends Error {
@@ -51,6 +60,12 @@ export class AuthService {
     if (options.sandboxOtpCode && (sms.kind !== 'SANDBOX' || !/^[0-9]{6}$/u.test(options.sandboxOtpCode))) {
       throw new Error('固定验证码只能用于沙箱且必须是 6 位数字');
     }
+    if (options.temporaryAdminOtpCode && (sms.kind !== 'TEMPORARY_ADMIN' || !/^[0-9]{6}$/u.test(options.temporaryAdminOtpCode))) {
+      throw new Error('临时管理员验证码只能用于受限管理员适配器且必须是 6 位数字');
+    }
+    if (sms.kind === 'TEMPORARY_ADMIN' && (!options.temporaryAdminOtpCode || options.allowSandboxCodeDisclosure)) {
+      throw new Error('受限管理员适配器必须配置固定验证码且不得向客户端披露');
+    }
     this.now = options.now ?? (() => new Date());
     this.otpTtlMs = options.otpTtlMs ?? 5 * 60_000;
     this.sessionTtlMs = options.sessionTtlMs ?? 7 * 24 * 60 * 60_000;
@@ -63,10 +78,13 @@ export class AuthService {
     readonly deviceId: string;
   }): Promise<{ readonly challengeId: string; readonly expiresAt: string; readonly sandboxCode?: string }> {
     const phoneE164 = normalizePhone(input.phone);
+    this.sms.validateOtpRequest?.({ phoneE164, purpose: input.purpose });
     const id = randomUUID();
     const code = this.sms.kind === 'SANDBOX' && this.options.sandboxOtpCode
       ? this.options.sandboxOtpCode
-      : createOtpCode();
+      : this.sms.kind === 'TEMPORARY_ADMIN'
+        ? this.options.temporaryAdminOtpCode!
+        : createOtpCode();
     const now = this.now();
     const expiresAt = new Date(now.getTime() + this.otpTtlMs);
     await this.repository.createOtpChallengeAfterRateCheck({
@@ -171,7 +189,8 @@ export class AuthService {
     readonly phone: string;
     readonly code: string;
     readonly displayName?: string;
-  }): Promise<{ readonly accountId: string; readonly displayName?: string; readonly registeredAt: string }> {
+    readonly requestId: string;
+  }): Promise<SessionCredentials> {
     const phoneE164 = normalizePhone(input.phone);
     const displayName = input.displayName?.trim().normalize('NFC') || null;
     if (displayName && Array.from(displayName).length > 80) {
@@ -194,26 +213,27 @@ export class AuthService {
         return { verified: false } as const;
       }
       await this.repository.consumeOtp(client, challenge.id, now);
+      const registration = await this.repository.registerLoginAccount(client, {
+        phoneE164,
+        displayName,
+        avatarId: randomInt(1, 60),
+        verifiedAt: now,
+        grantAdministrator: this.options.registrationAdminPhoneE164 === phoneE164,
+      });
+      if (!registration.registered) {
+        return { verified: true, registered: false } as const;
+      }
       return {
         verified: true,
-        result: await this.repository.registerLoginAccount(client, {
-          phoneE164,
-          displayName,
-          avatarId: randomInt(1, 60),
-          verifiedAt: now,
-          grantAdministrator: this.options.registrationAdminPhoneE164 === phoneE164,
-        }),
+        registered: true,
+        session: await this.issueSession(registration.account, now, input.requestId, client),
       } as const;
     });
     if (!verification.verified) throw new AuthFailure('OTP_INVALID');
-    if (!verification.result.registered) {
+    if (!verification.registered) {
       throw new AuthFailure('ACCOUNT_ALREADY_REGISTERED', '该手机号已注册，请直接登录', 409);
     }
-    return {
-      accountId: verification.result.account.id,
-      ...(displayName ? { displayName } : {}),
-      registeredAt: now.toISOString(),
-    };
+    return verification.session;
   }
 
   async verifyChallenge(input: {
@@ -301,6 +321,14 @@ export class AuthService {
     await this.repository.updateAvatar(accountId, avatarId);
   }
 
+  async setDisplayName(accountId: string, input: string): Promise<void> {
+    const displayName = input.trim().normalize('NFC') || null;
+    if (displayName && (Array.from(displayName).length > 80 || hasUnsupportedDisplayNameCharacter(displayName))) {
+      throw new AuthFailure('DISPLAY_NAME_INVALID', '账号名称须为 80 个以内的可见字符', 400);
+    }
+    await this.repository.updateDisplayName(accountId, displayName);
+  }
+
   async bootstrapAdministrator(phone: string): Promise<AccountRecord> {
     return this.repository.bootstrapAdministrator(normalizePhone(phone), this.now());
   }
@@ -328,7 +356,12 @@ export class AuthService {
     throw error;
   }
 
-  private async issueSession(account: AccountRecord, now: Date, requestId: string): Promise<SessionCredentials> {
+  private async issueSession(
+    account: AccountRecord,
+    now: Date,
+    requestId: string,
+    client?: SqlClient,
+  ): Promise<SessionCredentials> {
     const sessionToken = randomToken();
     const csrfToken = randomToken();
     const expiresAt = new Date(now.getTime() + this.sessionTtlMs);
@@ -342,7 +375,7 @@ export class AuthService {
         expiresAt,
         actorRoles: [...account.roles],
         requestId,
-      });
+      }, client);
     } catch (auditError) {
       // Session creation and its success audit are one repository transaction.
       // Neither may survive alone; callers receive one non-enumerating failure.
@@ -358,5 +391,33 @@ export class SandboxSmsProvider implements SmsProvider {
 
   async sendOtp(input: { readonly phoneE164: string; readonly purpose: OtpPurpose; readonly code: string }): Promise<void> {
     this.deliveries.push(input);
+  }
+}
+
+export class TemporaryAdminSmsProvider implements SmsProvider {
+  readonly kind = 'TEMPORARY_ADMIN' as const;
+
+  constructor(
+    private readonly allowedPhoneE164: string,
+    private readonly allowPublicRegistration = false,
+  ) {
+    if (!/^\+[1-9][0-9]{7,14}$/u.test(allowedPhoneE164)) {
+      throw new Error('临时管理员手机号必须是 E.164');
+    }
+  }
+
+  validateOtpRequest(input: { readonly phoneE164: string; readonly purpose: OtpPurpose }): void {
+    const administratorLogin = input.phoneE164 === this.allowedPhoneE164 && input.purpose === 'LOGIN';
+    const publicRegistrationFlow = this.allowPublicRegistration
+      && (input.purpose === 'REGISTER' || input.purpose === 'LOGIN');
+    if (!administratorLogin && !publicRegistrationFlow) {
+      throw new AuthFailure('OTP_DELIVERY_UNAVAILABLE', '验证码服务暂不可用', 503);
+    }
+  }
+
+  async sendOtp(input: { readonly phoneE164: string; readonly purpose: OtpPurpose; readonly code: string }): Promise<void> {
+    this.validateOtpRequest(input);
+    // 临时受限模式不向外部通道发送验证码。固定码只由运维侧约定，
+    // API 响应、日志和审计均不得包含验证码。
   }
 }

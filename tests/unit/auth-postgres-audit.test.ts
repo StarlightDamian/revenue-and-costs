@@ -20,6 +20,10 @@ class RecordingTransactionRunner implements TransactionRunner {
   }
 }
 
+function artifactInvalidator() {
+  return { invalidateForMembership: vi.fn(async () => undefined) };
+}
+
 describe("Postgres auth audit persistence", () => {
   it("bootstraps the first administrator without using a deferrable unique constraint as ON CONFLICT arbiter", async () => {
     const accountId = "10000000-0000-4000-8000-000000000001";
@@ -53,11 +57,12 @@ describe("Postgres auth audit persistence", () => {
     });
     const client = { query } as unknown as SqlClient;
     const transactions = new RecordingTransactionRunner(client);
-    const repository = new PostgresAuthRepository(transactions, client);
+    const repository = new PostgresAuthRepository(transactions, client, artifactInvalidator());
 
     await expect(repository.bootstrapAdministrator("+8619000000001", new Date("2026-08-06T00:00:00.000Z")))
       .resolves.toMatchObject({ id: accountId, roles: new Set(["ADMIN"]) });
     expect(transactions).toMatchObject({ commits: 1, rollbacks: 0 });
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("phone_verified_at, registered_at"))).toBe(true);
     expect(query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO account_role") && String(sql).includes("ON CONFLICT"))).toBe(false);
   });
 
@@ -81,7 +86,7 @@ describe("Postgres auth audit persistence", () => {
     });
     const client = { query } as unknown as SqlClient;
     const transactions = new RecordingTransactionRunner(client);
-    const repository = new PostgresAuthRepository(transactions, client);
+    const repository = new PostgresAuthRepository(transactions, client, artifactInvalidator());
     const input = {
       accountId,
       tokenDigest: Buffer.alloc(32, 1),
@@ -105,18 +110,26 @@ describe("Postgres auth audit persistence", () => {
     expect(JSON.stringify(auditParameters)).not.toContain(Buffer.from(input.tokenDigest).toString("hex"));
     expect(JSON.stringify(auditParameters)).not.toContain(Buffer.from(input.csrfDigest).toString("hex"));
 
+    await expect(repository.createSessionWithLoginAudit({ ...input, requestId: "registration-session" }, client))
+      .resolves.toEqual({ sessionId: "20000000-0000-4000-8000-000000000002", loginSequence: "1" });
+    expect(transactions).toMatchObject({ commits: 1, rollbacks: 0 });
+    expect(JSON.parse(String(auditParameters.at(-1)?.[1]))).toMatchObject({ requestId: "registration-session" });
+
     failAudit = true;
     await expect(repository.createSessionWithLoginAudit({ ...input, requestId: "failed-audit-request" }))
       .rejects.toThrow("audit unavailable");
     expect(transactions).toMatchObject({ commits: 1, rollbacks: 1 });
   });
 
-  it("writes phone-change audit with the account, sessions, and request in the same transaction", async () => {
+  it("keeps phone-change audit and pending-membership artifact invalidation in one transaction", async () => {
     const accountId = "10000000-0000-4000-8000-000000000001";
     const oldChallengeId = "30000000-0000-4000-8000-000000000003";
     const newChallengeId = "40000000-0000-4000-8000-000000000004";
     const oldPhone = "+8613800000000";
     const newPhone = "+8613900000000";
+    const shopId = "50000000-0000-4000-8000-000000000005";
+    const invitationId = "60000000-0000-4000-8000-000000000006";
+    const membershipId = "70000000-0000-4000-8000-000000000007";
     const sqlCalls: Array<{ sql: string; parameters: readonly unknown[] }> = [];
     const query = vi.fn(async (sql: string, parameters: readonly unknown[] = []) => {
       sqlCalls.push({ sql, parameters });
@@ -152,7 +165,25 @@ describe("Postgres auth audit persistence", () => {
         }], rowCount: 1 };
       }
       if (sql.includes("UPDATE enterprise_member") && sql.includes("RETURNING id, enterprise_id")) return { rows: [], rowCount: 0 };
-      if (sql.includes("FROM shop_invitation") && sql.includes("ORDER BY created_at")) return { rows: [], rowCount: 0 };
+      if (sql.includes("FROM shop_invitation") && sql.includes("ORDER BY created_at")) {
+        return { rows: [{
+          id: invitationId,
+          shop_id: shopId,
+          export_allowed: true,
+          invited_by: "80000000-0000-4000-8000-000000000008",
+        }], rowCount: 1 };
+      }
+      if (sql.includes("INSERT INTO shop_membership")) {
+        return { rows: [{
+          id: membershipId,
+          shop_id: shopId,
+          account_id: accountId,
+          status: "ACTIVE",
+          export_allowed: true,
+          authorization_epoch: "5",
+        }], rowCount: 1 };
+      }
+      if (sql.includes("UPDATE shop_invitation SET status='ACTIVE'")) return { rows: [], rowCount: 1 };
       if (sql.includes("UPDATE auth_session")) return { rows: [], rowCount: 2 };
       if (sql.includes("INSERT INTO phone_change_request")) return { rows: [], rowCount: 1 };
       if (sql.includes("INSERT INTO audit_event")) return { rows: [], rowCount: 1 };
@@ -160,7 +191,8 @@ describe("Postgres auth audit persistence", () => {
     });
     const client = { query } as unknown as SqlClient;
     const transactions = new RecordingTransactionRunner(client);
-    const repository = new PostgresAuthRepository(transactions, client);
+    const invalidator = artifactInvalidator();
+    const repository = new PostgresAuthRepository(transactions, client, invalidator);
 
     await repository.completePhoneChange({
       accountId,
@@ -174,7 +206,7 @@ describe("Postgres auth audit persistence", () => {
 
     expect(transactions).toMatchObject({ commits: 1, rollbacks: 0 });
     const requestIndex = sqlCalls.findIndex(({ sql }) => sql.includes("INSERT INTO phone_change_request"));
-    const auditIndex = sqlCalls.findIndex(({ sql }) => sql.includes("INSERT INTO audit_event"));
+    const auditIndex = sqlCalls.findIndex(({ sql }) => sql.includes("ACCOUNT_PHONE_CHANGED"));
     expect(requestIndex).toBeGreaterThan(-1);
     expect(auditIndex).toBeGreaterThan(requestIndex);
     expect(sqlCalls.some(({ sql }) => sql.includes("UPDATE enterprise_member SET phone_e164"))).toBe(true);
@@ -183,6 +215,7 @@ describe("Postgres auth audit persistence", () => {
     expect(membershipMergeQueries).toHaveLength(2);
     expect(membershipMergeQueries.every(({ sql }) =>
       sql.includes("authorization_epoch=pending.authorization_epoch+1"))).toBe(true);
+    expect(invalidator.invalidateForMembership).toHaveBeenCalledWith(client, membershipId, "5");
     const audit = sqlCalls[auditIndex]!;
     expect(audit.parameters[0]).toBe(accountId);
     expect(JSON.parse(String(audit.parameters[1]))).toEqual({
@@ -233,7 +266,7 @@ describe("Postgres auth audit persistence", () => {
     });
     const client = { query } as unknown as SqlClient;
     const transactions = new RecordingTransactionRunner(client);
-    const repository = new PostgresAuthRepository(transactions, client);
+    const repository = new PostgresAuthRepository(transactions, client, artifactInvalidator());
 
     await expect(repository.completePhoneChange({
       accountId,

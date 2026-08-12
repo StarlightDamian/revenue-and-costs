@@ -4,6 +4,7 @@ import { mkdir, unlink } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import yauzl, { type Entry, type ZipFile } from "yauzl";
+import { hasPdfHeaderInLeadingBytes, PDF_HEADER_PROBE_BYTES } from "../../shared/pdf-header";
 
 export interface ZipLimits {
   maxEntries: number;
@@ -25,6 +26,17 @@ export const defaultZipLimits: ZipLimits = {
   maxSegmentBytes: 255,
   maxIdleMs: 15 * 60 * 1_000,
   maxDurationMs: 6 * 60 * 60 * 1_000,
+};
+
+export const ooxmlZipLimits: ZipLimits = {
+  maxEntries: 20_000,
+  maxEntryBytes: 64n * 1024n * 1024n,
+  maxExpandedBytes: 256n * 1024n * 1024n,
+  maxRatio: 100,
+  maxPathBytes: 1_024,
+  maxSegmentBytes: 255,
+  maxIdleMs: 60_000,
+  maxDurationMs: 15 * 60_000,
 };
 
 export interface ZipEntryReport { path: string; compressedBytes: bigint; expandedBytes: bigint; directory: boolean }
@@ -64,17 +76,22 @@ function readEntry(zip: ZipFile, entry: Entry, limits: ZipLimits, startedAt: num
     zip.openReadStream(entry, (error, stream) => {
       if (error || !stream) return reject(error ?? new Error("ZIP_ENTRY_STREAM_FAILED"));
       let total = 0n;
-      const magic = Buffer.alloc(4);
-      let magicBytes = 0;
+      const probe = Buffer.alloc(PDF_HEADER_PROBE_BYTES);
+      let probeBytes = 0;
       let idle = setTimeout(() => stream.destroy(new Error("ZIP_NO_PROGRESS_TIMEOUT")), limits.maxIdleMs);
       idle.unref();
       stream.on("data", (chunk: Buffer) => {
         clearTimeout(idle);
         if (Date.now() - startedAt > limits.maxDurationMs) return stream.destroy(new Error("ZIP_DURATION_TIMEOUT"));
-        if (magicBytes < magic.byteLength) {
-          magicBytes += chunk.copy(magic, magicBytes, 0, magic.byteLength - magicBytes);
-          if (magicBytes === magic.byteLength && hasZipMagic(magic)) {
+        if (probeBytes < probe.byteLength) {
+          probeBytes += chunk.copy(probe, probeBytes, 0, probe.byteLength - probeBytes);
+          const prefix = probe.subarray(0, probeBytes);
+          if (hasZipMagic(prefix)) {
             stream.destroy(new Error("ZIP_NESTED_ARCHIVE_REJECTED"));
+            return;
+          }
+          if (hasPdfHeaderInLeadingBytes(prefix)) {
+            stream.destroy(new Error("ZIP_PDF_ENTRY_REQUIRES_FOLDER_UPLOAD"));
             return;
           }
         }
@@ -111,6 +128,7 @@ export async function validateZip(path: string, limits = defaultZipLimits): Prom
         validateUnixType(entry);
         const directory = /\/$/.test(entry.fileName);
         if (!directory && /\.(?:zip|7z|rar|tar|gz|bz2|xz|jar)$/i.test(name)) throw new Error("ZIP_NESTED_ARCHIVE_REJECTED");
+        if (!directory && /\.pdf$/iu.test(name)) throw new Error("ZIP_PDF_ENTRY_REQUIRES_FOLDER_UPLOAD");
         const declared = BigInt(entry.uncompressedSize);
         const compressed = BigInt(entry.compressedSize);
         if (declared > limits.maxEntryBytes || (compressed === 0n ? declared > 0n : declared > compressed * BigInt(limits.maxRatio))) throw new Error("ZIP_RATIO_OR_SIZE_LIMIT");
@@ -143,8 +161,11 @@ export async function extractValidatedZip(
   destinationRoot: string,
   destinationForEntry: (safePath: string) => string,
   limits = defaultZipLimits,
+  beforeWrite?: (reports: readonly ZipEntryReport[]) => Promise<void>,
+  beforeEntryWrite?: (report: ZipEntryReport) => Promise<void>,
 ): Promise<ExtractedZipEntry[]> {
   const reports = await validateZip(archivePath, limits);
+  await beforeWrite?.(reports);
   const expected = new Map(reports.filter((entry) => !entry.directory).map((entry) => [entry.path, entry]));
   const root = resolve(destinationRoot);
   const zip = await openZip(archivePath);
@@ -183,14 +204,15 @@ export async function extractValidatedZip(
         if (!report) throw new Error("ZIP_VALIDATION_CHANGED");
         const destination = resolve(destinationForEntry(safePath));
         if (!destination.startsWith(`${root}${sep}`)) throw new Error("ZIP_DESTINATION_ESCAPE");
+        await beforeEntryWrite?.(report);
         await mkdir(dirname(destination), { recursive: true });
         await unlink(destination).catch((error: NodeJS.ErrnoException) => {
           if (error.code !== "ENOENT") throw error;
         });
         const source = await openEntryStream(zip, entry);
         let actual = 0n;
-        const magic = Buffer.alloc(4);
-        let magicBytes = 0;
+        const probe = Buffer.alloc(PDF_HEADER_PROBE_BYTES);
+        let probeBytes = 0;
         let idle = setTimeout(() => {
           if ("destroy" in source && typeof source.destroy === "function") source.destroy(new Error("ZIP_NO_PROGRESS_TIMEOUT"));
         }, limits.maxIdleMs);
@@ -201,10 +223,15 @@ export async function extractValidatedZip(
             if ("destroy" in source && typeof source.destroy === "function") source.destroy(new Error("ZIP_DURATION_TIMEOUT"));
             return;
           }
-          if (magicBytes < magic.byteLength) {
-            magicBytes += chunk.copy(magic, magicBytes, 0, magic.byteLength - magicBytes);
-            if (magicBytes === magic.byteLength && hasZipMagic(magic)) {
+          if (probeBytes < probe.byteLength) {
+            probeBytes += chunk.copy(probe, probeBytes, 0, probe.byteLength - probeBytes);
+            const prefix = probe.subarray(0, probeBytes);
+            if (hasZipMagic(prefix)) {
               if ("destroy" in source && typeof source.destroy === "function") source.destroy(new Error("ZIP_NESTED_ARCHIVE_REJECTED"));
+              return;
+            }
+            if (hasPdfHeaderInLeadingBytes(prefix)) {
+              if ("destroy" in source && typeof source.destroy === "function") source.destroy(new Error("ZIP_PDF_ENTRY_REQUIRES_FOLDER_UPLOAD"));
               return;
             }
           }

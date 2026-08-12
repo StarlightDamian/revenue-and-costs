@@ -1,9 +1,10 @@
 import { open } from "node:fs/promises";
 import yauzl from "yauzl";
+import { hasPdfHeaderInLeadingBytes } from "../../shared/pdf-header";
 
 export type UploadedFileKind = "ZIP" | "PDF" | "TEXT" | "OTHER";
 
-function isOoxmlSpreadsheetContainer(path: string): Promise<boolean> {
+export function isOoxmlSpreadsheetContainer(path: string): Promise<boolean> {
   return new Promise((resolve) => {
     yauzl.open(path, { lazyEntries: true, validateEntrySizes: true, decodeStrings: true }, (openError, zip) => {
       if (openError || !zip) {
@@ -45,7 +46,7 @@ export async function detectFileKind(path: string): Promise<UploadedFileKind> {
     if (prefix.length >= 4 && prefix[0] === 0x50 && prefix[1] === 0x4b && [0x03, 0x05, 0x07].includes(prefix[2] ?? -1)) {
       return await isOoxmlSpreadsheetContainer(path) ? "OTHER" : "ZIP";
     }
-    if (prefix.subarray(0, 5).toString("ascii") === "%PDF-") return "PDF";
+    if (hasPdfHeaderInLeadingBytes(prefix)) return "PDF";
     if (!prefix.includes(0) || (prefix[0] === 0xff && prefix[1] === 0xfe) || (prefix[0] === 0xfe && prefix[1] === 0xff)) return "TEXT";
     return "OTHER";
   } finally {

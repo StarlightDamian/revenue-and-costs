@@ -1,8 +1,7 @@
 import { createPool } from "../src/db/pool";
-import { loadConfig } from "../src/shared/config";
+import { maintenanceDatabaseUrl } from "./database-url.js";
 
-const config = loadConfig();
-const pool = createPool(config.databaseUrl);
+const pool = createPool(maintenanceDatabaseUrl(), "cli");
 try {
   const waitFlagIndex = process.argv.indexOf("--wait-writable-ms");
   const waitWritableMs = waitFlagIndex === -1 ? 0 : Number(process.argv[waitFlagIndex + 1]);

@@ -75,15 +75,9 @@ async function submitAuth() {
   if (!canVerify.value) return;
   busy.value = true;
   try {
-    if (authMode.value === "register") {
-      const registeredName = displayName.value.trim();
-      await api.registerAccount(challengeId.value, phone.value, code.value, registeredName || undefined);
-      authMode.value = "login";
-      clearChallenge();
-      success.value = `${registeredName || "做账员"}，注册成功。请重新获取验证码登录。`;
-      return;
-    }
-    const me = await api.verifyOtp(challengeId.value, phone.value, code.value);
+    const me = authMode.value === "register"
+      ? await api.registerAccount(challengeId.value, phone.value, code.value, displayName.value.trim() || undefined)
+      : await api.verifyOtp(challengeId.value, phone.value, code.value);
     acceptSession(me);
     const requested = typeof route.query.returnTo === "string" ? route.query.returnTo : "";
     const fallback = me.isFirstLogin
@@ -128,7 +122,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
           <div><strong>59 个动物头像</strong><span>用熟悉的角色进入成本测算</span></div>
         </div>
         <div class="login-principles">
-          <div><strong>按版本复核</strong><span>数据、映射、时区、公式与汇率共同固定</span></div>
+          <div><strong>按版本复核</strong><span>数据、映射、日期口径、公式与汇率共同固定</span></div>
           <div><strong>自动发布</strong><span>资料准备完成后自动计算并发布，失败时保留可追溯恢复入口</span></div>
         </div>
       </section>

@@ -11,7 +11,7 @@ if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
 const baseUrl = (process.env.ACCEPTANCE_BASE_URL ?? "http://127.0.0.1:3011").replace(/\/$/u, "");
 const outputPath = resolve(process.env.ACCEPTANCE_PERFORMANCE_OUTPUT ?? ".work/acceptance/performance-final.json");
-const pool = createPool(databaseUrl);
+const pool = createPool(databaseUrl, "cli");
 const database = new PostgresDatabase(pool);
 const reports = new PostgresReportService(database, database);
 

@@ -69,6 +69,7 @@ describe("route parameter validation", () => {
     const app = Fastify();
     await app.register(adminRoutes, {
       identity: {} as never,
+      fx: {} as never,
       wallet: { listEnterpriseEntries: listEntries } as never,
       authenticate,
     });

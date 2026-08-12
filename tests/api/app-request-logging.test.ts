@@ -13,6 +13,7 @@ const config: AppConfig = {
   port: 3000,
   databaseUrl: "postgresql://diagnostic.invalid/test",
   publicOrigin: "https://app.example.test",
+  appBasePath: "/revenue-costs",
   otpHmacKey: "otp-test-key-32-bytes-minimum-value",
   sessionHmacKey: "session-test-key-32-bytes-minimum",
   paymentProvider: "sandbox",
@@ -39,6 +40,26 @@ function eventRecords(logLines: readonly string[]): Array<Record<string, unknown
 }
 
 describe("API request logging boundary", () => {
+  it("uses the forwarded client address only from the production loopback proxy", async () => {
+    const app = await createApp({ config: { ...config, mode: "production" }, pool: {} as Pool });
+    app.get("/test/client-ip", async (request) => ({ ip: request.ip }));
+    const response = await app.inject({
+      method: "GET",
+      url: "/test/client-ip",
+      remoteAddress: "127.0.0.1",
+      headers: { "x-forwarded-for": "203.0.113.11" },
+    });
+    expect(response.json()).toEqual({ ip: "203.0.113.11" });
+    const spoofed = await app.inject({
+      method: "GET",
+      url: "/test/client-ip",
+      remoteAddress: "198.51.100.9",
+      headers: { "x-forwarded-for": "203.0.113.12" },
+    });
+    expect(spoofed.json()).toEqual({ ip: "198.51.100.9" });
+    await app.close();
+  });
+
   it("installs the safe error handler before encapsulated auth routes", async () => {
     const logLines: string[] = [];
     const app = await createApp({

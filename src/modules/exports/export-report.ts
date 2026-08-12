@@ -570,7 +570,7 @@ async function createWorkbook(
   const metadata: readonly [string, string][] = [
     ["ID", input.diagnosticId], ["公司", input.shopName], ["快照", input.snapshotId], ["发布时间", input.publishedAt], ["导出生成时间", input.generatedAt],
     ["数据版本", input.dataVersion], ["映射版本", input.mappingVersion], ["汇率版本", input.fxVersion],
-    ["时区版本", input.timezoneVersion], ["口径版本", input.policyVersion], ["公式版本", input.formulaVersion],
+    ["日期口径版本", input.timezoneVersion], ["口径版本", input.policyVersion], ["公式版本", input.formulaVersion],
     ["代码版本", input.codeVersion], ["应用价格版本", input.priceVersion], ["Manifest SHA-256", input.manifestSha256],
     ["金额精度", "数据库金额与汇率追溯值保留8位小数，工作簿统一显示2位小数。"],
     ["本次利润率", input.costAssumptions.profitRate ?? "未设置"],

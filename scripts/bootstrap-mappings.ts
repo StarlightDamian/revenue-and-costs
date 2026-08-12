@@ -4,12 +4,11 @@ import { withTransaction } from "../src/db/pool.js";
 import { builtinShipmentMapping, builtinTransactionMapping } from "../src/modules/mappings/builtin.js";
 import { refreshUploadPreflight } from "../src/modules/uploads/partial-failure.js";
 import { validateMappingDefinition } from "../src/modules/mappings/validate.js";
-import { loadConfig } from "../src/shared/config.js";
+import { maintenanceDatabaseUrl } from "./database-url.js";
 
 const definitions = [builtinTransactionMapping, builtinShipmentMapping] as const;
 
-const config = loadConfig();
-const pool = createPool(config.databaseUrl);
+const pool = createPool(maintenanceDatabaseUrl(), "cli");
 try {
   for (const definition of definitions) validateMappingDefinition(definition);
   const result = await withTransaction(pool, async (client) => {
@@ -46,8 +45,10 @@ try {
     }
     await client.query(
       `INSERT INTO marketplace_policy_version
-        (marketplace, normalized_marketplace, iana_timezone, marketplace_size, effective_from, created_by, reason)
-       VALUES ('UNKNOWN','UNKNOWN','UTC','LARGE','2000-01-01T00:00:00Z',$1,'未知站点安全默认：按大站点并采用 UTC，待管理员创建明确版本')
+        (marketplace, normalized_marketplace, iana_timezone, marketplace_size, effective_from, created_by, reason,
+         date_attribution_mode)
+       VALUES ('UNKNOWN','UNKNOWN','UTC','LARGE','2000-01-01T00:00:00Z',$1,'未知站点安全默认：按大站点并采用 UTC，待管理员创建明确版本',
+         'REPORT_LITERAL_DATE')
        ON CONFLICT (normalized_marketplace, effective_from) DO NOTHING`,
       [actor],
     );
@@ -131,9 +132,27 @@ try {
     };
   });
   if (result.skipped) {
-    process.stdout.write("尚未初始化首位管理员，暂不创建内置映射；管理员初始化后再次启动会自动补齐。\n");
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (process.env.REQUIRE_BOOTSTRAP_MAPPINGS === "true") throw new Error("BUILTIN_MAPPING_BOOTSTRAP_SKIPPED");
   } else {
-    process.stdout.write(`已确保内置精确映射存在：新增 ${result.inserted}，恢复预检文件 ${result.requeued}，收敛批次 ${result.projected}\n`);
+    const expected = new Map(definitions.map((definition) => [
+      definition.reportKind,
+      createHash("sha256").update(JSON.stringify(definition)).digest("hex"),
+    ]));
+    const current = await pool.query<{ report_kind: string; digest: string }>(
+      `SELECT DISTINCT ON (mapping.report_kind) mapping.report_kind,
+              encode(version.definition_sha256,'hex') digest
+         FROM field_mapping mapping
+         JOIN field_mapping_version version ON version.field_mapping_id=mapping.id
+        WHERE mapping.locale IN ('amazon-multilingual-v1','amazon-zh-shipment-v1')
+        ORDER BY mapping.report_kind,version.version_no DESC,version.created_at DESC,version.id DESC`,
+    );
+    for (const [reportKind, digest] of expected) {
+      if (current.rows.find((row) => row.report_kind === reportKind)?.digest !== digest) {
+        throw new Error(`BUILTIN_MAPPING_VERSION_MISMATCH:${reportKind}`);
+      }
+    }
+    process.stdout.write(`${JSON.stringify({ ...result, verified: [...expected.keys()] })}\n`);
   }
 } finally {
   await pool.end();

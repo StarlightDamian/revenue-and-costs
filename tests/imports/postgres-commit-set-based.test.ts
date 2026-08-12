@@ -13,6 +13,7 @@ describe("set-based import materialization", () => {
           rows: Array.from({ length: 40 }, (_, index) => ({
             marketplace: `M${index}`,
             local_month: "2026-04-01",
+            retired: false,
           })),
           rowCount: 40,
         };
@@ -27,12 +28,19 @@ describe("set-based import materialization", () => {
     );
 
     expect(slices).toHaveLength(40);
-    expect(statements).toHaveLength(10);
+    expect(statements).toHaveLength(9);
     expect(statements.filter((sql) => sql.includes("INSERT INTO shipment_fact"))).toHaveLength(1);
     expect(statements.filter((sql) => sql.includes("INSERT INTO transaction_fact"))).toHaveLength(1);
-    expect(statements.filter((sql) => sql.includes("INSERT INTO transaction_fee_component"))).toHaveLength(1);
+    expect(statements.find((sql) => sql.includes("INSERT INTO transaction_fact"))).toContain("fulfillment_mode");
+    expect(statements.filter((sql) => sql.includes("INSERT INTO transaction_fee_component"))).toHaveLength(0);
     expect(statements.filter((sql) => sql.includes("INSERT INTO reconciliation_result"))).toHaveLength(1);
-    expect(statements.filter((sql) => sql.includes("JOIN import_version_stage"))).toHaveLength(5);
+    expect(statements.filter((sql) => sql.includes("JOIN import_version_stage"))).toHaveLength(4);
+    expect(statements.some((sql) => sql.includes("replayed_current_slices"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("DATASET_SLICE_RETIRED_BY_SOURCE_REPLAY"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("retiredBySourceReplay"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("transaction_only_fmb"))).toBe(true);
+    const reconciliation = statements.find((sql) => sql.includes("INSERT INTO reconciliation_result"));
+    expect(reconciliation).toContain("fulfillment_mode IS DISTINCT FROM 'MERCHANT'");
   });
 
   it("persists all file counters and issue groups with two set-based queries", async () => {

@@ -138,21 +138,53 @@ export class WalletService {
     readonly balanceAfterCents: string;
     readonly occurredAt: string;
     readonly reason?: string;
+    readonly reference?: {
+      readonly type: 'SHOP';
+      readonly id: string;
+      readonly name?: string;
+      readonly status?: 'ACTIVE' | 'EXPIRED_READONLY' | 'TRASHED' | 'PURGED';
+    };
   }[]> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
       throw new AppError('LEDGER_LIMIT_INVALID', '账本查询条数无效', 400);
     }
     const result = await this.reader.query<{
-      id: string; entry_type: string; delta_cents: string; balance_after_cents: string; created_at: Date; reason: string | null;
+      id: string;
+      entry_type: string;
+      delta_cents: string;
+      balance_after_cents: string;
+      created_at: Date;
+      reason: string | null;
+      reference_type: string;
+      reference_id: string | null;
+      reference_name: string | null;
+      reference_status: 'ACTIVE' | 'EXPIRED_READONLY' | 'TRASHED' | 'PURGED' | null;
     }>(
-      `SELECT id,entry_type,delta_cents,balance_after_cents,created_at,reason
-         FROM wallet_ledger WHERE wallet_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2`,
+      `SELECT wl.id,wl.entry_type,wl.delta_cents,wl.balance_after_cents,wl.created_at,wl.reason,
+              wl.reference_type,wl.reference_id,
+              CASE WHEN wl.reference_type = 'SHOP' THEN shop.name ELSE NULL END AS reference_name,
+              CASE WHEN wl.reference_type = 'SHOP' THEN shop.status ELSE NULL END AS reference_status
+         FROM wallet_ledger wl
+         JOIN wallet_account wallet ON wallet.id = wl.wallet_id
+         LEFT JOIN shop ON wl.reference_type = 'SHOP'
+                        AND shop.id = wl.reference_id
+                        AND shop.enterprise_id = wallet.enterprise_id
+        WHERE wl.wallet_id=$1
+        ORDER BY wl.created_at DESC,wl.id DESC LIMIT $2`,
       [walletId, limit],
     );
     return result.rows.map((row) => ({
       id: row.id, type: row.entry_type, amountCents: row.delta_cents,
       balanceAfterCents: row.balance_after_cents, occurredAt: row.created_at.toISOString(),
       ...(row.reason ? { reason: row.reason } : {}),
+      ...(row.reference_type === 'SHOP' && row.reference_id && row.reference_name ? {
+        reference: {
+          type: 'SHOP' as const,
+          id: row.reference_id,
+          ...(row.reference_name ? { name: row.reference_name } : {}),
+          ...(row.reference_status ? { status: row.reference_status } : {}),
+        },
+      } : {}),
     }));
   }
 

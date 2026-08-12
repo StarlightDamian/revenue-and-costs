@@ -199,6 +199,8 @@ export class ShopService {
       let batch: WorkflowBatchState | undefined;
       let calculation: WorkflowCalculationState | undefined;
       let latestExport: WorkflowExportState | undefined;
+      let workerAvailable = true;
+      let terminalRecoveryBlocked = false;
 
       if (shop.access !== 'CUSTOMER') {
         const batches = await this.reader.query<{
@@ -285,6 +287,116 @@ export class ShopService {
         };
       }
 
+      const workerRequired = Boolean(
+        batch && ["ANALYZING", "RETRYING", "COMMITTING", "COMMITTED", "COMMITTED_WITH_EXCLUSIONS", "CALCULATING", "READY_FOR_REVIEW", "RESULT_PUBLISHING"].includes(batch.status)
+      ) || Boolean(latestExport && ["QUEUED", "RUNNING"].includes(latestExport.status));
+      if (workerRequired || batch || calculation || latestExport) {
+        const processing = await this.reader.query<{ available: boolean; terminal_recovery_blocked: boolean }>(
+          `SELECT COALESCE((SELECT status='RUNNING'
+                                  AND last_heartbeat_at >= clock_timestamp() - interval '60 seconds'
+                             FROM job_operation
+                            WHERE business_key='service:worker'),false) AS available,
+                  EXISTS(
+                    SELECT 1
+                      FROM job_operation recovery
+                      LEFT JOIN pgboss.job terminal_job
+                        ON recovery.business_key='terminal-reconcile:' || terminal_job.id::text
+                       AND terminal_job.state='failed'
+                      CROSS JOIN LATERAL (
+                        SELECT COALESCE(recovery.progress->>'queueName',terminal_job.name) AS queue_name,
+                               COALESCE(
+                                 recovery.progress->>'businessField',
+                                 CASE terminal_job.name
+                                   WHEN 'upload.finalize' THEN 'fileId'
+                                   WHEN 'import.analyze' THEN 'fileId'
+                                   WHEN 'import.commit' THEN 'batchId'
+                                   WHEN 'calculation.requested' THEN 'batchId'
+                                   WHEN 'calculation.run' THEN 'runId'
+                                   WHEN 'report.auto-publish' THEN 'sourceImportBatchId'
+                                   WHEN 'export.generate' THEN 'exportId'
+                                 END
+                               ) AS business_field,
+                               COALESCE(
+                                 recovery.progress->>'businessId',
+                                 terminal_job.data->>CASE terminal_job.name
+                                   WHEN 'upload.finalize' THEN 'fileId'
+                                   WHEN 'import.analyze' THEN 'fileId'
+                                   WHEN 'import.commit' THEN 'batchId'
+                                   WHEN 'calculation.requested' THEN 'batchId'
+                                   WHEN 'calculation.run' THEN 'runId'
+                                   WHEN 'report.auto-publish' THEN 'sourceImportBatchId'
+                                   WHEN 'export.generate' THEN 'exportId'
+                                 END
+                               ) AS business_id
+                      ) recovery_identity
+                     WHERE recovery.job_name='worker.terminal-reconcile'
+                       AND recovery.business_key LIKE 'terminal-reconcile:%'
+                       AND (
+                         (recovery.status='RUNNING' AND recovery.progress->>'outcome'='ACTIVE_CALLBACK')
+                         OR (recovery.status='FAILED' AND recovery.progress->>'outcome'='RECOVERY_FAILED')
+                       )
+                       AND (
+                         (recovery_identity.queue_name='upload.finalize'
+                           AND recovery_identity.business_field='fileId'
+                           AND EXISTS(
+                           SELECT 1
+                             FROM upload_file source
+                             JOIN import_batch current_batch ON current_batch.upload_batch_id=source.batch_id
+                            WHERE current_batch.id=$1::uuid
+                              AND source.id::text=recovery_identity.business_id
+                              AND source.status IN ('COMPLETE','ENCRYPTING')
+                         ))
+                         OR (recovery_identity.queue_name='import.analyze'
+                           AND recovery_identity.business_field='fileId'
+                           AND EXISTS(
+                           SELECT 1
+                             FROM upload_file source
+                             JOIN import_batch current_batch ON current_batch.upload_batch_id=source.batch_id
+                             LEFT JOIN import_file analyzed
+                              ON analyzed.import_batch_id=current_batch.id
+                              AND analyzed.stored_object_id=source.stored_object_id
+                            WHERE current_batch.id=$1::uuid
+                              AND source.id::text=recovery_identity.business_id
+                              AND current_batch.status IN ('ANALYZING','RETRYING')
+                              AND (analyzed.id IS NULL OR analyzed.parse_status='PENDING')
+                         ))
+                         OR (recovery_identity.queue_name='import.commit'
+                           AND recovery_identity.business_field='batchId'
+                           AND recovery_identity.business_id=$1::text
+                           AND EXISTS(SELECT 1 FROM import_batch current_batch
+                                      WHERE current_batch.id=$1::uuid AND current_batch.status='COMMITTING'))
+                         OR (recovery_identity.queue_name='calculation.requested'
+                           AND recovery_identity.business_field='batchId'
+                           AND recovery_identity.business_id=$1::text
+                           AND EXISTS(SELECT 1 FROM import_batch current_batch
+                                      WHERE current_batch.id=$1::uuid
+                                        AND current_batch.status IN ('COMMITTED','COMMITTED_WITH_EXCLUSIONS','CALCULATING')))
+                         OR (recovery_identity.queue_name='calculation.run'
+                           AND recovery_identity.business_field='runId'
+                           AND recovery_identity.business_id=$2::text
+                           AND EXISTS(SELECT 1 FROM calculation_run current_run
+                                      WHERE current_run.id=$2::uuid
+                                        AND current_run.status IN ('QUEUED','RUNNING','BLOCKED')))
+                         OR (recovery_identity.queue_name='report.auto-publish'
+                           AND recovery_identity.business_field='sourceImportBatchId'
+                           AND recovery_identity.business_id=$1::text
+                           AND EXISTS(SELECT 1 FROM import_batch current_batch
+                                      WHERE current_batch.id=$1::uuid
+                                        AND current_batch.status IN ('CALCULATING','READY_FOR_REVIEW','RESULT_PUBLISHING')))
+                         OR (recovery_identity.queue_name='export.generate'
+                           AND recovery_identity.business_field='exportId'
+                           AND recovery_identity.business_id=$3::text
+                           AND EXISTS(SELECT 1 FROM export_request current_export
+                                      WHERE current_export.id=$3::uuid
+                                        AND current_export.status IN ('QUEUED','RUNNING')))
+                       )
+                  ) AS terminal_recovery_blocked`,
+          [batch?.id ?? null, calculation?.id ?? null, latestExport?.id ?? null],
+        );
+        if (workerRequired) workerAvailable = processing.rows[0]?.available === true;
+        terminalRecoveryBlocked = processing.rows[0]?.terminal_recovery_blocked === true;
+      }
+
       const workflow = deriveWorkflowSteps({
         access: shop.access,
         shopStatus: shop.status,
@@ -293,6 +405,8 @@ export class ShopService {
         ...(batch ? { batch } : {}),
         ...(calculation ? { calculation } : {}),
         ...(latestExport ? { latestExport } : {}),
+        workerAvailable,
+        terminalRecoveryBlocked,
       });
       const downloadAvailable = workflowDownloadAvailable({
         access: shop.access,
@@ -302,9 +416,26 @@ export class ShopService {
         ...(batch ? { batch } : {}),
         ...(calculation ? { calculation } : {}),
         ...(latestExport ? { latestExport } : {}),
+        workerAvailable,
+        terminalRecoveryBlocked,
       });
+      const diagnosticId = batch?.id
+        ? diagnosticReferenceId('I', batch.id)
+        : latestExport
+          ? diagnosticReferenceId('E', latestExport.id)
+          : shop.publishedSnapshot
+            ? diagnosticReferenceId('P', shop.publishedSnapshot.id)
+            : diagnosticReferenceId('C', shop.id);
       structuredLog('info', 'api', 'shop_workflow_resolved', {
         access: shop.access,
+        diagnosticDigest: createHash('sha256').update(diagnosticId).digest('hex').slice(0, 16),
+        batchStatus: batch?.status ?? null,
+        batchStage: batch?.stage ?? null,
+        failureCode: batch?.failureCode ?? calculation?.failureCode ?? null,
+        calculationStatus: calculation?.status ?? null,
+        exportStatus: latestExport?.status ?? null,
+        workerAvailable,
+        terminalRecoveryBlocked,
         currentStep: workflow.currentStep,
         warningCount: workflow.steps.reduce((sum, item) => sum + item.warningCount, 0),
         blockingCount: workflow.steps.reduce((sum, item) => sum + item.blockingCount, 0),
@@ -312,14 +443,9 @@ export class ShopService {
       });
       return {
         shop: { id: shop.id, name: shop.name, access: shop.access, status: shop.status, canEdit: shop.access !== 'CUSTOMER' && shop.status === 'ACTIVE' },
-        diagnosticId: batch?.id
-          ? diagnosticReferenceId('I', batch.id)
-          : latestExport
-            ? diagnosticReferenceId('E', latestExport.id)
-            : shop.publishedSnapshot
-              ? diagnosticReferenceId('P', shop.publishedSnapshot.id)
-              : diagnosticReferenceId('C', shop.id),
+        diagnosticId,
         ...workflow,
+        processingHealth: { workerAvailable, terminalRecoveryBlocked },
         ...(shop.access !== 'CUSTOMER' && batch ? { latestBatch: { id: batch.id, status: batch.status, stage: batch.stage, failureCode: batch.failureCode, ...(calculation?.id ? { calculationRunId: calculation.id } : {}) } } : {}),
         ...(shop.publishedSnapshot ? { publishedSnapshot: shop.publishedSnapshot } : {}),
         download: {

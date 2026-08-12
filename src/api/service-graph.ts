@@ -1,19 +1,22 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { Pool } from "pg";
 import { PostgresDatabase } from "../db/database.js";
-import { authorizePlatform, authorizeShop, CoreTransactionSideEffects, requireAllowed, type Actor, type ShopCapability, type SqlClient } from "../modules/authorization/index.js";
+import { authorizePlatform, authorizeShop, CoreTransactionSideEffects, requireAllowed, type Actor, type ShopCapability } from "../modules/authorization/index.js";
 import {
   AuthService,
   IdentityAdminService,
   PostgresAuthRepository,
   SandboxSmsProvider,
+  TemporaryAdminSmsProvider,
 } from "../modules/auth/index.js";
 import { CatalogService } from "../modules/catalog/index.js";
-import { MembershipService, type MembershipArtifactInvalidator } from "../modules/memberships/index.js";
+import { MembershipService } from "../modules/memberships/index.js";
 import {
   PaymentService,
   PostgresPaymentRepository,
   SandboxPaymentProvider,
+  TemporaryManualPaymentProvider,
+  type PaymentProvider,
 } from "../modules/payments/index.js";
 import { ShopService } from "../modules/shops/index.js";
 import { WalletService } from "../modules/wallet/index.js";
@@ -37,53 +40,32 @@ import { importRoutes } from "./routes/imports.js";
 import { reportRoutes } from "./routes/reports.js";
 import { EncryptedObjectStore } from "../modules/storage/encrypted-object-store.js";
 import { exportOutputRoot, PostgresExportService } from "../modules/exports/postgres.js";
+import { PostgresMembershipArtifactInvalidator } from "../modules/exports/postgres-membership-invalidator.js";
 import { exportRoutes } from "./routes/exports.js";
 import { registerOperationsRoutes } from "./routes/operations.js";
 import { PostgresAccountingPreferencesService } from "../modules/accounting-preferences/index.js";
 import { accountingPreferenceRoutes } from "./routes/accounting-preferences.js";
 import { PostgresOnboardingService } from "../modules/onboarding/index.js";
 import { onboardingRoutes } from "./routes/onboarding.js";
-
-export async function invalidateMembershipExportArtifacts(
-  client: SqlClient,
-  membershipId: string,
-  newAuthorizationEpoch: string,
-): Promise<void> {
-  await client.query(
-    `UPDATE export_request er
-        SET status = 'REVOKED', stage = 'REVOKED', error_code = 'MEMBERSHIP_REVOKED',
-            finished_at = clock_timestamp(), heartbeat_at = clock_timestamp()
-       FROM shop_membership sm
-      WHERE sm.id = $1
-        AND er.shop_id = sm.shop_id
-        AND er.requested_by = sm.account_id
-        AND er.status IN ('QUEUED','RUNNING','SUCCEEDED')
-        AND (er.membership_authorization_version IS NULL
-             OR er.membership_authorization_version::text <> $2)`,
-    [membershipId, newAuthorizationEpoch],
-  );
-  await client.query(
-    `UPDATE export_download_grant
-        SET revoked_at = clock_timestamp()
-      WHERE membership_id = $1
-        AND consumed_at IS NULL
-        AND revoked_at IS NULL
-        AND membership_authorization_version::text <> $2`,
-    [membershipId, newAuthorizationEpoch],
-  );
-}
+import { acquireIntermediateExportLease } from "./intermediate-export-capacity.js";
 
 export function createServiceGraph(config: AppConfig, pool: Pool) {
   const database = new PostgresDatabase(pool);
   const effects = new CoreTransactionSideEffects();
-  const authRepository = new PostgresAuthRepository(database, database);
-  const sms = new SandboxSmsProvider();
+  const artifactInvalidator = new PostgresMembershipArtifactInvalidator();
+  const authRepository = new PostgresAuthRepository(database, database, artifactInvalidator);
+  const sms = config.smsProvider === "sandbox"
+    ? new SandboxSmsProvider()
+    : config.smsProvider === "temporary-admin-fixed" && config.registrationAdminPhoneE164
+      ? new TemporaryAdminSmsProvider(config.registrationAdminPhoneE164, config.temporaryPublicRegistration === true)
+      : (() => { throw new AppError("SMS_PROVIDER_NOT_CONFIGURED", "短信适配器尚未配置", 503); })();
   const auth = new AuthService(authRepository, sms, {
     otpSecret: Buffer.from(config.otpHmacKey, "utf8"),
     privacySecret: Buffer.from(config.sessionHmacKey, "utf8"),
     allowSandboxCodeDisclosure: config.mode !== "production",
     ...(config.sandboxOtpCode ? { sandboxOtpCode: config.sandboxOtpCode } : {}),
-    ...(config.registrationAdminPhoneE164
+    ...(config.temporaryAdminOtpCode ? { temporaryAdminOtpCode: config.temporaryAdminOtpCode } : {}),
+    ...(config.mode !== "production" && config.registrationAdminPhoneE164
       ? { registrationAdminPhoneE164: config.registrationAdminPhoneE164 }
       : {}),
   });
@@ -91,11 +73,6 @@ export function createServiceGraph(config: AppConfig, pool: Pool) {
   const enterprises = new EnterpriseService(database, database, effects);
   const catalog = new CatalogService(database, database, effects);
   const shops = new ShopService(database, database, effects);
-  const artifactInvalidator: MembershipArtifactInvalidator = {
-    async invalidateForMembership(client, membershipId, newAuthorizationEpoch) {
-      await invalidateMembershipExportArtifacts(client, membershipId, newAuthorizationEpoch);
-    },
-  };
   const memberships = new MembershipService(
     database,
     database,
@@ -105,22 +82,29 @@ export function createServiceGraph(config: AppConfig, pool: Pool) {
   );
   const identity = new IdentityAdminService(database, database, effects);
   const paymentRepository = new PostgresPaymentRepository(database, database, effects);
-  if (config.paymentProvider !== "sandbox") {
+  const paymentProviders: PaymentProvider[] = [];
+  if (config.paymentProvider === "sandbox") {
+    paymentProviders.push(new SandboxPaymentProvider(
+      "revenue-costs-sandbox",
+      Buffer.from(config.sessionHmacKey, "utf8"),
+    ));
+  } else if (config.paymentProvider === "temporary-manual") {
+    paymentProviders.push(new TemporaryManualPaymentProvider(
+      "revenue-costs-temporary-manual",
+      Buffer.from(config.sessionHmacKey, "utf8"),
+    ));
+  } else if (config.paymentProvider !== "disabled") {
     throw new AppError("PAYMENT_PROVIDER_NOT_CONFIGURED", "真实支付适配器尚未配置", 503);
   }
-  const sandboxPayment = new SandboxPaymentProvider(
-    "revenue-costs-sandbox",
-    Buffer.from(config.sessionHmacKey, "utf8"),
-  );
-  const payments = new PaymentService(paymentRepository, [sandboxPayment]);
-  const fx = new PostgresFxService(database);
+  const payments = new PaymentService(paymentRepository, paymentProviders);
+  const fx = new PostgresFxService(database, database, effects);
   const uploads = new UploadService(pool, config.storageRoot);
   const imports = new PostgresImportService(database, database);
   const reports = new PostgresReportService(database, database);
   const accountingPreferences = new PostgresAccountingPreferencesService(database, database, effects);
   const onboarding = new PostgresOnboardingService(database);
   const objectStore = new EncryptedObjectStore(config.storageRoot, Buffer.from(config.fileKekBase64, "base64"));
-  const exports = new PostgresExportService(pool, objectStore, exportOutputRoot(process.cwd()));
+  const exports = new PostgresExportService(pool, objectStore, config.exportOutputRoot ?? exportOutputRoot(process.cwd()));
 
   const authenticate = (request: FastifyRequest, requireCsrf: boolean): Promise<Actor> =>
     authenticateAuthRoute({ auth, publicOrigin: config.publicOrigin }, request, requireCsrf);
@@ -168,7 +152,12 @@ export function createServiceGraph(config: AppConfig, pool: Pool) {
 
 export async function registerCoreRoutes(app: FastifyInstance, config: AppConfig, pool: Pool): Promise<ReturnType<typeof createServiceGraph>> {
   const graph = createServiceGraph(config, pool);
-  await app.register(authRoutes, { auth: graph.auth, publicOrigin: config.publicOrigin, secureCookies: config.mode === "production" });
+  await app.register(authRoutes, {
+    auth: graph.auth,
+    publicOrigin: config.publicOrigin,
+    secureCookies: config.mode === "production",
+    cookiePath: config.appBasePath,
+  });
   await app.register(meRoutes, {
     authService: graph.auth,
     authenticate: (request, requireCsrf) => authenticateAuthSession({ auth: graph.auth, publicOrigin: config.publicOrigin }, request, requireCsrf),
@@ -196,7 +185,7 @@ export async function registerCoreRoutes(app: FastifyInstance, config: AppConfig
   await app.register(appRoutes, { catalog: graph.catalog, authenticate: graph.authenticate });
   await app.register(enterpriseRoutes, { enterprises: graph.enterprises, authenticate: graph.authenticate });
   await app.register(shopRoutes, { shops: graph.shops, memberships: graph.memberships, authenticate: graph.authenticate });
-  await app.register(adminRoutes, { identity: graph.identity, wallet: graph.wallet, authenticate: graph.authenticate });
+  await app.register(adminRoutes, { identity: graph.identity, wallet: graph.wallet, fx: graph.fx, authenticate: graph.authenticate });
   // Keep payment JSON raw-body parsing in its encapsulated Fastify scope.
   await app.register(paymentRoutes, { service: graph.payments, wallet: graph.wallet, authenticate: graph.authenticate });
   await app.register(async (scope) => {
@@ -235,6 +224,7 @@ export async function registerCoreRoutes(app: FastifyInstance, config: AppConfig
   });
   await app.register(reportRoutes, {
     services: graph.reports,
+    acquireIntermediateExport: (accountId) => acquireIntermediateExportLease(pool, accountId),
     getContinentPrefixes: async (accountId) => (await graph.accountingPreferences.get(accountId)).continentPrefixes,
     ...shopRouteSecurity,
     async auditAdminAccess(actor, shopId, view, requestId, filter) {

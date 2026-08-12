@@ -11,7 +11,7 @@ const EnterpriseIdSchema = Type.String({ pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4
 const QuoteSchema = Type.Object({ enterpriseId: EnterpriseIdSchema, creditAmountCents: Type.String({ pattern: '^[1-9][0-9]*$' }) });
 const CreateSchema = Type.Object({
   enterpriseId: EnterpriseIdSchema,
-  provider: Type.Union([Type.Literal('WECHAT'), Type.Literal('ALIPAY'), Type.Literal('SANDBOX')]),
+  provider: Type.Union([Type.Literal('WECHAT'), Type.Literal('ALIPAY')]),
   creditAmountCents: Type.String({ pattern: '^[1-9][0-9]*$' }),
 });
 
@@ -69,6 +69,20 @@ export const paymentRoutes: FastifyPluginAsync<PaymentRouteOptions> = async (app
     const wallet = await options.wallet.getEnterpriseForActor(actor, body.enterpriseId, true);
     const key = requireIdempotencyKey(request);
     return options.service.createSandboxRecharge({
+      walletId: wallet.walletId,
+      accountId: actor.accountId,
+      creditAmountCents: body.creditAmountCents,
+      idempotencyKey: key,
+      requestId: request.id,
+    });
+  });
+
+  app.post<{ Body: Buffer }>('/api/v1/payments/manual/orders', async (request) => {
+    const actor = await options.authenticate(request, true);
+    const body = parseJsonBody<{ enterpriseId: string; creditAmountCents: string }>(request.body, QuoteSchema);
+    const wallet = await options.wallet.getEnterpriseForActor(actor, body.enterpriseId, true);
+    const key = requireIdempotencyKey(request);
+    return options.service.createTemporaryManualRecharge({
       walletId: wallet.walletId,
       accountId: actor.accountId,
       creditAmountCents: body.creditAmountCents,

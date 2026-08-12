@@ -5,6 +5,7 @@ export * from "./date.js";
 export * from "./normalize.js";
 export * from "./convert.js";
 export * from "./chinamoney.js";
+export * from "./chinamoney-json.js";
 export * from "./chinamoney-xlsx.js";
 export * from "./curl-fetch.js";
 export * from "./sync.js";

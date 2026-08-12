@@ -33,6 +33,7 @@ describe("export download token HTTP contract", () => {
       stream: Readable.from("report"),
       fileName: "report.xlsx",
       mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      contentLength: "6",
     }));
     const app = Fastify();
     await app.register(exportRoutes, { service: { createDownloadToken, download } as never, authenticate });
@@ -44,6 +45,8 @@ describe("export download token HTTP contract", () => {
 
     const consumed = await app.inject({ method: "GET", url: `/api/v1/exports/${exportId}/download?token=${token}` });
     expect(consumed.statusCode).toBe(200);
+    expect(consumed.headers["content-length"]).toBe("6");
+    expect(consumed.headers["x-accel-buffering"]).toBe("no");
     expect(download).toHaveBeenCalledWith(actor, exportId, token, expect.any(String));
     await app.close();
   });

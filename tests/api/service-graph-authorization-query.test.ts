@@ -21,6 +21,7 @@ const config: AppConfig = {
   port: 3000,
   databaseUrl: "postgres://test.invalid/test",
   publicOrigin: "https://app.example.test",
+  appBasePath: "/revenue-costs",
   otpHmacKey: "o".repeat(32),
   sessionHmacKey: "s".repeat(32),
   paymentProvider: "sandbox",

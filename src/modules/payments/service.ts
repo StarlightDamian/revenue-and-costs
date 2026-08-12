@@ -76,12 +76,52 @@ export class PaymentService {
     readonly quote: ReturnType<typeof quoteTopUp>;
     readonly walletBalanceCents: string | null;
   }> {
+    return this.createLocalRecharge(input, 'SANDBOX');
+  }
+
+  async createTemporaryManualRecharge(input: {
+    readonly walletId: string;
+    readonly accountId: string;
+    readonly creditAmountCents: string;
+    readonly idempotencyKey: string;
+    readonly requestId: string;
+  }): Promise<{
+    readonly orderId: string;
+    readonly status: 'PAID' | 'PENDING';
+    readonly quote: ReturnType<typeof quoteTopUp>;
+    readonly walletBalanceCents: string | null;
+  }> {
+    return this.createLocalRecharge(input, 'TEMPORARY_MANUAL');
+  }
+
+  private async createLocalRecharge(
+    input: {
+      readonly walletId: string;
+      readonly accountId: string;
+      readonly creditAmountCents: string;
+      readonly idempotencyKey: string;
+      readonly requestId: string;
+    },
+    mode: 'SANDBOX' | 'TEMPORARY_MANUAL',
+  ): Promise<{
+    readonly orderId: string;
+    readonly status: 'PAID' | 'PENDING';
+    readonly quote: ReturnType<typeof quoteTopUp>;
+    readonly walletBalanceCents: string | null;
+  }> {
+    const provider = this.providers.get('SANDBOX');
+    if (mode === 'SANDBOX') {
+      if (!(provider instanceof SandboxPaymentProvider)) {
+        throw new AppError('PAYMENT_SANDBOX_DISABLED', '支付沙箱未启用', 503);
+      }
+    } else if (!(provider instanceof TemporaryManualPaymentProvider)) {
+      throw new AppError('PAYMENT_MANUAL_DISABLED', '受控充值未启用', 503);
+    }
+
     const created = await this.createOrder({ ...input, provider: 'SANDBOX' });
     if (created.status === 'PAID') {
       return { orderId: created.orderId, status: 'PAID', quote: created.quote, walletBalanceCents: null };
     }
-    const provider = this.providers.get('SANDBOX');
-    if (!(provider instanceof SandboxPaymentProvider)) throw new AppError('PAYMENT_SANDBOX_DISABLED', '支付沙箱未启用', 503);
     const callback = provider.paidCallback(created.orderId, created.quote.payableAmountCents);
     const settled = await this.handleRawCallback({
       provider: 'SANDBOX',
@@ -126,14 +166,16 @@ export class PaymentService {
   }
 }
 
-export class SandboxPaymentProvider implements PaymentProvider {
+abstract class LocalSettlementPaymentProvider implements PaymentProvider {
   readonly name = 'SANDBOX' as const;
+  protected abstract readonly mode: 'SANDBOX' | 'TEMPORARY_MANUAL';
 
   constructor(
     readonly merchantId: string,
     private readonly signingSecret: Uint8Array,
+    allowProduction: boolean,
   ) {
-    if (process.env.NODE_ENV === 'production') throw new Error('生产环境禁止使用支付沙箱');
+    if (process.env.NODE_ENV === 'production' && !allowProduction) throw new Error('生产环境禁止使用支付沙箱');
   }
 
   async verifyRawSignature(rawBody: Uint8Array, headers: Readonly<Record<string, string | undefined>>): Promise<boolean> {
@@ -177,7 +219,13 @@ export class SandboxPaymentProvider implements PaymentProvider {
     readonly payableAmountCents: string;
     readonly currency: 'CNY';
   }): Promise<{ readonly providerPayload: Readonly<Record<string, unknown>> }> {
-    return { providerPayload: { sandbox: true, ...input, merchantId: this.merchantId } };
+    return {
+      providerPayload: {
+        ...(this.mode === 'SANDBOX' ? { sandbox: true } : { temporaryManual: true }),
+        ...input,
+        merchantId: this.merchantId,
+      },
+    };
   }
 
   sign(rawBody: Uint8Array): string {
@@ -188,17 +236,38 @@ export class SandboxPaymentProvider implements PaymentProvider {
     readonly rawBody: Uint8Array;
     readonly headers: Readonly<Record<string, string>>;
   } {
+    const prefix = this.mode === 'SANDBOX' ? 'sandbox' : 'temporary-manual';
     const rawBody = Buffer.from(
       JSON.stringify({
-        providerEventId: `sandbox-paid:${orderId}`,
+        providerEventId: `${prefix}-paid:${orderId}`,
         eventType: 'PAID',
         merchantId: this.merchantId,
         internalOrderId: orderId,
-        providerTransactionId: `sandbox-transaction:${orderId}`,
+        providerTransactionId: `${prefix}-transaction:${orderId}`,
         currency: 'CNY',
         amountCents: payableAmountCents,
       }),
     );
     return { rawBody, headers: { 'x-sandbox-signature': this.sign(rawBody) } };
+  }
+}
+
+export class SandboxPaymentProvider extends LocalSettlementPaymentProvider {
+  protected readonly mode = 'SANDBOX' as const;
+
+  constructor(merchantId: string, signingSecret: Uint8Array) {
+    super(merchantId, signingSecret, false);
+  }
+}
+
+/**
+ * 受控试运行使用的即时到账适配器。它不代表外部支付成功，只用于用户明确批准的临时充值通道。
+ * 数据库仍沿用既有 SANDBOX 渠道值，以避免伪造一个不存在的真实支付渠道。
+ */
+export class TemporaryManualPaymentProvider extends LocalSettlementPaymentProvider {
+  protected readonly mode = 'TEMPORARY_MANUAL' as const;
+
+  constructor(merchantId: string, signingSecret: Uint8Array) {
+    super(merchantId, signingSecret, true);
   }
 }

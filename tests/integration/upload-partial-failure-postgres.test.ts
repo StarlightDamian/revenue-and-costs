@@ -1,18 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { migrate } from "../../src/db/migrate.js";
 import { recordUploadFileFailure } from "../../src/modules/uploads/partial-failure.js";
+import { createPostgresTestSchema, type PostgresTestSchema } from "./postgres-harness.js";
 
-const databaseUrl = process.env.UPLOAD_PARTIAL_TEST_DATABASE_URL;
-
-describe.skipIf(!databaseUrl)("upload partial failure PostgreSQL projection", () => {
-  const pool = new Pool({ connectionString: databaseUrl });
+describe("upload partial failure PostgreSQL projection", () => {
+  let database: PostgresTestSchema | undefined;
+  let pool!: PostgresTestSchema["pool"];
 
   beforeAll(async () => {
-    if (process.env.UPLOAD_PARTIAL_SKIP_MIGRATE !== "true") await migrate(pool);
+    database = await createPostgresTestSchema();
+    pool = database.pool;
   });
-  afterAll(async () => pool.end());
+  afterAll(async () => { await database?.cleanup(); });
 
   async function createBatch(fileStatuses: readonly ("ENCRYPTING" | "STORED")[]) {
     const accountId = randomUUID();
@@ -151,6 +150,50 @@ describe.skipIf(!databaseUrl)("upload partial failure PostgreSQL projection", ()
       current_stage: "PREFLIGHT_COMPLETE",
       failure_code: "NO_USABLE_UPLOAD_FILES",
       issues: "3",
+    });
+  });
+
+  it("atomically releases a reserved archive budget when finalization fails", async () => {
+    const fixture = await createBatch(["STORED", "ENCRYPTING"]);
+    const failedId = fixture.fileIds[1]!;
+    await pool.query(
+      `UPDATE upload_batch
+          SET expanded_bytes=100,file_count=file_count+2
+        WHERE id=$1`,
+      [fixture.batchId],
+    );
+    await pool.query(
+      `UPDATE upload_file
+          SET archive_reservation_state='RESERVED',archive_expanded_bytes=100,archive_file_count=2
+        WHERE id=$1`,
+      [failedId],
+    );
+
+    await recordUploadFileFailure(pool, {
+      fileId: failedId,
+      errorCode: "UPLOAD_FINALIZE_FAILED",
+      allowedStatuses: ["COMPLETE", "ENCRYPTING"],
+    });
+
+    const state = await pool.query<{
+      expanded_bytes: string;
+      file_count: number;
+      archive_reservation_state: string;
+      archive_expanded_bytes: string;
+      archive_file_count: number;
+    }>(
+      `SELECT ub.expanded_bytes::text,ub.file_count,uf.archive_reservation_state,
+              uf.archive_expanded_bytes::text,uf.archive_file_count
+         FROM upload_batch ub JOIN upload_file uf ON uf.batch_id=ub.id
+        WHERE ub.id=$1 AND uf.id=$2`,
+      [fixture.batchId, failedId],
+    );
+    expect(state.rows[0]).toEqual({
+      expanded_bytes: "0",
+      file_count: 2,
+      archive_reservation_state: "NONE",
+      archive_expanded_bytes: "0",
+      archive_file_count: 0,
     });
   });
 });

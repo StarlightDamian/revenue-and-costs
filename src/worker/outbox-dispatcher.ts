@@ -1,5 +1,5 @@
 import type { PgBoss } from "pg-boss";
-import type { Notification, Pool } from "pg";
+import type { Pool } from "pg";
 import { withTransaction } from "../db/pool";
 
 interface PendingEvent { id: string; topic: string; business_key: string; payload: Record<string, unknown> }
@@ -12,67 +12,51 @@ const durableJobOptions = {
   heartbeatSeconds: 30,
 } as const;
 
-export const OUTBOX_NOTIFY_CHANNEL = "revenue_costs_outbox";
-
 export async function dispatchOutbox(pool: Pool, boss: PgBoss, limit = 50): Promise<number> {
-  return withTransaction(pool, async (tx) => {
-    const result = await tx.query<PendingEvent>(
-      `SELECT id, topic, business_key, payload
-       FROM outbox_event WHERE dispatched_at IS NULL
-       ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $1`,
-      [limit],
-    );
-    const byTopic = new Map<string, PendingEvent[]>();
-    for (const event of result.rows) {
-      const group = byTopic.get(event.topic) ?? [];
-      group.push(event);
-      byTopic.set(event.topic, group);
-    }
-    for (const [topic, events] of byTopic) {
-      await boss.insert(topic, events.map((event) => ({
-        data: event.payload,
-        singletonKey: event.id,
-        ...durableJobOptions,
-      })));
-    }
-    if (result.rows.length) {
-      await tx.query(
-        `UPDATE outbox_event
-            SET dispatched_at=clock_timestamp(),attempt_count=attempt_count+1,last_error=NULL
-          WHERE id=ANY($1::uuid[])`,
-        [result.rows.map((event) => event.id)],
-      );
-    }
-    return result.rowCount ?? 0;
-  });
-}
-
-export async function listenForOutboxNotifications(
-  pool: Pool,
-  wake: () => void,
-  reportError: (error: unknown) => void,
-): Promise<() => Promise<void>> {
-  const client = await pool.connect();
-  const onNotification = (message: Notification) => {
-    if (message.channel === OUTBOX_NOTIFY_CHANNEL) wake();
-  };
-  const onError = (error: Error) => { reportError(error); };
-  client.on("notification", onNotification);
-  client.on("error", onError);
+  let claimedIds: string[] = [];
   try {
-    await client.query(`LISTEN ${OUTBOX_NOTIFY_CHANNEL}`);
+    return await withTransaction(pool, async (tx) => {
+      const result = await tx.query<PendingEvent>(
+        `SELECT id, topic, business_key, payload
+         FROM outbox_event WHERE dispatched_at IS NULL
+         ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $1`,
+        [limit],
+      );
+      claimedIds = result.rows.map((event) => event.id);
+      const byTopic = new Map<string, PendingEvent[]>();
+      for (const event of result.rows) {
+        const group = byTopic.get(event.topic) ?? [];
+        group.push(event);
+        byTopic.set(event.topic, group);
+      }
+      for (const [topic, events] of byTopic) {
+        await boss.insert(topic, events.map((event) => ({
+          data: event.payload,
+          singletonKey: event.id,
+          ...durableJobOptions,
+        })));
+      }
+      if (result.rows.length) {
+        await tx.query(
+          `UPDATE outbox_event
+              SET dispatched_at=clock_timestamp(),attempt_count=attempt_count+1,last_error=NULL
+            WHERE id=ANY($1::uuid[])`,
+          [claimedIds],
+        );
+      }
+      return result.rowCount ?? 0;
+    });
   } catch (error) {
-    client.off("notification", onNotification);
-    client.off("error", onError);
-    client.release();
+    if (claimedIds.length) {
+      await pool.query(
+        `UPDATE outbox_event
+            SET attempt_count=attempt_count+1,last_error=$2
+          WHERE id=ANY($1::uuid[]) AND dispatched_at IS NULL`,
+        [claimedIds, "OUTBOX_DISPATCH_FAILED"],
+      ).catch(() => undefined);
+    }
     throw error;
   }
-  return async () => {
-    await client.query(`UNLISTEN ${OUTBOX_NOTIFY_CHANNEL}`).catch(reportError);
-    client.off("notification", onNotification);
-    client.off("error", onError);
-    client.release();
-  };
 }
 
 export function createOutboxDispatchScheduler(

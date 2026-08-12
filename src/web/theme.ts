@@ -2,6 +2,8 @@ export const THEME_STORAGE_KEY = "revenueCostsThemeV01";
 export const THEMES = ["comfort", "tech", "light", "dark"] as const;
 export type ThemeId = (typeof THEMES)[number];
 
+let pendingThemePreference: ThemeId | null = null;
+
 export const THEME_NAMES: Readonly<Record<ThemeId, string>> = {
   comfort: "舒适",
   tech: "科技",
@@ -30,4 +32,17 @@ export function applyTheme(
 ): void {
   root.dataset.theme = theme;
   storage.setItem(THEME_STORAGE_KEY, theme);
+}
+
+// An anonymous choice must survive authentication until it is written to the account.
+export function stageThemePreference(theme: ThemeId): void {
+  pendingThemePreference = theme;
+}
+
+export function getPendingThemePreference(): ThemeId | null {
+  return pendingThemePreference;
+}
+
+export function clearPendingThemePreference(): void {
+  pendingThemePreference = null;
 }

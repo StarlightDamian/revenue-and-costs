@@ -34,7 +34,12 @@ describe("calculation rule versioning", () => {
         if (sql.includes("FROM dataset_slice ds")) return { rows: [{
           slice_id: "slice-1", version_id: "version-1", status: "COMPLETE", mappings: [], warning: false,
           hard_ack: null, soft_ack: null, normalized_marketplace: "US", policy_id: "policy-1", iana_timezone: "America/Los_Angeles",
+          date_attribution_mode: "REPORT_LITERAL_DATE",
         }] };
+        if (sql.includes("FROM fx_current_override")) return { rows: [
+          { id: "20000000-0000-4000-8000-000000000002" },
+          { id: "20000000-0000-4000-8000-000000000001" },
+        ] };
         if (sql.includes("price_id") && sql.includes("fx_sync_run_id")) return { rows: [{ price_id: "price-1", fx_sync_run_id: "fx-sync-1" }] };
         if (sql.includes("INSERT INTO calculation_run(")) return { rows: [{ id: "run-1", status: "QUEUED" }] };
         return { rows: [], rowCount: 1 };
@@ -51,12 +56,50 @@ describe("calculation rule versioning", () => {
     })).resolves.toMatchObject({ runId: "run-1" });
 
     const insert = calls.find(({ sql }) => sql.includes("INSERT INTO calculation_run("));
-    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v2", "local-v4"]);
-    expect(JSON.parse(String(insert?.parameters?.[6]))).toMatchObject({
-      formulaVersion: "revenue-cost-v2",
-      codeVersion: "local-v4",
+    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v4", "local-v6"]);
+    expect(insert?.parameters?.[6]).toBe("transaction-fee-v2");
+    expect(JSON.parse(String(insert?.parameters?.[7]))).toMatchObject({
+      formulaVersion: "revenue-cost-v4",
+      codeVersion: "local-v6",
+      feeClassificationVersion: "transaction-fee-v2",
+      feeClassificationPolicySha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       fxDateRuleVersion: "next-business-day-v2",
+      fxOverrideIds: [
+        "20000000-0000-4000-8000-000000000001",
+        "20000000-0000-4000-8000-000000000002",
+      ],
+      timezonePolicyVersion: expect.stringMatching(/^date-attribution-policy-set:/u),
+      slices: [{ dateAttributionMode: "REPORT_LITERAL_DATE" }],
     });
+  });
+
+  it("rejects a calculation that would mix incompatible date attribution modes", async () => {
+    const client = {
+      async query(sql: string) {
+        if (sql.includes("FROM dataset_slice ds")) return { rows: [
+          {
+            slice_id: "slice-old", version_id: "version-old", status: "ACTIVE", mappings: [], warning: false,
+            hard_ack: null, soft_ack: null, normalized_marketplace: "US", policy_id: "policy-old",
+            iana_timezone: "Asia/Shanghai", date_attribution_mode: "INSTANT_TO_IANA_TIMEZONE",
+          },
+          {
+            slice_id: "slice-new", version_id: "version-new", status: "ACTIVE", mappings: [], warning: false,
+            hard_ack: null, soft_ack: null, normalized_marketplace: "CA", policy_id: "policy-new",
+            iana_timezone: "America/Toronto", date_attribution_mode: "REPORT_LITERAL_DATE",
+          },
+        ] };
+        return { rows: [{ id: "shop-1" }], rowCount: 1 };
+      },
+    };
+    const reports = new PostgresReportService(
+      { transaction: async (work: (transactionClient: typeof client) => Promise<unknown>) => work(client) } as never,
+      { query: vi.fn() } as never,
+    );
+
+    await expect(reports.requestCalculation("shop-1", {
+      actorAccountId: "actor-1",
+      idempotencyKey: "mixed-date-attribution",
+    })).rejects.toThrow("CALCULATION_DATE_ATTRIBUTION_MODE_MIXED");
   });
 });
 
@@ -70,6 +113,7 @@ describe("import-triggered automatic publishing", () => {
           return { rows: [{
             slice_id: "slice-1", version_id: "version-1", status: "INCOMPLETE", mappings: [], warning: false,
             hard_ack: null, soft_ack: null, normalized_marketplace: "US", policy_id: "policy-1", iana_timezone: "America/Los_Angeles",
+            date_attribution_mode: "REPORT_LITERAL_DATE",
           }] };
         }
         return { rows: [{ id: "shop-1" }] };
@@ -111,7 +155,7 @@ describe("import-triggered automatic publishing", () => {
       calculationRunId: "run-1",
       shopId: "shop-1",
       slices: [{ sliceId: "slice-1", datasetVersionId: "version-1", disposition: "INCLUDED" }],
-    }, { actorAccountId: "actor-1", idempotencyKey: "auto-import:batch-1" });
+    }, { actorAccountId: "actor-1", idempotencyKey: "auto-import:batch-1:run-1" }, { snapshotOnly: true });
     expect(queries.filter((query) => query.sql.includes("UPDATE import_batch")).map((query) => query.sql)).toEqual([
       expect.stringContaining("status='RESULT_PUBLISHING'"),
     ]);

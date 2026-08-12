@@ -74,3 +74,34 @@ describe("import confirmation recovery", () => {
     expect(statements.some((sql) => sql.includes("'import.commit'"))).toBe(false);
   });
 });
+
+describe("import quality acknowledgement policy binding", () => {
+  it("binds the policy effective for the slice marketplace and dataset creation time", async () => {
+    const calls: Array<{ sql: string; parameters?: readonly unknown[] }> = [];
+    const client = {
+      query: vi.fn(async (sql: string, parameters?: readonly unknown[]) => {
+        calls.push({ sql, ...(parameters ? { parameters } : {}) });
+        if (sql.includes("CASE WHEN dv.status='INCOMPLETE'")) {
+          return { rows: [{ dataset_version_id: "version-ca", issue_kind: "HARD_INCOMPLETE", issue_code: "ACCOUNTANT_ACKNOWLEDGED", policy_id: "policy-ca-literal" }] };
+        }
+        if (sql.includes("INSERT INTO quality_acknowledgement")) return { rows: [{ id: "ack-1" }] };
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const transactions = { transaction: vi.fn(async (work: (tx: typeof client) => Promise<unknown>) => work(client)) };
+    const service = new PostgresImportService(transactions as never, { query: vi.fn() } as never);
+
+    await expect(service.acknowledge("shop-1", "version-ca", {
+      actorAccountId: "actor-1",
+      reason: "确认排除报表字面日期重放后缺失的切片",
+      confirmations: "2",
+      idempotencyKey: "ack-ca-literal",
+    })).resolves.toEqual({ id: "ack-1", status: "ACKNOWLEDGED" });
+
+    const policyQuery = calls.find(({ sql }) => sql.includes("CASE WHEN dv.status='INCOMPLETE'"));
+    expect(policyQuery?.sql).toContain("candidate.normalized_marketplace=ds.normalized_marketplace");
+    expect(policyQuery?.sql).toContain("candidate.effective_from<=dv.created_at");
+    const acknowledgement = calls.find(({ sql }) => sql.includes("INSERT INTO quality_acknowledgement"));
+    expect(acknowledgement?.parameters?.[1]).toBe("policy-ca-literal");
+  });
+});

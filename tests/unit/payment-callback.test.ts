@@ -1,12 +1,23 @@
 import { createHmac } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type {
   PaymentEventResult,
   PaymentProvider,
   PaymentRepository,
   VerifiedPaymentEvent,
 } from '../../src/modules/payments/index.js';
-import { PaymentCallbackError, PaymentService, SandboxPaymentProvider } from '../../src/modules/payments/index.js';
+import {
+  PaymentCallbackError,
+  PaymentService,
+  SandboxPaymentProvider,
+  TemporaryManualPaymentProvider,
+} from '../../src/modules/payments/index.js';
+
+const originalNodeEnv = process.env.NODE_ENV;
+
+afterEach(() => {
+  process.env.NODE_ENV = originalNodeEnv;
+});
 
 const result: PaymentEventResult = {
   eventId: 'event-db',
@@ -29,6 +40,12 @@ function repository(events: VerifiedPaymentEvent[]): PaymentRepository {
 }
 
 describe('支付回调原文边界', () => {
+  it('生产环境拒绝沙箱适配器，只允许显式的受控充值适配器', () => {
+    process.env.NODE_ENV = 'production';
+    expect(() => new SandboxPaymentProvider('merchant', Buffer.alloc(32, 1))).toThrow('生产环境禁止使用支付沙箱');
+    expect(() => new TemporaryManualPaymentProvider('merchant', Buffer.alloc(32, 1))).not.toThrow();
+  });
+
   it('签名无效时绝不解析 JSON 或写入仓储', async () => {
     const calls: string[] = [];
     const provider: PaymentProvider = {

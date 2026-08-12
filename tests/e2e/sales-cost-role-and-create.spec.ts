@@ -144,7 +144,13 @@ test("管理员侧栏按 MECE 分组并提供平台治理入口", async ({ page 
 
   await page.goto("/admin/users");
   const menuButton = page.getByRole("button", { name: "菜单" });
-  if ((page.viewportSize()?.width ?? 1440) <= 1180) await menuButton.click();
+  if ((page.viewportSize()?.width ?? 1440) <= 1180) {
+    await menuButton.click();
+    await expect(page.getByRole("button", { name: /工作台/ })).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(menuButton).toBeFocused();
+    await menuButton.click();
+  }
 
   const navigation = page.getByRole("navigation");
   await expect(navigation.getByText("工作台", { exact: true })).toBeVisible();
@@ -152,14 +158,144 @@ test("管理员侧栏按 MECE 分组并提供平台治理入口", async ({ page 
   await expect(navigation.getByText("数据与规则", { exact: true })).toBeVisible();
   await expect(navigation.getByText("组织与账号", { exact: true })).toBeVisible();
   await expect(navigation.getByText("平台管理", { exact: true })).toBeVisible();
-  await expect(navigation.getByRole("link", { name: "公司与做账" })).toBeVisible();
-  await expect(navigation.getByRole("link", { name: "外汇市场" })).toBeVisible();
-  await expect(navigation.getByRole("link", { name: "企业钱包" })).toBeVisible();
   await expect(navigation.getByRole("link", { name: "做账员" })).toBeVisible();
   await expect(navigation.getByRole("link", { name: "应用" })).toBeVisible();
   await expect(navigation.getByRole("link", { name: "运营状态" })).toBeVisible();
+  await navigation.getByRole("button", { name: /销售成本/ }).click();
+  await expect(navigation.getByRole("link", { name: "公司与做账" })).toBeVisible();
+  await expect(navigation.getByRole("link", { name: "做账员" })).toBeHidden();
+  await navigation.getByRole("button", { name: /数据与规则/ }).click();
+  await expect(navigation.getByRole("link", { name: "外汇市场" })).toBeVisible();
+  await navigation.getByRole("button", { name: /组织与账号/ }).click();
+  await expect(navigation.getByRole("link", { name: "企业钱包" })).toBeVisible();
+
+  const sidebarLayout = await page.locator(".sidebar").evaluate((sidebar) => {
+    const group = sidebar.querySelector<HTMLElement>(".side-nav-group");
+    const toggle = sidebar.querySelector<HTMLElement>(".side-nav-group-toggle");
+    const toggles = [...sidebar.querySelectorAll<HTMLElement>(".side-nav-group-toggle")];
+    const nav = sidebar.querySelector<HTMLElement>(".side-nav");
+    const footer = sidebar.querySelector<HTMLElement>(".sidebar-foot");
+    const sidebarBox = sidebar.getBoundingClientRect();
+    const groupStyle = group ? getComputedStyle(group) : undefined;
+    const transitionDurations = groupStyle?.transitionDuration.split(",").map((value) => Number.parseFloat(value) * (value.trim().endsWith("ms") ? 1 : 1000)) ?? [];
+    const headerFills = toggles.map((element) => getComputedStyle(element).backgroundImage);
+    const headerTextColors = toggles.map((element) => getComputedStyle(element).color);
+    const headerFontWeights = toggles.map((element) => Number.parseInt(getComputedStyle(element.querySelector("strong") ?? element).fontWeight, 10));
+    const firstItem = sidebar.querySelector<HTMLElement>(".side-nav-items a");
+    return {
+      sidebarWidth: sidebarBox.width,
+      toggleHeight: toggle?.getBoundingClientRect().height ?? Number.POSITIVE_INFINITY,
+      groupAnimation: groupStyle?.animationName,
+      groupBorderWidth: groupStyle?.borderTopWidth,
+      headerFills,
+      headerTextColors,
+      headerFontWeights,
+      itemFontWeight: firstItem ? Number.parseInt(getComputedStyle(firstItem).fontWeight, 10) : Number.POSITIVE_INFINITY,
+      visibleDescriptions: [...sidebar.querySelectorAll<HTMLElement>(".side-nav-group-copy small")].filter((element) => getComputedStyle(element).display !== "none").length,
+      longestGroupTransitionMs: Math.max(0, ...transitionDurations),
+      navHasUsableViewport: Boolean(nav && nav.clientHeight > 0),
+      footerVisible: Boolean(footer && footer.getBoundingClientRect().bottom <= sidebarBox.bottom),
+    };
+  });
+  expect(sidebarLayout.sidebarWidth).toBeLessThanOrEqual(252);
+  expect(sidebarLayout.toggleHeight).toBeLessThanOrEqual(52);
+  expect(sidebarLayout.groupAnimation).toBe("none");
+  expect(sidebarLayout.groupBorderWidth).toBe("0px");
+  expect(new Set(sidebarLayout.headerFills).size).toBeGreaterThanOrEqual(4);
+  expect(sidebarLayout.headerFills).not.toContain("none");
+  expect(new Set(sidebarLayout.headerTextColors).size).toBe(1);
+  expect(sidebarLayout.headerTextColors).not.toContain("rgb(36, 24, 0)");
+  expect(Math.max(...sidebarLayout.headerFontWeights)).toBeLessThanOrEqual(600);
+  expect(sidebarLayout.itemFontWeight).toBeLessThanOrEqual(550);
+  expect(sidebarLayout.visibleDescriptions).toBe(0);
+  expect(sidebarLayout.longestGroupTransitionMs).toBeLessThanOrEqual(150);
+  expect(sidebarLayout.navHasUsableViewport).toBe(true);
+  expect(sidebarLayout.footerVisible).toBe(true);
+
+  await navigation.getByRole("button", { name: /平台管理/ }).click();
+  const expandedLinks = navigation.locator(".side-nav-group.is-expanded .side-nav-items a");
+  await expect(expandedLinks).toHaveCount(3);
+  for (const link of await expandedLinks.all()) await expect(link).toBeVisible();
+  const expandedBounds = await expandedLinks.evaluateAll((links) => {
+    const nav = links[0]?.closest(".side-nav");
+    if (!nav) return [];
+    const navBox = nav.getBoundingClientRect();
+    return links.map((link) => {
+      const linkBox = link.getBoundingClientRect();
+      return linkBox.top >= navBox.top && linkBox.bottom <= navBox.bottom;
+    });
+  });
+  expect(expandedBounds).toEqual([true, true, true]);
 
   const evidenceDirectory = resolve(".work/evidence/admin-navigation");
+  await mkdir(evidenceDirectory, { recursive: true });
+  const collapseButton = page.getByRole("button", { name: "收起侧栏" });
+  await expect(collapseButton).toBeVisible();
+  await collapseButton.click();
+  const collapsedSidebar = page.locator(".sidebar.is-collapsed");
+  await expect(collapsedSidebar).toBeVisible();
+  await expect(page.getByRole("button", { name: "展开侧栏" })).toBeVisible();
+  expect(await collapsedSidebar.evaluate((element) => element.getBoundingClientRect().width)).toBeLessThanOrEqual(68);
+  const railLinks = collapsedSidebar.locator(".side-nav-items a");
+  await expect(railLinks).toHaveCount(10);
+  await expect(railLinks.locator(".side-nav-item-marker")).toHaveCount(10);
+  expect(await railLinks.locator(".side-nav-item-marker").allTextContents()).not.toContain("");
+  await expect(collapsedSidebar.getByRole("link", { name: "做账员" })).toHaveClass(/router-link-active/);
+  const collapsedGroupFills = await collapsedSidebar.locator(".side-nav-marker").evaluateAll((markers) => markers.map((marker) => getComputedStyle(marker).backgroundImage));
+  expect(new Set(collapsedGroupFills).size).toBeGreaterThanOrEqual(4);
+  expect(collapsedGroupFills).not.toContain("none");
+  await page.screenshot({ path: resolve(evidenceDirectory, `rail-${testInfo.project.name}.png`), fullPage: true });
+
+  await collapsedSidebar.getByRole("button", { name: "数据与规则" }).click();
+  await expect(page.locator(".sidebar.is-collapsed")).toHaveCount(0);
+  await expect(navigation.getByRole("link", { name: "外汇市场" })).toBeVisible();
+  await page.getByRole("button", { name: "收起侧栏" }).click();
+  await page.getByRole("button", { name: "展开侧栏" }).click();
+  await expect(page.locator(".sidebar.is-collapsed")).toHaveCount(0);
+  await expect(navigation.getByText("数据与规则", { exact: true })).toBeVisible();
+  await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
+});
+
+test("账号名称可修改并即时同步侧栏，手机号区号独立置灰", async ({ page }, testInfo) => {
+  let currentAccount = { ...accountant, phoneMasked: "+86 138****0000" };
+  let profilePayload: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentAccount) }));
+  await page.route("**/api/v1/enterprises", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route("**/api/v1/me/profile", async (route) => {
+    profilePayload = route.request().postDataJSON() as Record<string, unknown>;
+    currentAccount = { ...currentAccount, displayName: String(profilePayload.displayName) };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentAccount) });
+  });
+
+  await page.goto("/account");
+  const nameInput = page.getByLabel("账号名称");
+  await expect(nameInput).toHaveValue("浏览器验收做账员");
+  await expect(nameInput).toHaveAttribute("placeholder", "例如：香港公司名称");
+  const phone = page.locator(".definition-list .phone-display");
+  await expect(phone.locator(".phone-country-code")).toHaveText("+86");
+  await expect(phone).toContainText("138****0000");
+  const colors = await phone.evaluate((element) => {
+    const prefix = element.querySelector<HTMLElement>(".phone-country-code");
+    const number = element.querySelector<HTMLElement>(".phone-number");
+    return { prefix: prefix ? getComputedStyle(prefix).color : "", number: number ? getComputedStyle(number).color : "" };
+  });
+  expect(colors.prefix).not.toBe(colors.number);
+  await expect(phone).toHaveAttribute("aria-label", "+86 138****0000");
+  expect(await page.locator(".account-avatar-toggle").evaluate((element) => getComputedStyle(element, "::after").content))
+    .toMatch(/^(none|normal)$/u);
+
+  await nameInput.fill("😀".repeat(80));
+  await expect(page.getByRole("button", { name: "保存名称" })).toBeEnabled();
+
+  await nameInput.fill("测试做账员");
+  await page.getByRole("button", { name: "保存名称" }).click();
+  await expect(page.getByText("账号名称已更新")).toBeVisible();
+  expect(profilePayload).toEqual({ displayName: "测试做账员" });
+  if ((page.viewportSize()?.width ?? 1440) <= 1180) await page.getByRole("button", { name: "菜单" }).click();
+  await expect(page.locator(".account-summary").getByText("测试做账员", { exact: true })).toBeVisible();
+  await expect(page.locator(".account-summary")).not.toContainText("138****0000");
+
+  const evidenceDirectory = resolve(".work/evidence/account-settings");
   await mkdir(evidenceDirectory, { recursive: true });
   await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
 });

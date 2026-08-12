@@ -3,7 +3,7 @@ import { createPool } from "../db/pool";
 import { loadConfig } from "../shared/config";
 
 const config = loadConfig();
-const pool = createPool(config.databaseUrl);
+const pool = createPool(config.databaseUrl, "api");
 const app = await createApp({ config, pool });
 
 const close = async (): Promise<void> => {

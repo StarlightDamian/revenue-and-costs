@@ -6,10 +6,8 @@ import type {
   TransactionRunner,
   TransactionSideEffects,
 } from "../../src/modules/authorization/index.js";
-import {
-  MembershipService,
-  type MembershipArtifactInvalidator,
-} from "../../src/modules/memberships/service.js";
+import { MembershipService } from "../../src/modules/memberships/service.js";
+import type { MembershipArtifactInvalidator } from "../../src/modules/memberships/activation.js";
 
 const owner: Actor = {
   accountId: "10000000-0000-4000-8000-000000000001",
@@ -272,7 +270,7 @@ describe("membership authorization and idempotency", () => {
     });
 
     expect(invalidateForMembership).toHaveBeenCalledWith(client, membershipId, "5");
-    expect(operations).toEqual(["invitation", "invalidate"]);
+    expect(operations).toEqual(["invalidate", "invitation"]);
     expect(audit.mock.calls[0]?.[1]).toMatchObject({ action: "CUSTOMER_INVITATION_ACCEPTED" });
     expect(transactions).toMatchObject({ commits: 1, rollbacks: 0 });
   });
@@ -286,7 +284,13 @@ describe("membership authorization and idempotency", () => {
 
     for (const operation of ["export", "revoke"] as const) {
       const query = vi.fn(async (sql: string) => {
-        if (sql.includes("FROM shop_membership sm JOIN shop s")) {
+        if (sql === "SELECT shop_id FROM shop_membership WHERE id = $1") {
+          return { rows: [{ shop_id: shopId }], rowCount: 1 };
+        }
+        if (sql.includes("FROM shop WHERE")) {
+          return { rows: [{ id: shopId, enterprise_id: "50000000-0000-4000-8000-000000000005", status: "ACTIVE" }], rowCount: 1 };
+        }
+        if (sql.includes("FROM shop_membership") && sql.includes("FOR UPDATE")) {
           return {
             rows: [{
               id: "60000000-0000-4000-8000-000000000006",
@@ -326,7 +330,7 @@ describe("membership authorization and idempotency", () => {
         : service.revoke(common);
 
       await expect(result).rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND", statusCode: 404 });
-      expect(query).toHaveBeenCalledOnce();
+      expect(query).toHaveBeenCalledTimes(3);
       expect(transactions).toMatchObject({ commits: 0, rollbacks: 1 });
     }
   });
@@ -336,7 +340,13 @@ describe("membership authorization and idempotency", () => {
     const sqlCalls: string[] = [];
     const query = vi.fn(async (sql: string) => {
       sqlCalls.push(sql);
-      if (sql.includes("FROM shop_membership sm JOIN shop s")) {
+      if (sql === "SELECT shop_id FROM shop_membership WHERE id = $1") {
+        return { rows: [{ shop_id: shopId }], rowCount: 1 };
+      }
+      if (sql.includes("FROM shop WHERE")) {
+        return { rows: [{ id: shopId, enterprise_id: "50000000-0000-4000-8000-000000000005", status: "ACTIVE" }], rowCount: 1 };
+      }
+      if (sql.includes("FROM shop_membership") && sql.includes("FOR UPDATE")) {
         return {
           rows: [{
             id: membershipId,
@@ -385,6 +395,10 @@ describe("membership authorization and idempotency", () => {
     });
 
     expect(sqlCalls.some((sql) => sql.includes("UPDATE shop_membership"))).toBe(false);
+    const shopLockIndex = sqlCalls.findIndex((sql) => sql.includes("FROM shop WHERE") && sql.includes("FOR UPDATE"));
+    const membershipLockIndex = sqlCalls.findIndex((sql) => sql.includes("FROM shop_membership") && sql.includes("FOR UPDATE"));
+    expect(shopLockIndex).toBeGreaterThanOrEqual(0);
+    expect(shopLockIndex).toBeLessThan(membershipLockIndex);
     expect(invalidateForMembership).not.toHaveBeenCalled();
     expect(audit).not.toHaveBeenCalled();
     expect(transactions).toMatchObject({ commits: 1, rollbacks: 0 });

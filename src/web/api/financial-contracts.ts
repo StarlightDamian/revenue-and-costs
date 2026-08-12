@@ -1,4 +1,4 @@
-import type { FxConversionRow, FxQuote, FxStatus, UploadCompletion } from "./types";
+import type { FxConversionRow, FxOverride, FxQuote, FxStatus, UploadCompletion } from "./types";
 
 type JsonObject = Record<string, unknown>;
 
@@ -14,6 +14,26 @@ function string(value: unknown, label: string): string {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function fxOverride(value: unknown): FxOverride {
+  const row = object(value, "人工汇率");
+  const supersedesOverrideId = row.supersedesOverrideId === null
+    ? null
+    : string(row.supersedesOverrideId, "人工汇率");
+  if (typeof row.isCurrent !== "boolean") throw new Error("人工汇率接口返回格式无效");
+  return {
+    id: string(row.id, "人工汇率"),
+    currency: string(row.currency, "人工汇率"),
+    validFrom: string(row.validFrom, "人工汇率"),
+    validTo: string(row.validTo, "人工汇率"),
+    cnyPerUnit: string(row.cnyPerUnit, "人工汇率"),
+    sourceReference: string(row.sourceReference, "人工汇率"),
+    reason: string(row.reason, "人工汇率"),
+    createdAt: string(row.createdAt, "人工汇率"),
+    supersedesOverrideId,
+    isCurrent: row.isCurrent,
+  };
 }
 
 export function normalizeFxStatus(payload: unknown): FxStatus {
@@ -55,6 +75,16 @@ export function normalizeFxHistory(payload: unknown): FxQuote[] {
       source: "OFFICIAL",
     };
   });
+}
+
+export function normalizeFxOverrideList(payload: unknown): FxOverride[] {
+  const wrapper = object(payload, "人工汇率");
+  if (!Array.isArray(wrapper.rows)) throw new Error("人工汇率接口返回格式无效");
+  return wrapper.rows.map(fxOverride);
+}
+
+export function normalizeFxOverrideMutation(payload: unknown): FxOverride {
+  return fxOverride(object(payload, "人工汇率").override);
 }
 
 export function normalizeFxConversions(payload: unknown): FxConversionRow[] {

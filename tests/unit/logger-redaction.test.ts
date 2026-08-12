@@ -16,11 +16,12 @@ describe("structured request diagnostics", () => {
   });
 
   it("emits an allowlisted terminal event without raw error or request values", () => {
+    const sourceRoot = process.cwd().replaceAll("/", "\\");
     const cause = Object.assign(new Error("database secret sentinel 13800000000"), { code: "ECONNREFUSED" });
-    cause.stack = "Error: database secret sentinel 13800000000\n    at query (D:\\wwwroot\\revenue-and-costs\\src\\modules\\auth\\postgres.ts:241:5)";
+    cause.stack = `Error: database secret sentinel 13800000000\n    at query (${sourceRoot}\\src\\modules\\auth\\postgres.ts:241:5)`;
     const error = new Error("outer secret sentinel", { cause });
     error.name = "AuthFailure";
-    error.stack = "AuthFailure: outer secret sentinel\n    at rejectLogin (D:\\wwwroot\\revenue-and-costs\\src\\modules\\auth\\service.ts:326:13)";
+    error.stack = `AuthFailure: outer secret sentinel\n    at rejectLogin (${sourceRoot}\\src\\modules\\auth\\service.ts:326:13)`;
 
     const record = buildRequestCompletion({
       requestId: "15210cf7-8b96-4412-8808-4b1f44c962b7",

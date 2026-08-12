@@ -3,28 +3,36 @@ import { appendFile, cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { clearTimeout, setTimeout } from "node:timers";
-import { Pool } from "pg";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../../src/db/migrate";
+import { createPostgresTestSchema, type PostgresTestSchema } from "./postgres-harness.js";
 
-const databaseUrl = process.env.MIGRATION_TEST_DATABASE_URL;
 const temporaryDirectories: string[] = [];
 
 afterAll(async () => Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
-describe.skipIf(!databaseUrl)("forward migration runner", () => {
+describe("forward migration runner", () => {
+  let database: PostgresTestSchema | undefined;
+  let first!: PostgresTestSchema["pool"];
+  let second!: PostgresTestSchema["pool"];
+
+  beforeAll(async () => {
+    database = await createPostgresTestSchema({ migrate: false });
+    first = database.pool;
+    second = database.createPool();
+  });
+
+  afterAll(async () => { await database?.cleanup(); });
+
   it("serializes concurrent runners, is repeatable, and rejects checksum drift", async () => {
-    const first = new Pool({ connectionString: databaseUrl });
-    const second = new Pool({ connectionString: databaseUrl });
-    try {
-      await Promise.all([migrate(first), migrate(second)]);
+    await Promise.all([migrate(first), migrate(second)]);
       await expect(migrate(first)).resolves.toEqual([]);
       const status = await first.query<{ applied: string; duplicates: string }>(
         `SELECT count(*)::text AS applied,
                 (count(*)-count(DISTINCT filename))::text AS duplicates
            FROM schema_migration`,
       );
-      expect(Number(status.rows[0]?.applied ?? "0")).toBeGreaterThanOrEqual(42);
+      expect(Number(status.rows[0]?.applied ?? "0")).toBeGreaterThanOrEqual(49);
       expect(status.rows[0]?.duplicates).toBe("0");
       const enterpriseModel = await first.query<{
         invalid_roles: string; orphan_companies: string; invalid_wallet_owners: string; current_price: string;
@@ -66,6 +74,57 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
               OR (table_name='export_request' AND column_name IN ('profit_rate','minimum_sales_cost_rate')))`
       );
       expect(accountingColumns.rows[0]?.count).toBe("4");
+      const fulfillmentContract = await first.query<{ is_nullable: string; definition: string }>(
+        `SELECT column_info.is_nullable,pg_get_constraintdef(con.oid) definition
+           FROM information_schema.columns column_info
+           JOIN pg_constraint con ON con.conname='transaction_fact_fulfillment_mode_check'
+           JOIN pg_class relation ON relation.oid=con.conrelid AND relation.relname='transaction_fact'
+           JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace AND namespace.nspname=current_schema()
+          WHERE column_info.table_schema=current_schema()
+            AND column_info.table_name='transaction_fact'
+            AND column_info.column_name='fulfillment_mode'`,
+      );
+        expect(fulfillmentContract.rows).toEqual([{
+          is_nullable: "YES",
+          definition: expect.stringContaining("fulfillment_mode"),
+        }]);
+        const feeClassificationContract = await first.query<{ column_default: string; definition: string }>(
+          `SELECT column_info.column_default,pg_get_constraintdef(con.oid) definition
+             FROM information_schema.columns column_info
+             JOIN pg_constraint con ON con.conname='transaction_fee_component_classification_version_check'
+             JOIN pg_class relation ON relation.oid=con.conrelid AND relation.relname='transaction_fee_component'
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace AND namespace.nspname=current_schema()
+            WHERE column_info.table_schema=current_schema()
+              AND column_info.table_name='transaction_fee_component'
+              AND column_info.column_name='classification_version'`,
+        );
+        expect(feeClassificationContract.rows).toEqual([{
+          column_default: "'transaction-fee-v1'::text",
+          definition: expect.stringContaining("transaction-fee-v2"),
+        }]);
+        const feeRunContract = await first.query<{ column_default: string }>(
+          `SELECT column_default FROM information_schema.columns
+            WHERE table_schema=current_schema() AND table_name='calculation_run'
+              AND column_name='fee_classification_version'`,
+        );
+        expect(feeRunContract.rows).toEqual([{ column_default: "'transaction-fee-v1'::text" }]);
+        const protectedRunInputs = await first.query<{ exists: boolean }>(
+          `SELECT EXISTS(
+             SELECT 1 FROM pg_trigger trigger
+             JOIN pg_class relation ON relation.oid=trigger.tgrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema() AND relation.relname='calculation_run'
+              AND trigger.tgname='calculation_run_inputs_immutable' AND NOT trigger.tgisinternal
+           ) AS exists`,
+        );
+        expect(protectedRunInputs.rows).toEqual([{ exists: true }]);
+      const australianPolicy = await first.query<{ timezone: string; mode: string }>(
+        `SELECT iana_timezone timezone,date_attribution_mode mode
+           FROM marketplace_policy_version
+          WHERE normalized_marketplace='AU'
+          ORDER BY effective_from DESC,id DESC LIMIT 1`,
+      );
+      expect(australianPolicy.rows).toEqual([{ timezone: "Australia/Sydney", mode: "REPORT_LITERAL_DATE" }]);
       const exportProgressColumns = await first.query<{ count: string }>(
         `SELECT count(*)::text AS count
            FROM information_schema.columns
@@ -85,6 +144,41 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
             AND NOT trigger.tgisinternal`,
       );
       expect(outboxNotifyTrigger.rows[0]?.count).toBe("1");
+      const replicationOutboxTrigger = await first.query<{ count: string }>(
+        `SELECT count(*)::text count
+           FROM pg_trigger trigger
+           JOIN pg_class relation ON relation.oid=trigger.tgrelid
+           JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+          WHERE namespace.nspname=current_schema()
+            AND relation.relname='stored_object'
+            AND trigger.tgname='stored_object_replication_outbox'
+            AND NOT trigger.tgisinternal`,
+      );
+      expect(replicationOutboxTrigger.rows[0]?.count).toBe("1");
+      const replicationObjectId = randomUUID();
+      await first.query("BEGIN");
+      try {
+        await first.query(
+          `INSERT INTO stored_object
+             (id,object_kind,immutable_key,storage_path,plaintext_size,plaintext_sha256,ciphertext_sha256,
+              encryption_format,encryption_context,verification_status)
+           VALUES($1,'SOURCE',$2,$3,1,$4,$4,'AWS_ESDK_V2_FRAMED','{}'::jsonb,'LOCAL_VERIFIED')`,
+          [replicationObjectId, `migration/${replicationObjectId}`, `migration/${replicationObjectId}.esdk`, "a".repeat(64)],
+        );
+        const replicationEvent = await first.query<{ topic: string; business_key: string; object_id: string }>(
+          `SELECT topic,business_key,payload->>'objectId' AS object_id
+             FROM outbox_event
+            WHERE topic='storage.replicate' AND business_key=$1`,
+          [replicationObjectId],
+        );
+        expect(replicationEvent.rows).toEqual([{
+          topic: "storage.replicate",
+          business_key: replicationObjectId,
+          object_id: replicationObjectId,
+        }]);
+      } finally {
+        await first.query("ROLLBACK");
+      }
       const fxOffsetConstraint = await first.query<{ definition: string }>(
         `SELECT pg_get_constraintdef(con.oid) definition
            FROM pg_constraint con
@@ -102,6 +196,12 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
         sa_current_size: string;
         se_historical_size: string;
         se_current_size: string;
+        current_non_literal_count: string;
+        current_shanghai_count: string;
+        current_policy_count: string;
+        historical_shanghai_instant_count: string;
+        source_timezone_mismatch_count: string;
+        changed_size_count: string;
       }>(
         `SELECT
            (SELECT count(*)::text FROM marketplace_policy_version
@@ -126,16 +226,63 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
            (SELECT marketplace_size FROM marketplace_policy_version
              WHERE normalized_marketplace='SE'
                AND effective_from<='2026-08-07T08:25:00Z'::timestamptz
-             ORDER BY effective_from DESC,id DESC LIMIT 1) se_current_size`,
+             ORDER BY effective_from DESC,id DESC LIMIT 1) se_current_size,
+           (SELECT count(*)::text FROM (
+              SELECT DISTINCT ON (normalized_marketplace) normalized_marketplace,date_attribution_mode
+                FROM marketplace_policy_version
+               ORDER BY normalized_marketplace,effective_from DESC,id DESC
+            ) current_policy WHERE date_attribution_mode<>'REPORT_LITERAL_DATE') current_non_literal_count,
+           (SELECT count(*)::text FROM (
+              SELECT DISTINCT ON (normalized_marketplace) normalized_marketplace,iana_timezone
+                FROM marketplace_policy_version
+               ORDER BY normalized_marketplace,effective_from DESC,id DESC
+            ) current_policy WHERE iana_timezone='Asia/Shanghai') current_shanghai_count,
+           (SELECT count(DISTINCT normalized_marketplace)::text
+              FROM marketplace_policy_version) current_policy_count,
+           (SELECT count(*)::text FROM marketplace_policy_version
+             WHERE iana_timezone='Asia/Shanghai'
+               AND date_attribution_mode='INSTANT_TO_IANA_TIMEZONE') historical_shanghai_instant_count,
+           (SELECT count(*)::text
+              FROM (
+                SELECT DISTINCT ON (normalized_marketplace) id,normalized_marketplace,iana_timezone
+                  FROM marketplace_policy_version
+                 ORDER BY normalized_marketplace,effective_from DESC,id DESC
+              ) current_policy
+              JOIN LATERAL (
+                SELECT historical.iana_timezone
+                  FROM marketplace_policy_version historical
+                 WHERE historical.normalized_marketplace=current_policy.normalized_marketplace
+                   AND historical.id<>current_policy.id
+                   AND historical.iana_timezone<>'Asia/Shanghai'
+                 ORDER BY historical.effective_from DESC,historical.id DESC LIMIT 1
+              ) source_policy ON true
+             WHERE current_policy.iana_timezone IS DISTINCT FROM source_policy.iana_timezone) source_timezone_mismatch_count,
+           (SELECT count(*)::text FROM (
+              SELECT normalized_marketplace,
+                     (array_agg(marketplace_size ORDER BY effective_from DESC,id DESC))[1] latest_size,
+                     (array_agg(marketplace_size ORDER BY effective_from DESC,id DESC))[2] previous_size
+                FROM marketplace_policy_version
+               GROUP BY normalized_marketplace
+            ) policy_history
+             WHERE previous_size IS NOT NULL
+               AND latest_size IS DISTINCT FROM previous_size) changed_size_count`,
       );
-      expect(marketplacePolicies.rows[0]).toEqual({
+      const marketplacePolicy = marketplacePolicies.rows[0];
+      expect(marketplacePolicy).toMatchObject({
         br_historical_count: "0",
         br_timezone: "America/Sao_Paulo",
         sa_historical_size: "LARGE",
         sa_current_size: "SMALL",
         se_historical_size: "LARGE",
         se_current_size: "SMALL",
+        current_non_literal_count: "0",
+        current_shanghai_count: "0",
+        source_timezone_mismatch_count: "0",
+        changed_size_count: "0",
       });
+      expect(Number(marketplacePolicy?.historical_shanghai_instant_count) + 1).toBe(
+        Number(marketplacePolicy?.current_policy_count),
+      );
       const listener = await first.connect();
       const outboxEventId = randomUUID();
       try {
@@ -180,8 +327,5 @@ describe.skipIf(!databaseUrl)("forward migration runner", () => {
       await cp(resolve("migrations"), copiedMigrations, { recursive: true });
       await appendFile(join(copiedMigrations, "0001_core_audit_jobs.sql"), "\n-- prohibited history rewrite\n", "utf8");
       await expect(migrate(first, copiedMigrations)).rejects.toThrow("MIGRATION_CHECKSUM_MISMATCH:0001_core_audit_jobs.sql");
-    } finally {
-      await Promise.all([first.end(), second.end()]);
-    }
   });
 });

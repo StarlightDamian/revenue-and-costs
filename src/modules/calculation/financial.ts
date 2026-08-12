@@ -1,5 +1,6 @@
 import Decimal from "decimal.js";
 import { decimal, decimal8 } from "../fx/decimal.js";
+import { canonicalTransactionType, classifyFeeCell } from "./fee-classification.js";
 import {
   REFUND_FIELDS,
   SHIPMENT_INCOME_FIELDS,
@@ -7,8 +8,10 @@ import {
   type FactFxConversion,
   type FinancialComponent,
   type FinancialSummary,
+  type FeeClassificationAudit,
   type ShipmentFact,
   type TransactionFact,
+  type TransactionFeeFact,
 } from "./types.js";
 
 const ZERO = "0.00000000";
@@ -25,10 +28,6 @@ const SUMMARY_KEY: Readonly<Record<FinancialComponent, SummaryKey>> = {
   FBA_STORAGE_FEE: "fbaStorageFee",
   OTHER_DEDUCTION: "otherDeduction",
 };
-
-function canonical(value: string): string {
-  return value.normalize("NFKC").trim().replace(/[\s-]+/gu, "_").toUpperCase();
-}
 
 function assertConversion(fact: ShipmentFact | TransactionFact, fx: FactFxConversion): void {
   if (fx.requestedDate !== fact.fxDate) throw new Error(`FX_DATE_MISMATCH:${fact.id}`);
@@ -77,8 +76,18 @@ function pushResult(
 
 function transactionResults(fact: TransactionFact, fx: FactFxConversion): CalculationFactResult[] {
   const results: CalculationFactResult[] = [];
-  const type = canonical(fact.type);
-  const description = canonical(fact.description);
+  // Re-normalize immutable legacy facts with the current formula rules. New
+  // imports are already canonical, while old localized values remain auditable.
+  const type = canonicalTransactionType(fact.type);
+
+  if (type === "ORDER" && fact.fulfillmentMode === "MERCHANT") {
+    // FMB uses the same nine amount semantics as refunds, but localized report
+    // layouts place them in different physical columns. Keep each source
+    // amount separate so the existing FX audit chain remains unchanged.
+    for (const field of REFUND_FIELDS) {
+      pushResult(results, fact, field, "INCOME", fact.amounts[field], fx, false);
+    }
+  }
 
   if (type === "REFUND") {
     for (const field of REFUND_FIELDS) {
@@ -99,23 +108,10 @@ function transactionResults(fact: TransactionFact, fx: FactFxConversion): Calcul
   pushResult(results, fact, "sellingFees", "PLATFORM_FEE", fact.amounts.sellingFees, fx, true);
   pushResult(results, fact, "fbaFees", "FBA_FULFILLMENT_FEE", fact.amounts.fbaFees, fx, true);
 
-  const otherTransactionComponent = description === "COST_OF_ADVERTISING"
-    ? "ADVERTISING_FEE"
-    : "OTHER_DEDUCTION";
-  pushResult(
-    results,
-    fact,
-    "otherTransactionFees",
-    otherTransactionComponent,
-    fact.amounts.otherTransactionFees,
-    fx,
-    true,
-  );
-
-  if (type === "FBA_INVENTORY_FEE") {
-    pushResult(results, fact, "other", "FBA_STORAGE_FEE", fact.amounts.other, fx, true);
-  } else if (type !== "TRANSFER" && type !== "DEBT") {
-    pushResult(results, fact, "other", "OTHER_DEDUCTION", fact.amounts.other, fx, true);
+  for (const sourceColumn of ["otherTransactionFees", "other"] as const) {
+    const classification = classifyFeeCell(sourceColumn, type, fact.description);
+    if (classification.category === "EXCLUDED_TRANSFER_DEBT") continue;
+    pushResult(results, fact, sourceColumn, classification.category, fact.amounts[sourceColumn], fx, true);
   }
   return results;
 }
@@ -155,6 +151,17 @@ export class FinancialAccumulator {
     const results = transactionResults(fact, fx);
     results.forEach((result) => this.append(result));
     return results;
+  }
+
+  classifyTransactionFees(fact: TransactionFeeFact): readonly FeeClassificationAudit[] {
+    const audits: FeeClassificationAudit[] = [];
+    for (const sourceColumn of ["sellingFees", "fbaFees", "otherTransactionFees", "other"] as const) {
+      const amountOriginal = decimal8(fact.amounts[sourceColumn]);
+      if (decimal(amountOriginal).isZero()) continue;
+      const classification = classifyFeeCell(sourceColumn, fact.type, fact.description);
+      audits.push({ factId: fact.id, sourceColumn, ...classification, amountOriginal });
+    }
+    return audits;
   }
 
   summary(): FinancialSummary {
