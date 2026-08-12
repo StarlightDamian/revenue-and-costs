@@ -28,11 +28,13 @@ export async function removeUploadStagingArtifacts(input: {
     throw new Error("UPLOAD_STAGING_CLEANUP_PATH_INVALID");
   }
 
-  await Promise.all([
+  const removals = await Promise.allSettled([
     ignoreMissing(async () => unlink(tempPath)),
     ignoreMissing(async () => rm(archiveRoot, { recursive: true })),
     ignoreMissing(async () => rm(chunkRoot, { recursive: true })),
   ]);
+  const failed = removals.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed) throw failed.reason;
 }
 
 export async function cleanupUploadStagingArtifacts(
