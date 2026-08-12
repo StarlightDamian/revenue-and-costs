@@ -106,8 +106,32 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain("dist/cli/migrate.js");
     expect(remote).toContain("dist/cli/bootstrap-mappings.js");
     expect(remote).toContain("REQUIRE_BOOTSTRAP_MAPPINGS=true");
+    expect(remote).toContain('migrator_env="$config_root/database-migrator.env"');
+    expect(remote).toContain("DATABASE_MIGRATOR_CONFIG_INVALID");
+    expect(remote).toContain('assert_database_identity revenue_costs_migrator revenue_costs_owner owner "$database_name" "$database_server_identity"');
+    expect(remote).toContain('assert_database_identity revenue_costs_app revenue_costs_app application "$database_name" "$database_server_identity"');
+    expect(remote).toContain("DATABASE_RELEASE_IDENTITY_MISMATCH");
+    expect(remote).toContain("DATABASE_IDENTITY_EXPECTED_DATABASE");
+    expect(remote).toContain("DATABASE_IDENTITY_EXPECTED_SERVER");
+    expect(remote).toContain("pg_postmaster_start_time()");
+    expect(remote).toContain("server_is_local");
+    expect(remote).toContain("session_has_limited_owner_membership");
+    expect(remote).toContain("session_membership_count === 0");
+    expect(remote).toContain("unset DATABASE_URL PGOPTIONS");
+    expect(remote).not.toMatch(/GRANT\s+(?:CREATE|revenue_costs_owner)|ALTER\s+ROLE/iu);
     expect(remote.indexOf('runuser -u postgres -- "$pg_dump_bin"')).toBeLessThan(remote.indexOf("dist/cli/migrate.js"));
+    expect(remote.indexOf('source "$migrator_env"')).toBeLessThan(remote.indexOf("dist/cli/migrate.js"));
+    expect(remote.indexOf("dist/cli/migrate.js")).toBeLessThan(remote.indexOf('source "$config_root/database-app.env"'));
+    expect(remote.indexOf('source "$config_root/database-app.env"')).toBeLessThan(remote.indexOf("dist/cli/bootstrap-mappings.js"));
     expect(remote).toContain("RELEASE_FAILED_AFTER_MIGRATION_SERVICES_STOPPED");
+    const migratedFailure = remote.slice(
+      remote.indexOf("# The forward migration is committed and immutable."),
+      remote.indexOf("fi\n  fi", remote.indexOf("# The forward migration is committed and immutable.")),
+    );
+    expect(migratedFailure).toContain('systemctl stop "$api_service" "$worker_service"');
+    expect(migratedFailure).toContain("systemctl show --property=ActiveState --value");
+    expect(migratedFailure).toContain('"$api_state" =~ ^(inactive|failed)$');
+    expect(migratedFailure).toContain("RELEASE_FAILED_AFTER_MIGRATION_SERVICE_STOP_FAILED");
     expect(remote).toContain("database_matches_previous");
     expect(remote).toContain("RESULT_PUBLISHED','FAILED','CANCELLED");
     expect(remote).toContain("tar --no-same-owner --no-same-permissions");
