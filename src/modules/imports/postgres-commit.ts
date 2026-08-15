@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { statfs } from "node:fs/promises";
 import { join } from "node:path";
@@ -13,7 +13,11 @@ import type { FieldMappingDefinition } from "../mappings/types.js";
 import { parseMappedDelimitedStream, type MappedImportRow } from "./stream-parser.js";
 import { parseMappedXlsxStream, XLSX_IMPORT_ENCODING } from "./xlsx-stream.js";
 import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeFulfillment, normalizeReportDate, normalizeTransactionDescription, normalizeTransactionType, SingleSiteMarketplaceInference, type MarketplaceProfile } from "./normalize-row.js";
-import { inheritSourceReplayHardAcknowledgements } from "./source-replay.js";
+import {
+  inheritSourceReplayHardAcknowledgements,
+  sourceReplayClosureHash,
+  type SourceReplayClosureRow,
+} from "./source-replay-contract.js";
 
 const STAGE_COLUMNS = [
   "report_kind", "file_id", "row_number", "row_hash", "date_text", "parsed_at", "source_timezone",
@@ -123,13 +127,7 @@ export async function assertSourceReplayClosureCurrent(client: PoolClient, batch
     "SELECT id FROM dataset_slice WHERE shop_id=$1 ORDER BY id FOR UPDATE",
     [replay.rows[0]!.shop_id],
   );
-  const current = await client.query<{
-    dataset_version_id: string;
-    report_kind: string;
-    import_file_id: string;
-    stored_object_id: string;
-    mapping_version_id: string;
-  }>(
+  const current = await client.query<SourceReplayClosureRow>(
     `SELECT version.id::text dataset_version_id,binding.report_kind,binding.import_file_id::text,
             file.stored_object_id::text,binding.mapping_version_id::text
        FROM dataset_slice slice
@@ -140,13 +138,7 @@ export async function assertSourceReplayClosureCurrent(client: PoolClient, batch
       ORDER BY version.id,binding.report_kind,binding.import_file_id`,
     [replay.rows[0]!.shop_id],
   );
-  const actual = createHash("sha256").update(JSON.stringify(current.rows.map((row) => ({
-    datasetVersionId: row.dataset_version_id,
-    reportKind: row.report_kind,
-    importFileId: row.import_file_id,
-    storedObjectId: row.stored_object_id,
-    mappingVersionId: row.mapping_version_id,
-  })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))))).digest("hex");
+  const actual = sourceReplayClosureHash(current.rows);
   if (actual !== expected) throw new Error("SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED");
 }
 

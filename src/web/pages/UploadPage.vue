@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
+import { MAX_UPLOAD_BATCH_BYTES, MAX_UPLOAD_BATCH_FILES } from "../../shared/upload-limits";
 import { api } from "../api/client";
 import type { CompletenessSlice, ImportPreview } from "../api/types";
 import PageHeader from "../components/PageHeader.vue";
@@ -32,7 +33,9 @@ const selectedPaths = new WeakMap<File, string>();
 let pollingGeneration = 0;
 let stateEpoch = 0;
 const totalBytes = computed(() => uploadItems.value.reduce((sum, item) => sum + item.size, 0));
-const accepted = computed(() => files.value.length > 0 && files.value.length <= 20_000 && totalBytes.value <= 2 * 1024 * 1024 * 1024);
+const accepted = computed(() => files.value.length > 0
+  && files.value.length <= MAX_UPLOAD_BATCH_FILES
+  && totalBytes.value <= MAX_UPLOAD_BATCH_BYTES);
 const selectionLocked = computed(() => restoringLatest.value
   || checkingSelection.value
   || resuming.value
@@ -181,8 +184,8 @@ async function acceptSelection(selection: readonly DroppedFile[]) {
     const action = previous.length > 0 ? `已追加 ${merged.added} 个文件` : `已选择 ${merged.added} 个文件`;
     const replacement = merged.replaced > 0 ? `，已用最后一次选择替换 ${merged.replaced} 个同路径文件` : "";
     selectionNotice.value = `${action}${replacement}；当前共 ${merged.files.length} 个文件，可继续追加，确认后再开始上传。`;
-    if (files.value.length > 20_000) error.value = "单批文件数不能超过 20,000";
-    else if (totalBytes.value > 2 * 1024 * 1024 * 1024) error.value = "单批上传不能超过 2GB";
+    if (files.value.length > MAX_UPLOAD_BATCH_FILES) error.value = "单批文件数不能超过 20,000";
+    else if (totalBytes.value > MAX_UPLOAD_BATCH_BYTES) error.value = "单批上传不能超过 2GB";
   } finally {
     checkingSelection.value = false;
   }

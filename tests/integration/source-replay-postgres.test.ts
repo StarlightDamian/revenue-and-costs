@@ -44,7 +44,7 @@ describe("admin current-source replay", () => {
     await pool.query(
       `INSERT INTO shop(id,application_id,owner_account_id,name,normalized_name,status,start_date,close_date,
                         enterprise_id,created_by_account_id,last_operated_by_account_id)
-       SELECT $1,id,$2,'Replay synthetic shop','replay synthetic shop','ACTIVE','2026-01-01','2027-01-01',$3,$2,$2
+       SELECT $1,id,$2,'Replay synthetic shop','replay synthetic shop','ACTIVE','2026-01-01','2099-01-01',$3,$2,$2
          FROM application WHERE code='amazon-sales-cost'`,
       [shopId, actorAccountId, enterpriseId],
     );
@@ -167,6 +167,23 @@ describe("admin current-source replay", () => {
     if (root) await rm(root, { recursive: true, force: true });
   });
 
+  it("rejects replay when an ACTIVE shop has reached its Shanghai close date", async () => {
+    await pool.query(
+      "UPDATE shop SET close_date=timezone('Asia/Shanghai', clock_timestamp())::date WHERE id=$1",
+      [shopId],
+    );
+    try {
+      await expect(replayCurrentShopSources(pool, {
+        shopId,
+        actorAccountId,
+        idempotencyKey: "expired-shop-replay",
+        reason: "Prove that an expired shop cannot create a source replay",
+      }, { objectStore })).rejects.toThrow("SOURCE_REPLAY_SHOP_NOT_ACTIVE");
+    } finally {
+      await pool.query("UPDATE shop SET close_date='2099-01-01' WHERE id=$1", [shopId]);
+    }
+  });
+
   it("replays the complete current PARSED binding closure once and queues commit", async () => {
     const input = {
       shopId,
@@ -248,6 +265,17 @@ describe("admin current-source replay", () => {
         sourceClosureHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
       },
     });
+
+    await pool.query(
+      "UPDATE shop SET close_date=timezone('Asia/Shanghai', clock_timestamp())::date WHERE id=$1",
+      [shopId],
+    );
+    try {
+      await expect(replayCurrentShopSources(pool, input, { objectStore }))
+        .rejects.toThrow("SOURCE_REPLAY_SHOP_NOT_ACTIVE");
+    } finally {
+      await pool.query("UPDATE shop SET close_date='2099-01-01' WHERE id=$1", [shopId]);
+    }
 
     const replayed = await replayCurrentShopSources(pool, input, { objectStore });
     expect(replayed).toEqual({ ...created, replayed: true });

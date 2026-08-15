@@ -5,6 +5,7 @@ import type { EncryptedObjectStore } from "../modules/storage/encrypted-object-s
 import { recordUploadFileFailure } from "../modules/uploads/partial-failure.js";
 import { cleanupUploadStagingArtifacts } from "../modules/uploads/staging-cleanup.js";
 import { safeErrorDiagnostic } from "../shared/diagnostics.js";
+import { structuredLog } from "../shared/structured-logger.js";
 import { tryWithJobExecutionLock } from "./job-execution-lock.js";
 
 const TERMINAL_QUEUES = [
@@ -57,12 +58,7 @@ const businessKeyFields: Record<TerminalQueue, BusinessKey["field"]> = {
 };
 
 function defaultLog(level: "info" | "error", event: string, fields: Record<string, unknown>): void {
-  try {
-    const line = `${JSON.stringify({ level, time: Date.now(), event, service: "worker", ...fields })}\n`;
-    (level === "error" ? process.stderr : process.stdout).write(line);
-  } catch {
-    // Recovery diagnostics must never change the recovery result.
-  }
+  structuredLog(level, "worker", event, fields);
 }
 
 function businessKey(job: TerminalJob): BusinessKey {

@@ -14,6 +14,7 @@ const owner: Actor = {
   accountId: "owner-account",
   status: "ACTIVE",
   roles: new Set(["ACCOUNTANT"]),
+  enterpriseIds: new Set(["enterprise-account"]),
 };
 const config: AppConfig = {
   mode: "test",
@@ -48,7 +49,7 @@ function authorizationGraph(
       return {
         rows: [{
           id: shopId,
-          owner_account_id: "owner-account",
+          enterprise_id: "enterprise-account",
           status,
           membership_id: "30000000-0000-4000-8000-000000000003",
           membership_status: "ACTIVE",

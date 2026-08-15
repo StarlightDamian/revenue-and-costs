@@ -86,7 +86,7 @@ describe("source replay hard-incomplete acknowledgement continuity", () => {
     await pool.query(
       `INSERT INTO shop(id,application_id,owner_account_id,name,normalized_name,status,start_date,close_date,
                         enterprise_id,created_by_account_id,last_operated_by_account_id)
-       SELECT $1,id,$2,$3,$4,'ACTIVE','2026-01-01','2027-01-01',$5,$2,$2
+       SELECT $1,id,$2,$3,$4,'ACTIVE','2026-01-01','2099-01-01',$5,$2,$2
          FROM application WHERE code='amazon-sales-cost'`,
       [shopId, actorAccountId, `Ack shop ${suffix}`, `ack shop ${suffix}`, enterpriseId],
     );
@@ -237,6 +237,22 @@ describe("source replay hard-incomplete acknowledgement continuity", () => {
     await pool.query("UPDATE dataset_slice SET current_version_id=$2 WHERE id=$1", [sliceId, versionId]);
     return versionId;
   }
+
+  it("rejects resume when an ACTIVE shop has reached its Shanghai close date", async () => {
+    const scenario = await createScenario();
+    await pool.query(
+      "UPDATE shop SET close_date=timezone('Asia/Shanghai', clock_timestamp())::date WHERE id=$1",
+      [scenario.shopId],
+    );
+
+    await expect(resumeFailedSourceReplay(pool, {
+      shopId: scenario.shopId,
+      batchId: scenario.batchId,
+      actorAccountId,
+      idempotencyKey: "expired-shop-resume",
+      reason: "Prove that an expired shop cannot resume a source replay",
+    })).rejects.toThrow("SOURCE_REPLAY_SHOP_NOT_ACTIVE");
+  });
 
   it("adds a new audited acknowledgement and resumes the failed immutable replay exactly once", async () => {
     const scenario = await createScenario();

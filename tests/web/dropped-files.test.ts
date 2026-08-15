@@ -83,6 +83,52 @@ describe("collectDroppedFiles", () => {
       { file: us, relativePath: "US/transaction.csv" },
     ]);
   });
+
+  it("bounds directory entry expansion to sixteen concurrent file reads", async () => {
+    let active = 0;
+    let peak = 0;
+    const entries = Array.from({ length: 40 }, (_, index) => {
+      const file = new File([String(index)], `part-${index}.csv`, { type: "text/csv" });
+      return {
+        isFile: true as const,
+        isDirectory: false as const,
+        name: file.name,
+        fullPath: `/bulk/${file.name}`,
+        file: (success: (selected: File) => void) => {
+          active += 1;
+          peak = Math.max(peak, active);
+          setTimeout(() => {
+            active -= 1;
+            success(file);
+          }, 1);
+        },
+      };
+    });
+    let readCount = 0;
+    const directoryEntry = {
+      isFile: false as const,
+      isDirectory: true as const,
+      name: "bulk",
+      fullPath: "/bulk",
+      createReader: () => ({
+        readEntries: (success: (selected: typeof entries) => void) => {
+          readCount += 1;
+          success(readCount === 1 ? entries : []);
+        },
+      }),
+    };
+    const transfer = {
+      items: [{ kind: "file", webkitGetAsEntry: () => directoryEntry, getAsFile: () => null }],
+      files: [],
+    } as unknown as DataTransfer;
+
+    const result = await collectDroppedFiles(transfer);
+
+    expect(peak).toBeLessThanOrEqual(16);
+    expect(result).toHaveLength(40);
+    expect(result.map((item) => item.relativePath))
+      .toEqual([...result.map((item) => item.relativePath)].sort((left, right) => left.localeCompare(right)));
+  });
 });
 
 describe("mergeFileSelections", () => {

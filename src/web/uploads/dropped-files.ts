@@ -1,3 +1,5 @@
+import { UPLOAD_FILE_IO_CONCURRENCY } from "../../shared/upload-limits";
+
 export interface DroppedFile {
   readonly file: File;
   readonly relativePath: string;
@@ -90,13 +92,24 @@ async function directoryEntries(entry: BrowserDirectoryEntry): Promise<BrowserEn
   }
 }
 
-async function flattenEntry(entry: BrowserEntry): Promise<DroppedFile[]> {
-  if (entry.isFile) {
-    const file = await entryFile(entry);
-    return [{ file, relativePath: pathOf(entry, file.name) }];
+async function flattenEntries(roots: readonly BrowserEntry[]): Promise<DroppedFile[]> {
+  const pending = [...roots];
+  const files: DroppedFile[] = [];
+  while (pending.length > 0) {
+    const batch = pending.splice(0, UPLOAD_FILE_IO_CONCURRENCY);
+    const expanded = await Promise.all(batch.map(async (entry) => {
+      if (entry.isFile) {
+        const file = await entryFile(entry);
+        return { file, relativePath: pathOf(entry, file.name) } as DroppedFile;
+      }
+      return directoryEntries(entry);
+    }));
+    for (const result of expanded) {
+      if (Array.isArray(result)) pending.push(...result);
+      else files.push(result);
+    }
   }
-  const children = await directoryEntries(entry);
-  return (await Promise.all(children.map(flattenEntry))).flat();
+  return files;
 }
 
 export async function collectDroppedFiles(transfer: DataTransfer): Promise<DroppedFile[]> {
@@ -112,7 +125,7 @@ export async function collectDroppedFiles(transfer: DataTransfer): Promise<Dropp
       if (file) looseFiles.push(file);
     }
   }
-  const nested = (await Promise.all(roots.map(flattenEntry))).flat();
+  const nested = await flattenEntries(roots);
   const fallback = roots.length === 0 ? Array.from(transfer.files) : looseFiles;
   return [
     ...nested,
