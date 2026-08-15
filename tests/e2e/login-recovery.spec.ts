@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
 
 test("未受邀的新手机号登录后进入姓名可选的注册流程", async ({ page }) => {
+  await page.route("**/api/v1/me", (route) => route.fulfill({
+    status: 401,
+    contentType: "application/json",
+    body: JSON.stringify({ code: "SESSION_REQUIRED", message: "请先登录" }),
+  }));
   await page.route("**/api/v1/auth/otp", async (route) => {
     await route.fulfill({
       status: 200,

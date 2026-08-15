@@ -63,6 +63,63 @@ describe("one-click code release guardrails", () => {
     expect(script).toContain("$program | & node.exe - $ExpectedPath $ActualPath");
   });
 
+  it("binds every release to a clean local main that matches GitHub main", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+
+    expect(script).toContain("DEPLOY_GIT_WORKTREE_DIRTY");
+    expect(script).toContain("DEPLOY_GIT_BRANCH_NOT_MAIN");
+    expect(script).toContain("DEPLOY_GIT_REMOTE_MAIN_MISMATCH");
+    expect(script).toContain("git.exe status --porcelain=v1 --untracked-files=all");
+    expect(script).toContain("git.exe branch --show-current");
+    expect(script).toContain("git.exe rev-parse HEAD");
+    expect(script).toContain("git.exe ls-remote --exit-code origin refs/heads/main");
+    expect(script).toContain("$gitCommit");
+    expect(script).toContain("DEPLOY_GIT_COMMIT_CHANGED");
+    expect(script.match(/Assert-GitReleaseCommit \$gitCommit/gu)).toHaveLength(2);
+  });
+
+  it("persists the Git and archive provenance locally and in the remote release", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+
+    expect(script).toContain("revenue-costs-release-receipt-v1");
+    expect(script).toContain("release-$releaseId.receipt.json");
+    expect(script).toContain("release-$releaseId.tar.gz.partial");
+    expect(script).toContain("deploymentAcceptance = 'passed'");
+    expect(script).toContain("$dependencySha");
+    expect(script).toContain("$gitCommit");
+    expect(remote).toContain('[[ "$#" -eq 14 ]]');
+    expect(remote).toContain('git_commit="${14}"');
+    expect(remote).toContain('[[ "$git_commit" =~ ^[a-f0-9]{40}$ ]]');
+    expect(remote).toContain('receipt="$staging/.release-receipt.json"');
+    expect(remote).toContain("revenue-costs-release-receipt-v1");
+    expect(remote).toContain('"deploymentAcceptance":"passed"');
+    expect(remote.indexOf('receipt="$staging/.release-receipt.json"')).toBeLessThan(
+      remote.indexOf('find "$staging" -type f -exec chmod 0640 {} +'),
+    );
+  });
+
+  it("marks acceptance passed only after strict auth, worker, capacity, and stability checks", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const acceptancePassed = remote.lastIndexOf('"deploymentAcceptance":"passed"');
+
+    expect(remote).toContain('health_once "$public_url/health/ready" degraded');
+    expect(remote).toContain("anonymous_me_once");
+    expect(remote).toContain("authenticated_me_once");
+    expect(remote).toContain("worker_heartbeat_once");
+    expect(remote).toContain("connection_budget_once");
+    expect(remote).toContain("stability_deadline=$((SECONDS + 90))");
+    expect(remote).toContain('await request("/api/v1/me", { headers: { cookie } }, 401);');
+    expect(remote).toContain("RELEASE_RUNTIME_LOG_UNAVAILABLE");
+    expect(remote).toContain("RELEASE_RUNTIME_ERROR_DETECTED");
+    expect(remote).toContain("release_journal_since=\"$(date '+%Y-%m-%d %H:%M:%S')\"");
+    expect(remote).toContain('journalctl -u "$api_service" -u "$worker_service" --since "$release_journal_since" --no-pager --output=cat > "$runtime_log"');
+    expect(remote).toContain("grep -Eiq");
+    expect(remote).not.toContain("--output=cat |\n    grep -Eiq");
+    expect(acceptancePassed).toBeGreaterThan(remote.indexOf("stability_deadline=$((SECONDS + 90))"));
+    expect(acceptancePassed).toBeGreaterThan(remote.indexOf("authenticated_me_once ||"));
+  });
+
   it("allows only append-only migrations after draining work and taking a recoverable backup", async () => {
     const remote = await readFile("bin/push-remote.sh", "utf8");
 

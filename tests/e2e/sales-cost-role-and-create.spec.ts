@@ -160,6 +160,7 @@ test("深色主题的企业下拉框和选项保持深底浅字", async ({ page 
 test("管理员侧栏按 MECE 分组并提供平台治理入口", async ({ page }, testInfo) => {
   const admin = { ...accountant, roles: ["ADMIN"] };
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(admin) }));
+  await page.route("**/api/v1/enterprises", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
   await page.route("**/api/v1/admin/users?**", (route) => route.fulfill({
     status: 200,
     contentType: "application/json",

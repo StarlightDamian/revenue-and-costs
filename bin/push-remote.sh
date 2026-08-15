@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-[[ "$#" -eq 13 ]] || { echo 'REMOTE_ARGUMENTS_INVALID' >&2; exit 64; }
+[[ "$#" -eq 14 ]] || { echo 'REMOTE_ARGUMENTS_INVALID' >&2; exit 64; }
 release_id="$1"; app_archive="$2"; app_sha="$3"; dependency_archive="$4"; dependency_sha="$5"
 root="$6"; config_root="$7"; node_root="$8"; api_service="$9"; worker_service="${10}"
 database_name="${11}"; api_port="${12}"; public_url="${13%/}"
+git_commit="${14}"
 
 [[ "$(id -u)" == '0' ]] || { echo 'REMOTE_ROOT_REQUIRED' >&2; exit 77; }
 [[ "$release_id" =~ ^[0-9]{8}-[0-9]{6}$ ]] || { echo 'RELEASE_ID_INVALID' >&2; exit 64; }
@@ -14,6 +15,7 @@ database_name="${11}"; api_port="${12}"; public_url="${13%/}"
 [[ "$database_name" =~ ^[a-z_][a-z0-9_]*$ && "$api_port" =~ ^[0-9]{2,5}$ ]] || { echo 'DATABASE_OR_PORT_INVALID' >&2; exit 64; }
 [[ "$public_url" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$ ]] || { echo 'PUBLIC_URL_INVALID' >&2; exit 64; }
 [[ "$app_sha" =~ ^[a-f0-9]{64}$ && "$dependency_sha" =~ ^[a-f0-9]{64}$ ]] || { echo 'ARCHIVE_SHA_INVALID' >&2; exit 64; }
+[[ "$git_commit" =~ ^[a-f0-9]{40}$ ]] || { echo 'GIT_COMMIT_INVALID' >&2; exit 64; }
 umask 027
 
 target="$root/releases/$release_id"
@@ -298,6 +300,10 @@ runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name"
   -c "SELECT filename || ' ' || checksum FROM schema_migration ORDER BY filename" > "$staging/.database-migrations"
 cmp -s "$staging/.previous-migrations" "$staging/.database-migrations" || fail 'DATABASE_MIGRATION_BASELINE_MISMATCH'
 
+receipt="$staging/.release-receipt.json"
+printf '{"format":"revenue-costs-release-receipt-v1","releaseId":"%s","gitCommit":"%s","appSha256":"%s","dependencySha256":"%s","migrationCount":%s,"deploymentAcceptance":"pending"}\n' \
+  "$release_id" "$git_commit" "$app_sha" "$dependency_sha" "$release_migration_count" > "$receipt"
+
 # Normalize after creating the release metadata as well as installing production
 # dependencies. Otherwise these manifest files inherit 0644 from the shell and
 # trip the non-static world-readable gate after the staging directory is moved.
@@ -365,37 +371,160 @@ cmp -s "$target/.release-migrations" "$target/.database-migrations" || fail 'DAT
 ln -s "$target/app" "$next_link"
 switched=1
 mv -Tf "$next_link" "$current_link"
+release_journal_since="$(date '+%Y-%m-%d %H:%M:%S')"
+release_started_at="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" -c 'SELECT clock_timestamp()')"
 systemctl start "$api_service" "$worker_service"
 
 health_once() {
-  local url="$1" kind="$2" body
+  local url="$1" expected_status="$2" body
   shift 2
   body="$(mktemp)"
   if ! curl --fail --silent --show-error --max-time 5 "$@" "$url" > "$body"; then rm -f "$body"; return 1; fi
   "$node_root/bin/node" -e '
     const fs = require("node:fs");
     const payload = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const kind = process.argv[2];
+    const expectedStatus = process.argv[2];
     if (payload.service !== "api") process.exit(1);
-    if (kind === "live" ? payload.status !== "ok" : !["ok", "degraded"].includes(payload.status)) process.exit(1);
-  ' "$body" "$kind"
+    if (payload.status !== expectedStatus) process.exit(1);
+  ' "$body" "$expected_status"
   result=$?; rm -f "$body"; return "$result"
+}
+
+anonymous_me_once() {
+  local url="$1" status
+  shift
+  status="$(curl --silent --show-error --max-time 5 --output /dev/null --write-out '%{http_code}' \
+    "$@" "$url")" || return 1
+  [[ "$status" == '401' ]]
+}
+
+worker_heartbeat_once() {
+  [[ "$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
+    -v started_at="$release_started_at" -c \
+    "SELECT EXISTS (SELECT 1 FROM job_operation WHERE business_key='service:worker' AND status='RUNNING' AND last_heartbeat_at > :'started_at'::timestamptz AND last_heartbeat_at >= clock_timestamp()-interval '30 seconds')")" == 't' ]]
+}
+
+connection_budget_once() {
+  [[ "$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" -c \
+    "SELECT (role.rolconnlimit >= 7 AND count(activity.pid) <= 6) FROM pg_roles role LEFT JOIN pg_stat_activity activity ON activity.usename=role.rolname WHERE role.rolname='revenue_costs_app' GROUP BY role.rolconnlimit")" == 't' ]]
+}
+
+services_stable_once() {
+  systemctl is-active --quiet "$api_service" && systemctl is-active --quiet "$worker_service" &&
+    [[ "$(systemctl show --property=NRestarts --value "$api_service")" == '0' ]] &&
+    [[ "$(systemctl show --property=NRestarts --value "$worker_service")" == '0' ]]
+}
+
+authenticated_me_once() {
+  local acceptance_phone
+  acceptance_phone="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" -c \
+    "SELECT account.phone_e164 FROM account JOIN account_role role ON role.account_id=account.id WHERE account.status='ACTIVE' AND role.role='ADMIN' ORDER BY account.created_at,account.id LIMIT 1")"
+  [[ "$acceptance_phone" =~ ^\+[1-9][0-9]{7,14}$ ]] || return 1
+  (
+    set -a
+    source "$config_root/revenue-costs.env"
+    set +a
+    [[ "${TEMPORARY_ADMIN_OTP_CODE:-}" =~ ^[0-9]{6}$ && "${PUBLIC_ORIGIN:-}" =~ ^https://[A-Za-z0-9.-]+$ ]] || return 1
+    RELEASE_ACCEPTANCE_API_ORIGIN="http://127.0.0.1:$api_port" \
+    RELEASE_ACCEPTANCE_PHONE="$acceptance_phone" \
+    RELEASE_ACCEPTANCE_ID="$release_id" \
+      "$node_root/bin/node" --input-type=module - <<'NODE_AUTH_ACCEPTANCE'
+const apiOrigin = process.env.RELEASE_ACCEPTANCE_API_ORIGIN;
+const publicOrigin = process.env.PUBLIC_ORIGIN;
+const phone = process.env.RELEASE_ACCEPTANCE_PHONE;
+const code = process.env.TEMPORARY_ADMIN_OTP_CODE;
+const releaseId = process.env.RELEASE_ACCEPTANCE_ID;
+
+async function request(path, init, expectedStatus) {
+  const response = await fetch(`${apiOrigin}${path}`, { ...init, signal: AbortSignal.timeout(5_000) });
+  if (response.status !== expectedStatus) throw new Error(`RELEASE_AUTH_HTTP_${response.status}`);
+  const text = await response.text();
+  return { response, body: text ? JSON.parse(text) : {} };
+}
+
+const headers = { origin: publicOrigin, "content-type": "application/json" };
+const otp = await request("/api/v1/auth/otp", {
+  method: "POST", headers,
+  body: JSON.stringify({ phone, purpose: "LOGIN", deviceId: `release-${releaseId}` }),
+}, 200);
+if (typeof otp.body.challengeId !== "string") throw new Error("RELEASE_AUTH_CHALLENGE_INVALID");
+const verified = await request("/api/v1/auth/verify", {
+  method: "POST", headers,
+  body: JSON.stringify({ challengeId: otp.body.challengeId, phone, purpose: "LOGIN", code }),
+}, 200);
+const cookies = new Map();
+for (const value of verified.response.headers.getSetCookie()) {
+  const pair = value.split(";", 1)[0];
+  const separator = pair.indexOf("=");
+  if (separator < 1) continue;
+  const name = pair.slice(0, separator);
+  const cookieValue = pair.slice(separator + 1);
+  if (cookieValue) cookies.set(name, cookieValue); else cookies.delete(name);
+}
+const session = cookies.get("rc_session");
+const csrf = cookies.get("rc_csrf");
+if (!session || !csrf) throw new Error("RELEASE_AUTH_COOKIE_MISSING");
+const cookie = [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+const me = await request("/api/v1/me", { headers: { cookie } }, 200);
+if (me.body.id !== verified.body.account?.id || me.body.status !== "ACTIVE" || !me.body.roles?.includes("ADMIN")) {
+  throw new Error("RELEASE_AUTH_ME_INVALID");
+}
+await request("/api/v1/auth/logout", {
+  method: "POST",
+  headers: { cookie, origin: publicOrigin, "x-csrf-token": decodeURIComponent(csrf) },
+}, 200);
+await request("/api/v1/me", { headers: { cookie } }, 401);
+NODE_AUTH_ACCEPTANCE
+  )
 }
 
 healthy=0
 public_host="${public_url#https://}"
 public_host="${public_host%%/*}"
 for _ in $(seq 1 30); do
-  if health_once "http://127.0.0.1:$api_port/health/live" live &&
-     health_once "http://127.0.0.1:$api_port/health/ready" ready &&
-     health_once "$public_url/health/live" live --resolve "$public_host:443:127.0.0.1" &&
-     health_once "$public_url/health/ready" ready --resolve "$public_host:443:127.0.0.1"; then healthy=1; break; fi
+  if health_once "http://127.0.0.1:$api_port/health/live" ok &&
+     health_once "http://127.0.0.1:$api_port/health/ready" degraded &&
+     health_once "$public_url/health/live" ok --resolve "$public_host:443:127.0.0.1" &&
+     health_once "$public_url/health/ready" degraded --resolve "$public_host:443:127.0.0.1" &&
+     anonymous_me_once "http://127.0.0.1:$api_port/api/v1/me" &&
+     anonymous_me_once "$public_url/api/v1/me" --resolve "$public_host:443:127.0.0.1" &&
+     worker_heartbeat_once && connection_budget_once && services_stable_once; then healthy=1; break; fi
   sleep 2
 done
 [[ "$healthy" == '1' ]] || fail 'HEALTH_CHECK_FAILED'
-systemctl is-active --quiet "$api_service"; systemctl is-active --quiet "$worker_service"
 curl --fail --silent --show-error --compressed --resolve "$public_host:443:127.0.0.1" "$public_url/" |
   cmp -s - "$target/app/dist/web/index.html" || fail 'PUBLIC_INDEX_MISMATCH'
+authenticated_me_once || fail 'AUTHENTICATED_ME_ACCEPTANCE_FAILED'
+
+stability_deadline=$((SECONDS + 90))
+while (( SECONDS < stability_deadline )); do
+  health_once "http://127.0.0.1:$api_port/health/live" ok &&
+    health_once "http://127.0.0.1:$api_port/health/ready" degraded &&
+    health_once "$public_url/health/live" ok --resolve "$public_host:443:127.0.0.1" &&
+    health_once "$public_url/health/ready" degraded --resolve "$public_host:443:127.0.0.1" &&
+    anonymous_me_once "http://127.0.0.1:$api_port/api/v1/me" &&
+    anonymous_me_once "$public_url/api/v1/me" --resolve "$public_host:443:127.0.0.1" &&
+    worker_heartbeat_once && connection_budget_once && services_stable_once ||
+    fail 'STABILITY_WINDOW_FAILED'
+  sleep 5
+done
+services_stable_once && worker_heartbeat_once && connection_budget_once || fail 'FINAL_RUNTIME_CHECK_FAILED'
+runtime_log="$(mktemp)"
+if ! journalctl -u "$api_service" -u "$worker_service" --since "$release_journal_since" --no-pager --output=cat > "$runtime_log"; then
+  rm -f "$runtime_log"
+  fail 'RELEASE_RUNTIME_LOG_UNAVAILABLE'
+fi
+if grep -Eiq '53300|remaining connection slots|pool[- ]?timeout|timeout exceeded when trying to connect|ERR_UNHANDLED_ERROR|Unhandled .error. event|Main process exited' "$runtime_log"; then
+  rm -f "$runtime_log"
+  fail 'RELEASE_RUNTIME_ERROR_DETECTED'
+fi
+rm -f "$runtime_log"
+
+receipt_partial="$target/.release-receipt.json.partial"
+printf '{"format":"revenue-costs-release-receipt-v1","releaseId":"%s","gitCommit":"%s","appSha256":"%s","dependencySha256":"%s","migrationCount":%s,"deploymentAcceptance":"passed"}\n' \
+  "$release_id" "$git_commit" "$app_sha" "$dependency_sha" "$release_migration_count" > "$receipt_partial"
+chown root:revenue-costs "$receipt_partial"; chmod 0640 "$receipt_partial"
+mv -f "$receipt_partial" "$target/.release-receipt.json"
 
 rm -f "$target/.previous-migrations" "$target/.release-migrations" "$target/.release-migration-prefix" \
   "$target/.pending-migrations" "$target/.database-migrations"
@@ -403,3 +532,4 @@ success=1
 trap - EXIT HUP INT TERM
 echo "RELEASE_OK:$target/app"
 echo "DATABASE_BACKUP:$backup_path"
+echo "RELEASE_RECEIPT:$target/.release-receipt.json"
