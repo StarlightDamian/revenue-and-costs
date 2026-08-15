@@ -12,7 +12,7 @@ describe("diagnostic ID presentation", () => {
   it("does not alter short references and keeps the full ID in clipboard text", () => {
     expect(compactDiagnosticId("I1234567")).toBe("I1234567");
     expect(diagnosticClipboardText("I4QQr6qR79OTD82CkROjVDq")).toBe(
-      "诊断ID: I4QQr6qR79OTD82CkROjVDq",
+      "处理编号：I4QQr6qR79OTD82CkROjVDq",
     );
   });
 });

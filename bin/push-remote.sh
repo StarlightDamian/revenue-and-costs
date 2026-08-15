@@ -14,6 +14,7 @@ database_name="${11}"; api_port="${12}"; public_url="${13%/}"
 [[ "$database_name" =~ ^[a-z_][a-z0-9_]*$ && "$api_port" =~ ^[0-9]{2,5}$ ]] || { echo 'DATABASE_OR_PORT_INVALID' >&2; exit 64; }
 [[ "$public_url" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$ ]] || { echo 'PUBLIC_URL_INVALID' >&2; exit 64; }
 [[ "$app_sha" =~ ^[a-f0-9]{64}$ && "$dependency_sha" =~ ^[a-f0-9]{64}$ ]] || { echo 'ARCHIVE_SHA_INVALID' >&2; exit 64; }
+umask 027
 
 target="$root/releases/$release_id"
 staging="$root/releases/.$release_id.partial"
@@ -25,6 +26,19 @@ previous_app="$(readlink -f "$current_link")"
 next_link="$root/.current-$release_id"
 rollback_link="$root/.current-rollback-$release_id"
 services_stopped=0; switched=0; success=0; cleanup_running=0
+initial_api_state="$(systemctl show --property=ActiveState --value "$api_service")"
+initial_worker_state="$(systemctl show --property=ActiveState --value "$worker_service")"
+[[ "$initial_api_state" =~ ^(active|inactive|failed)$ && "$initial_worker_state" =~ ^(active|inactive|failed)$ ]] ||
+  { echo 'INITIAL_SERVICE_STATE_INVALID' >&2; exit 69; }
+
+restore_initial_service_state() {
+  local service="$1" initial_state="$2"
+  if [[ "$initial_state" == 'active' ]]; then
+    systemctl restart "$service"
+  else
+    systemctl stop "$service"
+  fi
+}
 
 cleanup() {
   status=$?
@@ -50,12 +64,24 @@ cleanup() {
       if [[ "$(readlink -f "$current_link" 2>/dev/null)" == "$target/app" ]]; then
         ln -s "$previous_app" "$rollback_link" && mv -Tf "$rollback_link" "$current_link"
       fi
-      if [[ "$services_stopped" == '1' ]]; then systemctl restart "$api_service" "$worker_service"; fi
+      if [[ "$services_stopped" == '1' ]]; then
+        restore_initial_service_state "$api_service" "$initial_api_state"
+        restore_initial_service_state "$worker_service" "$initial_worker_state"
+      fi
       echo "RELEASE_FAILED_ROLLED_BACK:$release_id" >&2
     else
     # The forward migration is committed and immutable. Keep both services
     # stopped; starting the previous code against the new schema is unsafe.
-      echo "RELEASE_FAILED_AFTER_MIGRATION_SERVICES_STOPPED:$release_id:$backup_path" >&2
+      stop_status=0; api_state_status=0; worker_state_status=0
+      systemctl stop "$api_service" "$worker_service" >/dev/null 2>&1 || stop_status=$?
+      api_state="$(systemctl show --property=ActiveState --value "$api_service" 2>/dev/null)" || api_state_status=$?
+      worker_state="$(systemctl show --property=ActiveState --value "$worker_service" 2>/dev/null)" || worker_state_status=$?
+      if [[ "$stop_status" == '0' && "$api_state_status" == '0' && "$worker_state_status" == '0' &&
+            "$api_state" =~ ^(inactive|failed)$ && "$worker_state" =~ ^(inactive|failed)$ ]]; then
+        echo "RELEASE_FAILED_AFTER_MIGRATION_SERVICES_STOPPED:$release_id:$backup_path" >&2
+      else
+        echo "RELEASE_FAILED_AFTER_MIGRATION_SERVICE_STOP_FAILED:$release_id:$backup_path" >&2
+      fi
     fi
   fi
   exit "$status"
@@ -166,9 +192,6 @@ esac
 find "$staging/pnpm-store" -type f -name '*-exec' -exec chmod 0750 {} +
 PATH="$node_root/bin:$PATH" "$node_root/bin/node" "$staging/tools/pnpm-min/pnpm.cjs" \
   --dir "$staging/app" --store-dir "$staging/pnpm-store" install --offline --frozen-lockfile --prod
-chown -R root:revenue-costs "$staging"
-find "$staging" -type d -exec chmod 0750 {} +
-find "$staging" -type f -exec chmod 0640 {} +
 find "$staging" \( -type b -o -type c -o -type p \) -print -quit | grep -q . && fail 'NON_REGULAR_RELEASE_ENTRY'
 while IFS= read -r -d '' link; do
   [[ "$link" == "$staging/app/node_modules/"* ]] || fail 'SYMLINK_OUTSIDE_NODE_MODULES'
@@ -177,13 +200,87 @@ while IFS= read -r -d '' link; do
   resolved_target="$(realpath -m -- "$link")"
   [[ "$resolved_target" == "$staging/app/node_modules/"* ]] || fail 'SYMLINK_ESCAPE_REJECTED'
 done < <(find "$staging" -type l -print0)
-find "$staging" \( -type f -o -type d \) -perm /0022 -print -quit | grep -q . && fail 'GROUP_OR_OTHER_WRITABLE_REJECTED'
 
 migration_manifest() {
   local directory="$1"
   find "$directory" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' | LC_ALL=C sort |
     while IFS= read -r filename; do printf '%s %s\n' "$filename" "$(sha256sum "$directory/$filename" | awk '{print $1}')"; done
 }
+
+assert_database_identity() {
+  local expected_session="$1" expected_current="$2" expected_mode="$3" expected_database="$4" expected_server="$5"
+  (
+    cd "$target/app"
+    DATABASE_IDENTITY_EXPECTED_SESSION="$expected_session" \
+    DATABASE_IDENTITY_EXPECTED_CURRENT="$expected_current" \
+    DATABASE_IDENTITY_EXPECTED_MODE="$expected_mode" \
+    DATABASE_IDENTITY_EXPECTED_DATABASE="$expected_database" \
+    DATABASE_IDENTITY_EXPECTED_SERVER="$expected_server" \
+      "$node_root/bin/node" --input-type=module - <<'NODE_DATABASE_IDENTITY'
+import pg from "pg";
+
+const client = new pg.Client({
+  connectionString: process.env.DATABASE_URL,
+  application_name: "revenue-costs-release-identity-check",
+  connectionTimeoutMillis: 5_000,
+});
+await client.connect();
+try {
+  const result = await client.query(`
+    SELECT session_user,current_user,current_database() AS database_name,
+           COALESCE(inet_server_addr() IN (inet '127.0.0.1',inet '::1'),true) AS server_is_local,
+           current_setting('port') || '|' || pg_postmaster_start_time()::text AS server_identity,
+           session_database_role.rolsuper OR session_database_role.rolcreaterole OR session_database_role.rolcreatedb OR
+             session_database_role.rolreplication OR session_database_role.rolbypassrls AS session_elevated,
+           active_database_role.rolsuper OR active_database_role.rolcreaterole OR active_database_role.rolcreatedb OR
+             active_database_role.rolreplication OR active_database_role.rolbypassrls AS current_elevated,
+           current_user=pg_get_userbyid(database_info.datdba) AS owns_database,
+           current_user=pg_get_userbyid(public_namespace.nspowner) AS owns_public_schema,
+           has_database_privilege(current_user,current_database(),'CREATE') AS can_create_database_object,
+           has_schema_privilege(current_user,'public','CREATE') AS can_create_public_object,
+           (SELECT count(*)::int FROM pg_auth_members membership
+             WHERE membership.member=active_database_role.oid) AS current_membership_count,
+           (SELECT count(*)::int FROM pg_auth_members membership
+             WHERE membership.member=session_database_role.oid) AS session_membership_count,
+           EXISTS (
+             SELECT 1 FROM pg_auth_members membership
+              WHERE membership.member=session_database_role.oid
+                AND membership.roleid=active_database_role.oid
+                AND membership.set_option AND NOT membership.inherit_option AND NOT membership.admin_option
+           ) AS session_has_limited_owner_membership,
+           EXISTS (
+             SELECT 1 FROM pg_class relation
+              WHERE relation.relnamespace=public_namespace.oid AND relation.relowner=active_database_role.oid
+           ) AS owns_public_objects
+      FROM pg_roles active_database_role
+      JOIN pg_roles session_database_role ON session_database_role.rolname=session_user
+      JOIN pg_database database_info ON database_info.datname=current_database()
+      JOIN pg_namespace public_namespace ON public_namespace.nspname='public'
+     WHERE active_database_role.rolname=current_user`);
+  const row = result.rows[0];
+  const identityMatches = row?.session_user === process.env.DATABASE_IDENTITY_EXPECTED_SESSION
+    && row?.current_user === process.env.DATABASE_IDENTITY_EXPECTED_CURRENT
+    && row?.database_name === process.env.DATABASE_IDENTITY_EXPECTED_DATABASE
+    && row?.server_is_local === true
+    && row?.server_identity === process.env.DATABASE_IDENTITY_EXPECTED_SERVER
+    && row?.session_elevated === false && row?.current_elevated === false;
+  const privilegeMatches = process.env.DATABASE_IDENTITY_EXPECTED_MODE === "owner"
+    ? row?.owns_database === true && row?.owns_public_schema === true
+      && row?.can_create_database_object === true && row?.can_create_public_object === true
+      && row?.current_membership_count === 0 && row?.session_membership_count === 1
+      && row?.session_has_limited_owner_membership === true
+    : row?.owns_database === false && row?.owns_public_schema === false
+      && row?.can_create_database_object === false && row?.can_create_public_object === false
+      && row?.owns_public_objects === false && row?.current_membership_count === 0
+      && row?.session_membership_count === 0 && row?.session_has_limited_owner_membership === false;
+  if (!identityMatches || !privilegeMatches) throw new Error("DATABASE_RELEASE_IDENTITY_MISMATCH");
+} finally {
+  await client.end();
+}
+NODE_DATABASE_IDENTITY
+  )
+}
+
 migration_manifest "$previous_app/migrations" > "$staging/.previous-migrations"
 migration_manifest "$staging/app/migrations" > "$staging/.release-migrations"
 previous_migration_count="$(wc -l < "$staging/.previous-migrations")"
@@ -194,9 +291,20 @@ cmp -s "$staging/.previous-migrations" "$staging/.release-migration-prefix" || f
 tail -n "+$((previous_migration_count + 1))" "$staging/.release-migrations" > "$staging/.pending-migrations"
 psql_bin='/usr/pgsql-17/bin/psql'; pg_dump_bin='/usr/pgsql-17/bin/pg_dump'; pg_restore_bin='/usr/pgsql-17/bin/pg_restore'
 [[ -x "$psql_bin" && -x "$pg_dump_bin" && -x "$pg_restore_bin" ]] || fail 'POSTGRES_17_TOOLS_MISSING'
+database_server_identity="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
+  -c "SELECT current_setting('port') || '|' || pg_postmaster_start_time()::text")"
+[[ -n "$database_server_identity" ]] || fail 'DATABASE_SERVER_IDENTITY_MISSING'
 runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
   -c "SELECT filename || ' ' || checksum FROM schema_migration ORDER BY filename" > "$staging/.database-migrations"
 cmp -s "$staging/.previous-migrations" "$staging/.database-migrations" || fail 'DATABASE_MIGRATION_BASELINE_MISMATCH'
+
+# Normalize after creating the release metadata as well as installing production
+# dependencies. Otherwise these manifest files inherit 0644 from the shell and
+# trip the non-static world-readable gate after the staging directory is moved.
+chown -R root:revenue-costs "$staging"
+find "$staging" -type d -exec chmod 0750 {} +
+find "$staging" -type f -exec chmod 0640 {} +
+find "$staging" \( -type f -o -type d \) -perm /0022 -print -quit | grep -q . && fail 'GROUP_OR_OTHER_WRITABLE_REJECTED'
 
 mv "$staging" "$target"
 setfacl -m u:www:--x "$target" "$target/app" "$target/app/dist"
@@ -223,20 +331,36 @@ runuser -u postgres -- "$pg_dump_bin" --format=custom "$database_name" > "$backu
 mv "$backup_partial" "$backup_path"
 chown root:root "$backup_path"; chmod 0600 "$backup_path"
 
-set -a
-# These are root-owned production settings. The migration CLI intentionally
-# uses the same least-privilege database identity as the application.
-source "$config_root/database-app.env"
-source "$config_root/revenue-costs.env"
-set +a
-export NODE_ENV=production
-(cd "$target/app" && PATH="$node_root/bin:$PATH" "$node_root/bin/node" dist/cli/migrate.js)
-(cd "$target/app" && REQUIRE_BOOTSTRAP_MAPPINGS=true PATH="$node_root/bin:$PATH" "$node_root/bin/node" dist/cli/bootstrap-mappings.js)
+migrator_env="$config_root/database-migrator.env"
+[[ -f "$migrator_env" && "$(stat -c '%U:%G:%a' "$migrator_env")" == 'root:root:600' ]] ||
+  fail 'DATABASE_MIGRATOR_CONFIG_INVALID'
+(
+  unset DATABASE_URL PGOPTIONS
+  set -a
+  source "$migrator_env"
+  set +a
+  [[ -n "${DATABASE_URL:-}" ]] || fail 'DATABASE_MIGRATOR_URL_MISSING'
+  export NODE_ENV=production
+  assert_database_identity revenue_costs_migrator revenue_costs_owner owner "$database_name" "$database_server_identity"
+  cd "$target/app"
+  PATH="$node_root/bin:$PATH" "$node_root/bin/node" dist/cli/migrate.js
+)
+(
+  unset DATABASE_URL PGOPTIONS
+  set -a
+  source "$config_root/database-app.env"
+  source "$config_root/revenue-costs.env"
+  set +a
+  [[ -n "${DATABASE_URL:-}" ]] || fail 'DATABASE_APP_URL_MISSING'
+  export NODE_ENV=production
+  assert_database_identity revenue_costs_app revenue_costs_app application "$database_name" "$database_server_identity"
+  cd "$target/app"
+  REQUIRE_BOOTSTRAP_MAPPINGS=true PATH="$node_root/bin:$PATH" \
+    "$node_root/bin/node" dist/cli/bootstrap-mappings.js
+)
 runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
   -c "SELECT filename || ' ' || checksum FROM schema_migration ORDER BY filename" > "$target/.database-migrations"
 cmp -s "$target/.release-migrations" "$target/.database-migrations" || fail 'DATABASE_MIGRATION_MANIFEST_MISMATCH'
-rm -f "$target/.previous-migrations" "$target/.release-migrations" "$target/.release-migration-prefix" \
-  "$target/.pending-migrations" "$target/.database-migrations"
 
 ln -s "$target/app" "$next_link"
 switched=1
@@ -273,6 +397,8 @@ systemctl is-active --quiet "$api_service"; systemctl is-active --quiet "$worker
 curl --fail --silent --show-error --compressed --resolve "$public_host:443:127.0.0.1" "$public_url/" |
   cmp -s - "$target/app/dist/web/index.html" || fail 'PUBLIC_INDEX_MISMATCH'
 
+rm -f "$target/.previous-migrations" "$target/.release-migrations" "$target/.release-migration-prefix" \
+  "$target/.pending-migrations" "$target/.database-migrations"
 success=1
 trap - EXIT HUP INT TERM
 echo "RELEASE_OK:$target/app"

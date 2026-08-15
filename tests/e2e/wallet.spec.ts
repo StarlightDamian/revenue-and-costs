@@ -77,7 +77,7 @@ test("企业钱包一键充值且账本说明来自真实公司引用", async ({
 
   const recharge = page.getByRole("button", { name: "充值", exact: true });
   await recharge.click();
-  await expect(page.getByRole("alert")).toContainText("金额必须是最多两位小数的非负十进制数");
+  await expect(page.getByRole("alert")).toContainText("请输入正确的充值金额，最多保留两位小数，例如 100.00");
   expect(rechargeRequests).toBe(0);
   await expect(recharge).toBeEnabled();
 

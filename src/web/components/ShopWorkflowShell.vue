@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import logoUrl from "../../../nas/image/LOGO-transparent.png";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { ExportJob, ShopWorkflow, WorkflowStepCode } from "../api/types";
 import { avatarById } from "../avatars";
 import { clearSession, session } from "../session";
@@ -26,7 +27,7 @@ const dismissedBlockerKeys = ref<ReadonlySet<string>>(new Set());
 const shopId = computed(() => String(route.params.shopId ?? ""));
 const accountAvatar = computed(() => avatarById(session.me?.avatarId));
 const diagnosticDisplay = computed(() => workflow.value?.diagnosticId ? compactDiagnosticId(workflow.value.diagnosticId) : "读取中");
-const diagnosticAccessibleLabel = computed(() => workflow.value?.diagnosticId ? `复制诊断ID: ${workflow.value.diagnosticId}` : "诊断ID读取中");
+const diagnosticAccessibleLabel = computed(() => workflow.value?.diagnosticId ? `复制处理编号：${workflow.value.diagnosticId}` : "处理编号读取中");
 const blocker = computed(() => workflowBlockerPresentation(workflow.value, Boolean(session.me?.roles.includes("ADMIN"))));
 const visibleBlocker = computed(() => blocker.value && !dismissedBlockerKeys.value.has(blocker.value.key) ? blocker.value : null);
 const currentPhaseKey = computed(() => ({
@@ -69,7 +70,7 @@ async function loadWorkflow(initial = false) {
     status.value = "ready";
   } catch (caught) {
     if (sequence !== workflowRequestSequence || requestedShopId !== shopId.value) return;
-    error.value = caught instanceof Error ? caught.message : "无法读取公司流程";
+    error.value = userFacingError(caught, "暂时无法读取公司流程，请检查网络后重试");
     status.value = "error";
   } finally {
     if (sequence === workflowRequestSequence) workflowLoading = false;
@@ -84,7 +85,7 @@ async function copyDiagnosticId() {
     diagnosticCopied.value = true;
     window.setTimeout(() => { diagnosticCopied.value = false; }, 1400);
   } catch {
-    downloadError.value = "诊断 ID 复制失败，请手动选择后复制";
+    downloadError.value = "处理编号复制失败，请手动选择后复制";
   }
 }
 
@@ -118,7 +119,7 @@ async function quickDownload() {
     }
     await router.push({ name: "workflow-export", params: { shopId: shopId.value }, query: { auto: job.id } });
   } catch (caught) {
-    downloadError.value = caught instanceof Error ? caught.message : "下载失败";
+    downloadError.value = userFacingError(caught, "暂时无法下载，请检查网络后重试");
   } finally {
     downloadBusy.value = false;
   }
@@ -158,12 +159,12 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
           <button
             class="workflow-diagnostic-id"
             type="button"
-            title="诊断ID"
+            title="处理编号"
             :aria-label="diagnosticAccessibleLabel"
             :disabled="!workflow?.diagnosticId"
             @click="copyDiagnosticId"
           >
-            <span aria-hidden="true">ID: {{ diagnosticDisplay }}</span>
+            <span aria-hidden="true">编号：{{ diagnosticDisplay }}</span>
             <i
               v-if="diagnosticCopied"
               aria-hidden="true"
@@ -173,7 +174,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
             class="sr-only"
             role="status"
             aria-live="polite"
-          >{{ diagnosticCopied ? "诊断ID已复制" : "" }}</span>
+          >{{ diagnosticCopied ? "处理编号已复制" : "" }}</span>
         </span>
       </div>
 

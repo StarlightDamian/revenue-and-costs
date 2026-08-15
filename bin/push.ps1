@@ -19,6 +19,7 @@ $dependencyArchive = Join-Path $runRoot "dependencies-$releaseId.tar.gz"
 $knownHosts = Join-Path $runRoot 'known_hosts'
 $hostKeyCandidate = Join-Path $runRoot 'host-key-candidate'
 $askPass = Join-Path $runRoot 'askpass.cmd'
+$remoteScript = Join-Path $PSScriptRoot 'push-remote.sh'
 
 function Read-EnvFile([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "DEPLOY_CONFIG_MISSING:$Path" }
@@ -118,6 +119,7 @@ function Assert-Archive([string]$Archive, [ValidateSet('base', 'supplement', 'ap
 foreach ($command in @('node.exe', 'pnpm.cmd', 'tar.exe', 'ssh.exe', 'scp.exe', 'ssh-keyscan.exe', 'ssh-keygen.exe')) {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "COMMAND_NOT_FOUND:$command" }
 }
+if ([System.IO.File]::ReadAllBytes($remoteScript) -contains 13) { throw 'REMOTE_SCRIPT_REQUIRES_LF' }
 
 $config = Read-EnvFile (Join-Path $projectRoot '.env.local')
 $hostName = Require-Value $config 'DEPLOY_HOST'
@@ -260,7 +262,7 @@ try {
   Invoke-Native 'ssh.exe' ($sshOptions + @($target, "umask 077; mkdir -p '$incoming'"))
   Invoke-Native 'scp.exe' ($scpOptions + @($appArchive, "$target`:$incoming/release-$releaseId.tar.gz.partial"))
   Invoke-Native 'scp.exe' ($scpOptions + @($dependencyArchive, "$target`:$incoming/dependencies-$releaseId.tar.gz.partial"))
-  Invoke-Native 'scp.exe' ($scpOptions + @((Join-Path $PSScriptRoot 'push-remote.sh'), "$target`:$incoming/push-$releaseId.sh.partial"))
+  Invoke-Native 'scp.exe' ($scpOptions + @($remoteScript, "$target`:$incoming/push-$releaseId.sh.partial"))
 
   Write-Host '[5/5] Remote backup, atomic switch, health checks, and automatic code rollback'
   $remoteCommand = "chmod 700 '$incoming/push-$releaseId.sh.partial' && bash '$incoming/push-$releaseId.sh.partial' '$releaseId' '$incoming/release-$releaseId.tar.gz.partial' '$appSha' '$incoming/dependencies-$releaseId.tar.gz.partial' '$dependencySha' '$remoteRoot' '$configRoot' '$nodeRoot' '$apiService' '$workerService' '$databaseName' '$apiPort' '$publicUrl'"

@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import { INTERMEDIATE_REPORT_COLUMNS, type IntermediateReportKind } from "../../shared/intermediate-report";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { CompletenessSlice, IntermediateReportSummary, ShopWorkflow } from "../api/types";
 import DateRangePicker from "../components/DateRangePicker.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -51,7 +52,7 @@ const allColumns = computed(() => INTERMEDIATE_REPORT_COLUMNS[intermediateKind.v
 const visibleColumns = computed(() => allColumns.value.filter((column) => selectedColumnKeys.value.includes(column.key)));
 const blockingCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.blockingCount, 0) ?? 0);
 const warningCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.warningCount, 0) ?? 0);
-const stateText = computed(() => requiresHardExclusionConfirmation.value ? "资料缺失待确认" : requiresDateAttributionReplay.value ? "日期口径待统一" : requiresFxCoverage.value ? "汇率数据待补齐" : calculation.value?.severity === "BLOCKING" ? "计算被阻断" : calculation.value?.state === "COMPLETED" ? "计算完成" : calculation.value?.state === "IN_PROGRESS" ? "计算中" : "等待资料");
+const stateText = computed(() => requiresHardExclusionConfirmation.value ? "资料缺失待确认" : requiresDateAttributionReplay.value ? "日期计算方式待统一" : requiresFxCoverage.value ? "汇率数据待补齐" : calculation.value?.severity === "BLOCKING" ? "需要先处理问题" : calculation.value?.state === "COMPLETED" ? "计算完成" : calculation.value?.state === "IN_PROGRESS" ? "计算中" : "等待资料");
 
 function decimalDisplay(value: string, scale = 2): string {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
@@ -122,14 +123,14 @@ async function loadIntermediate(after?: string) {
     intermediateItems.value = page.items;
     intermediateNext.value = page.nextCursor;
     intermediateAfter.value = after;
-  } catch (caught) { error.value = caught instanceof Error ? caught.message : "无法读取中间结果"; }
+  } catch (caught) { error.value = userFacingError(caught, "暂时无法读取计算明细，请检查网络后重试"); }
   finally { intermediateLoading.value = false; }
 }
 
 async function applyFilters() {
   intermediateHistory.value = [];
   try { await Promise.all([loadSummary(), loadIntermediate()]); }
-  catch (caught) { error.value = caught instanceof Error ? caught.message : "筛选失败"; }
+  catch (caught) { error.value = userFacingError(caught, "筛选没有成功，请检查网络后重试"); }
 }
 
 async function resetFilters() {
@@ -173,14 +174,14 @@ async function reload() {
   try {
     current.value = await api.getShopWorkflow(shopId.value); error.value = ""; emit("workflowChange");
     completeness.value = requiresHardExclusionConfirmation.value ? await api.getCompleteness(shopId.value) : [];
-  } catch (caught) { error.value = caught instanceof Error ? caught.message : "无法读取计算状态"; }
+  } catch (caught) { error.value = userFacingError(caught, "暂时无法读取计算状态，请检查网络后重试"); }
   finally { reloadInFlight = false; }
 }
 
 async function confirmHardExclusions() {
   const batchId = current.value?.latestBatch?.id;
   const slices = missingCoverageRows.value.filter((slice) => slice.datasetVersionId);
-  if (!batchId || slices.length === 0) { error.value = "没有可确认的缺失切片，请刷新状态"; return; }
+  if (!batchId || slices.length === 0) { error.value = "没有可确认的缺少资料项目，请刷新状态"; return; }
   resuming.value = true;
   error.value = "";
   try {
@@ -193,7 +194,7 @@ async function confirmHardExclusions() {
       await loadSummary(true);
       await loadIntermediate();
     }
-  } catch (caught) { error.value = caught instanceof Error ? caught.message : "无法确认排除并继续计算"; }
+  } catch (caught) { error.value = userFacingError(caught, "暂时无法保存本次选择，请稍后重试"); }
   finally { resuming.value = false; }
 }
 
@@ -213,16 +214,16 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
 
 <template>
   <section class="workflow-stage-page calculation-workbench" data-density="9">
-    <PageHeader title="计算复核" description="在一个页面内处理阻断、核对计算明细并发布正式结果。">
+    <PageHeader title="计算复核" description="在一个页面内处理资料问题、核对计算明细并发布正式结果。">
       <template #actions><button class="secondary-button compact" type="button" @click="reload">刷新状态</button></template>
     </PageHeader>
 
     <section v-if="canManage" class="calculation-status-strip" :data-severity="requiresHardExclusionConfirmation || requiresDateAttributionReplay ? 'BLOCKING' : calculation?.severity">
       <div><span>运行状态</span><b>{{ stateText }}</b></div><div><span>输入版本</span><b>{{ current?.latestBatch?.calculationRunId?.slice(0, 8) || current?.latestBatch?.id.slice(0, 8) || "—" }}</b></div><div><span>覆盖日期</span><b>{{ summary?.coverage.start || "—" }} 至 {{ summary?.coverage.end || "—" }}</b></div>
       <div><span>站点 / 币种</span><b>{{ summary?.options.marketplaces.length ?? 0 }} / {{ summary?.options.currencies.length ?? 0 }}</b></div><div><span>筛选行数</span><b>{{ summary?.matchedRows ?? "0" }}</b></div>
-      <div><span>阻断 / 警告</span><b>{{ blockingCount }} / {{ warningCount }}</b></div><div><span>发布状态</span><b>{{ publication?.state === "COMPLETED" ? "已发布" : publication?.state === "IN_PROGRESS" ? "发布中" : "待发布" }}</b></div>
+      <div><span>必须处理 / 提醒</span><b>{{ blockingCount }} / {{ warningCount }}</b></div><div><span>正式结果</span><b>{{ publication?.state === "COMPLETED" ? "已发布" : publication?.state === "IN_PROGRESS" ? "发布中" : "待发布" }}</b></div>
       <a v-if="requiresHardExclusionConfirmation" class="primary-button compact" href="#review-blocker">处理资料缺失</a>
-      <RouterLink v-else-if="requiresDateAttributionReplay" class="primary-button compact" :to="`/shops/${shopId}/workflow/commit`">重传同口径资料</RouterLink>
+      <RouterLink v-else-if="requiresDateAttributionReplay" class="primary-button compact" :to="`/shops/${shopId}/workflow/commit`">按同一种日期方式重传</RouterLink>
       <RouterLink v-else-if="requiresFxCoverage" class="primary-button compact" to="/fx">查看汇率覆盖</RouterLink>
       <a v-else-if="showResults" class="primary-button compact" href="#review-result">{{ publication?.state === 'COMPLETED' ? "查看正式结果" : "核对并发布" }}</a>
       <RouterLink v-else-if="calculation?.state === 'NOT_STARTED'" class="secondary-button compact" :to="`/shops/${shopId}/workflow/commit`">返回资料准备</RouterLink>
@@ -230,8 +231,8 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
     </section>
 
     <section v-if="requiresDateAttributionReplay" class="surface-section quality-blocker" aria-labelledby="date-attribution-blocker-title">
-      <h2 id="date-attribution-blocker-title">当前数据日期口径不一致</h2>
-      <p>同一正式结果不能混用时区换算和报表字面日期。请返回资料准备，按报表字面日期口径完整重传当前数据范围；此阻断不能确认绕过。</p>
+      <h2 id="date-attribution-blocker-title">当前资料使用了不同的日期计算方式</h2>
+      <p>同一份正式结果中的日期必须按同一种方法计算。请返回资料准备，按报表上显示的日期重新上传这一范围内的全部资料。这项问题必须修正后才能继续。</p>
     </section>
 
     <section v-if="requiresFxCoverage" class="surface-section quality-blocker" aria-labelledby="fx-coverage-blocker-title">
@@ -240,30 +241,30 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
     </section>
 
     <section v-if="requiresHardExclusionConfirmation" id="review-blocker" class="surface-section workflow-commit-panel">
-      <div class="section-heading"><h2>资料缺失，确认后继续</h2><p>当前阻断直接在本页处理，不再跳转到旧的入库子步骤。</p></div>
+      <div class="section-heading"><h2>资料缺失，确认后继续</h2><p>资料缺失会在本页直接处理。您可以补充文件，也可以确认不计算缺少资料的项目。</p></div>
       <div v-if="missingCoverageRows.length" class="table-scroll commit-coverage-table" tabindex="0" role="region" aria-label="计算复核缺失资料"><table><thead><tr><th>站点</th><th>月份</th><th>缺失内容</th></tr></thead><tbody><tr v-for="slice in missingCoverageRows" :key="slice.datasetVersionId || `${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chip"><b aria-hidden="true">!</b>缺少{{ slice.missingContent }}</span></td></tr></tbody></table></div>
       <div v-else class="inline-empty">正在读取缺失项，请刷新状态后重试。</div>
-      <section class="quality-blocker" aria-labelledby="review-exclusion-title"><h3 id="review-exclusion-title">确认排除缺失切片</h3><p>缺失资料不能按 0 计算。确认后只排除上表切片，其余完整数据继续计算。</p><label class="form-field"><span>排除原因（选填）</span><textarea v-model="exclusionReason" rows="3" maxlength="1000" placeholder="可补充说明本次排除原因"></textarea></label></section>
+      <section class="quality-blocker" aria-labelledby="review-exclusion-title"><h3 id="review-exclusion-title">确认不计算缺少资料的项目</h3><p>缺失资料不能当作 0 计算。确认后，上表项目不会计入结果，其余资料继续计算。</p><label class="form-field"><span>不计算的原因（选填）</span><textarea v-model="exclusionReason" rows="3" maxlength="1000" placeholder="可补充说明为什么不计算这些项目"></textarea></label></section>
       <p v-if="error" class="form-error" role="alert">{{ error }}</p>
       <div class="stage-next-action"><span>也可以返回资料准备页补充文件。</span><RouterLink class="secondary-button" :to="`/shops/${shopId}/workflow/commit`">补充文件</RouterLink><button class="primary-button" type="button" :disabled="resuming || !missingCoverageRows.length" @click="confirmHardExclusions">{{ resuming ? "正在继续" : "确认排除并继续" }}</button></div>
     </section>
 
     <section v-if="canManage && !requiresHardExclusionConfirmation" class="surface-section intermediate-results" aria-labelledby="intermediate-title">
-      <div class="section-heading split-heading"><div><h2 id="intermediate-title">标准化中间结果</h2><p>筛选固定在表体上方；合计覆盖完整筛选结果，不受分页影响。</p></div><a class="primary-button compact" :href="exportUrl">导出当前筛选</a></div>
-      <div class="segmented-control" role="tablist" aria-label="中间结果类型"><button type="button" :class="{ active: intermediateKind === 'TRANSACTION' }" @click="changeIntermediateKind('TRANSACTION')">交易报告</button><button type="button" :class="{ active: intermediateKind === 'SHIPMENT' }" @click="changeIntermediateKind('SHIPMENT')">配送货件</button></div>
+      <div class="section-heading split-heading"><div><h2 id="intermediate-title">系统识别出的明细</h2><p>可按日期、站点和币种查看；合计会计算所有符合条件的明细，不只计算当前这一页。</p></div><a class="primary-button compact" :href="exportUrl">导出当前筛选</a></div>
+      <div class="segmented-control" role="tablist" aria-label="明细类型"><button type="button" :class="{ active: intermediateKind === 'TRANSACTION' }" @click="changeIntermediateKind('TRANSACTION')">交易报告</button><button type="button" :class="{ active: intermediateKind === 'SHIPMENT' }" @click="changeIntermediateKind('SHIPMENT')">配送货件</button></div>
 
       <details class="intermediate-filter-drawer" open>
-        <summary>筛选、日期与字段</summary>
+        <summary>筛选日期和显示内容</summary>
         <div ref="filterBar" class="intermediate-filter-bar">
         <details class="filter-popover"><summary>站点 {{ selectedMarketplaces.length ? `(${selectedMarketplaces.length})` : "全部" }}</summary><div><label v-for="value in summary?.options.marketplaces" :key="value"><input v-model="selectedMarketplaces" type="checkbox" :value="value" />{{ value }}</label></div></details>
         <details class="filter-popover"><summary>币种 {{ selectedCurrencies.length ? `(${selectedCurrencies.length})` : "全部" }}</summary><div><label v-for="value in summary?.options.currencies" :key="value"><input v-model="selectedCurrencies" type="checkbox" :value="value" />{{ value }}</label></div></details>
         <DateRangePicker :grain="grain" :start="start" :end="end" @update:grain="changeGrain" @update:start="start = $event" @update:end="end = $event" />
-        <details class="filter-popover field-picker"><summary>字段 ({{ visibleColumns.length }}/{{ allColumns.length }})</summary><div><label v-for="column in allColumns" :key="column.key"><input v-model="selectedColumnKeys" type="checkbox" :value="column.key" @change="saveColumns" />{{ column.header }}</label></div></details>
+        <details class="filter-popover field-picker"><summary>显示列 ({{ visibleColumns.length }}/{{ allColumns.length }})</summary><div><label v-for="column in allColumns" :key="column.key"><input v-model="selectedColumnKeys" type="checkbox" :value="column.key" @change="saveColumns" />{{ column.header }}</label></div></details>
           <button class="primary-button compact" type="button" @click="applyFilters">应用筛选</button><button class="secondary-button compact" type="button" @click="resetFilters">重置</button>
         </div>
       </details>
 
-      <p v-if="intermediateLoading" class="inline-empty">正在读取中间结果…</p>
+      <p v-if="intermediateLoading" class="inline-empty">正在读取计算明细…</p>
       <div v-else-if="intermediateItems.length" class="intermediate-table-scroll" tabindex="0"><table><thead><tr><th v-for="column in visibleColumns" :key="column.key">{{ column.header }}</th></tr></thead><tbody><tr v-for="item in intermediateItems" :key="item.id"><td v-for="column in visibleColumns" :key="column.key" :class="{ numeric: !['text', 'date'].includes(column.kind) }">{{ intermediateValue(item, column.key) }}</td></tr></tbody><tfoot><tr v-for="total in summary?.totalsByCurrency" :key="total.currency"><th v-for="(column, index) in visibleColumns" :key="column.key">{{ index === 0 ? `${total.currency} 合计` : column.total ? decimalDisplay(total.values[column.key] ?? '0', column.kind === 'rate' ? 8 : 2) : "" }}</th></tr></tfoot></table></div>
       <p v-else class="inline-empty">当前筛选没有{{ intermediateKind === "TRANSACTION" ? "交易报告" : "配送货件" }}数据。</p>
       <div class="table-footer-actions"><span>{{ intermediateKind === "SHIPMENT" ? `人民币跨币种总计：${summary?.cnyTotal ? decimalDisplay(summary.cnyTotal) : "汇率不完整"}` : "原币金额按币种分别合计" }}</span><div><button class="secondary-button" type="button" :disabled="intermediateHistory.length === 0 || intermediateLoading" @click="previousIntermediate">上一页</button><button class="secondary-button" type="button" :disabled="!intermediateNext || intermediateLoading" @click="nextIntermediate">下一页</button></div></div>

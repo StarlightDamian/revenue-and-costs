@@ -8,8 +8,8 @@ import { publishSnapshot, type CalculationRunForPublishing, type PublishStore, t
 
 function shaHex(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
-const CALCULATION_FORMULA_VERSION = "revenue-cost-v4";
-const CALCULATION_CODE_VERSION = "local-v6";
+const CALCULATION_FORMULA_VERSION = "revenue-cost-v5";
+const CALCULATION_CODE_VERSION = "local-v7";
 const FX_DATE_RULE_VERSION = "next-business-day-v2";
 
 type ResolvedCalculationRunSlice = {
@@ -704,9 +704,9 @@ export class PostgresReportService {
             ? { note: "数量存在非零差异，已自动纳入并持续披露" }
             : row.warning ? { note: "数量差异尚未确认，不能发布" } : {})})),
       fees:fees.rows.map((row)=>({category:row.component,marketplace:row.marketplace,month:row.report_month,sourceRows:row.source_rows,amountCny:row.amount_cny})),
-      notices:[...(BigInt(fallback.rows[0]?.count??"0")>0n?[`存在 ${fallback.rows[0]?.count} 个非当日报价单元格`]:[]),
-        ...(unacknowledgedWarnings>0?[`存在 ${unacknowledgedWarnings} 个未确认数量差异，确认后才能发布`]:[]),
-        ...(hasFilter&&!effectivePublished?["筛选视图不可直接发布，请清除筛选后发布完整公司结果"]:[])],
+      notices:[...(BigInt(fallback.rows[0]?.count??"0")>0n?[`${fallback.rows[0]?.count} 笔金额使用了报表日期之后最近一个开市日的汇率，结果已经按该汇率计算。`]:[]),
+        ...(unacknowledgedWarnings>0?[`${unacknowledgedWarnings} 个站点和月份的两份资料数量不一致，确认后才能发布正式结果。`]:[]),
+        ...(hasFilter&&!effectivePublished?["当前只显示筛选后的部分结果，不能直接发布。请清除筛选后再发布完整结果。"]:[])],
       canPublish:run.status==='READY'&&!effectivePublished&&!hasFilter&&unacknowledgedWarnings===0};
   }
 }

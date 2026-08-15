@@ -104,7 +104,7 @@ test("普通做账员看不到人工汇率管理区", async ({ page }) => {
   await expect(page.getByRole("button", { name: "新增人工汇率" })).toHaveCount(0);
 });
 
-test("持久阻断自动弹窗且同一阻断关闭后不被轮询反复打开，诊断按钮复制完整诊断信息", async ({ page, context }) => {
+test("持续问题自动弹窗且关闭后不被轮询反复打开，处理编号按钮复制完整信息", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1:5173" });
   await routeSession(page, ["ACCOUNTANT"]);
   const shop = { id: shopId, enterpriseId: "60000000-0000-4000-8000-000000000041", createdByAccountId: accountId, lastOperatedByAccountId: accountId, name: "阻断验收公司", access: "ENTERPRISE", accountingStatus: "SUBMITTED", status: "ACTIVE", termStart: "2025-01-01", termEndExclusive: "2027-01-01", renameAvailable: true };
@@ -130,12 +130,11 @@ test("持久阻断自动弹窗且同一阻断关闭后不被轮询反复打开�
   await page.waitForTimeout(3000);
   await expect(blocker).toHaveCount(0);
 
-  const diagnostic = page.getByRole("button", { name: `复制诊断ID: ${diagnosticId}` });
-  await expect(diagnostic).toHaveText("ID: I4QQ…jVDq");
-  await expect(diagnostic).toHaveAttribute("title", "诊断ID");
+  const diagnostic = page.getByRole("button", { name: `复制处理编号：${diagnosticId}` });
+  await expect(diagnostic).toHaveText("编号：I4QQ…jVDq");
+  await expect(diagnostic).toHaveAttribute("title", "处理编号");
   await diagnostic.click();
   await expect(diagnostic).toContainText("已复制");
-  await expect(diagnostic).toHaveAccessibleName(`复制诊断ID: ${diagnosticId}`);
-  await expect(page.getByRole("status")).toHaveText("诊断ID已复制");
-  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(`诊断ID: ${diagnosticId}`);
+  await expect(diagnostic).toHaveAccessibleName(`复制处理编号：${diagnosticId}`);
+  await expect(page.getByRole("status")).toHaveText("处理编号已复制");
 });

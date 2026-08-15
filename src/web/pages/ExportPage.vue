@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { percentInputToRatio, ratioToPercentInput } from "../accounting-rates";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { AccountingPreferences, CostAccountingPreview, ExportJob, ShopWorkflow } from "../api/types";
 import AsyncState from "../components/AsyncState.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -34,6 +35,10 @@ let profitRateEdited = false;
 let minimumSalesCostRateEdited = false;
 let assumptionRevision = 0;
 let previewRequestSequence = 0;
+const assumptionErrorText = (caught: unknown, fallback: string) => caught instanceof Error
+  && /利润率|销售成本率/u.test(caught.message)
+  ? caught.message
+  : userFacingError(caught, fallback);
 
 watch(profitRate, () => {
   if (applyingLoadedDefaults) return;
@@ -91,12 +96,12 @@ async function reload(silent = false) {
       await router.replace({ name: "workflow-export", params: { shopId: shopId.value } });
     } else if (autoJob && ["FAILED", "CANCELLED", "REVOKED"].includes(autoJob.status)) {
       routeError.value = autoJob.status === "FAILED"
-        ? (autoJob.error ? `导出失败：${autoJob.error}` : "导出生成失败，请重试")
+        ? "报告生成失败，请重新生成"
         : autoJob.status === "CANCELLED" ? "导出任务已取消" : "导出授权已撤销";
       await router.replace({ name: "workflow-export", params: { shopId: shopId.value } });
     }
   } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "读取下载任务失败";
+    error.value = userFacingError(caught, "暂时无法读取下载任务，请检查网络后重试");
     status.value = "error";
   } finally { reloadInFlight = false; }
 }
@@ -113,7 +118,7 @@ async function refreshPreview() {
   } catch (caught) {
     if (sequence !== previewRequestSequence || revision !== assumptionRevision) return;
     preview.value = null;
-    actionError.value = caught instanceof Error ? caught.message : "预览成本测算失败";
+    actionError.value = assumptionErrorText(caught, "暂时无法预览成本测算，请检查网络后重试");
   } finally {
     if (sequence === previewRequestSequence) previewBusy.value = false;
   }
@@ -136,7 +141,7 @@ async function loadAccountingPreferences() {
     preferencesStatus.value = "ready";
   } catch (caught) {
     preferencesStatus.value = "error";
-    preferencesError.value = caught instanceof Error ? `读取默认测算参数失败：${caught.message}` : "读取默认测算参数失败";
+    preferencesError.value = userFacingError(caught, "暂时无法读取默认测算参数，请手动填写后继续");
   }
 }
 
@@ -160,13 +165,13 @@ async function createExport() {
     await router.replace({ name: "workflow-export", params: { shopId: shopId.value }, query: { auto: job.id } });
     await reload(true);
   } catch (caught) {
-    actionError.value = caught instanceof Error ? caught.message : "创建导出失败";
+    actionError.value = assumptionErrorText(caught, "暂时无法生成报告，请检查网络后重试");
   } finally { busy.value = false; }
 }
 
 async function cancel(job: ExportJob) {
   try { await api.cancelExport(job.id); await reload(true); }
-  catch (caught) { actionError.value = caught instanceof Error ? caught.message : "取消导出失败"; }
+  catch (caught) { actionError.value = userFacingError(caught, "暂时无法取消报告，请稍后重试"); }
 }
 
 async function download(job: ExportJob) {
@@ -174,7 +179,7 @@ async function download(job: ExportJob) {
     const result = await api.getDownloadUrl(job.id);
     window.location.assign(result.url);
   } catch (caught) {
-    actionError.value = caught instanceof Error ? caught.message : "无法获取下载授权";
+    actionError.value = userFacingError(caught, "暂时无法开始下载，请检查网络后重试");
   }
 }
 
@@ -184,28 +189,38 @@ function versionLabel(job: ExportJob): string {
 }
 
 const exportStageLabels: Readonly<Record<string, string>> = {
-  QUEUED: "等待处理",
-  VALIDATING: "校验快照",
-  QUERYING: "汇总数据",
-  WRITING_NOTES: "写入口径说明",
+  QUEUED: "等待生成",
+  VALIDATING: "检查正式结果",
+  QUERYING: "整理数据",
+  WRITING_NOTES: "整理计算说明",
   WRITING_MONTHLY: "写入月度账单",
   WRITING_QUARTERLY: "写入季度账单",
   WRITING_ANNUAL: "写入年度账单",
   WRITING_COST: "写入成本核算",
   FINALIZING_XLSX: "完成工作簿",
-  HASHING: "校验文件",
+  HASHING: "检查文件",
   PACKAGING: "打包文件",
-  ENCRYPTING: "加密存储",
-  COMMITTING: "提交结果",
-  SUCCEEDED: "已完成",
+  ENCRYPTING: "安全保存",
+  COMMITTING: "保存结果",
+  SUCCEEDED: "已生成",
+  FAILED: "生成失败",
+  CANCELLED: "已取消",
+  REVOKED: "授权已撤销",
+};
+
+const exportStatusLabels: Readonly<Record<ExportJob["status"], string>> = {
+  QUEUED: "等待生成",
+  RUNNING: "正在生成",
+  SUCCEEDED: "已生成",
   FAILED: "生成失败",
   CANCELLED: "已取消",
   REVOKED: "授权已撤销",
 };
 
 function progressDetails(job: ExportJob): string {
-  if (job.totalRows === null) return exportStageLabels[job.stage] ?? job.stage;
-  return `${exportStageLabels[job.stage] ?? job.stage} · ${job.processedRows}/${job.totalRows} 行`;
+  const stage = exportStageLabels[job.stage] ?? "正在生成";
+  if (job.totalRows === null) return stage;
+  return `${stage} · ${job.processedRows}/${job.totalRows} 行`;
 }
 
 watch(() => route.query.auto, () => { void reload(true); });
@@ -220,7 +235,7 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
 
 <template>
   <section class="workflow-stage-page" data-density="4">
-    <PageHeader title="报告交付" description="先预览本次测算参数，再生成固定到当前正式快照的报告。下载时仍会实时校验公司权限。" />
+    <PageHeader title="报告交付" description="先预览本次测算参数，再为当前正式结果生成报告。下载时系统还会检查您是否有权限。" />
     <template v-if="canCreateExport">
       <section class="surface-section export-assumption-panel">
         <div class="section-heading"><h2>本次成本测算</h2><p>已带入“做账习惯”的默认值；此处修改只影响本次新导出。</p></div>
@@ -253,19 +268,19 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
           <span>当前正式版本</span>
           <h2>{{ publishedLabel }}</h2>
           <p v-if="workflow?.download.usesPreviousPublishedVersion">新一轮数据仍在处理中。当前流程发布完成前，下载保持禁用。</p>
-          <p v-else>发布快照与本次两项测算参数都会冻结到导出任务，后续修改不会改变已生成报告。</p>
+          <p v-else>生成报告时，系统会记住当前正式结果和本次测算参数。之后再修改设置，也不会改变已经生成的报告。</p>
         </div>
         <button class="primary-button export-main-button" type="button" :disabled="busy || previewBusy || preferencesStatus !== 'ready'" @click="createExport">{{ busy ? "正在准备" : "生成并下载" }}</button>
         <p v-if="routeError" class="form-error" role="alert">{{ routeError }}</p><p v-if="actionError" class="form-error" role="alert">{{ actionError }}</p>
-        <ol class="sheet-list" aria-label="导出工作簿结构"><li>口径说明（默认隐藏）</li><li>月度明细账单</li><li>季度明细账单</li><li>年度明细账单</li><li>成本核算表-人民币</li></ol>
+        <ol class="sheet-list" aria-label="报告包含的表格"><li>计算说明（默认隐藏）</li><li>月度明细账单</li><li>季度明细账单</li><li>年度明细账单</li><li>成本核算表-人民币</li></ol>
       </section>
     </template>
     <section v-else class="surface-section"><div class="warning-panel">当前没有可导出的正式结果，或客户关系尚未获得导出授权。在线查看权限不受影响。</div></section>
 
     <section class="surface-section">
-      <div class="section-heading"><h2>下载任务</h2><p>只有发布快照、格式和两项测算参数完全一致时才会复用已有任务。</p></div>
+      <div class="section-heading"><h2>下载任务</h2><p>如果正式结果、文件格式和两项测算参数都没有变化，系统会直接使用已生成的报告。</p></div>
       <AsyncState :status="status" :error="error" empty-title="暂无下载任务" empty-message="点击“生成并下载”后，生成进度会显示在这里。" @retry="initialize()">
-        <div class="table-scroll" tabindex="0"><table><thead><tr><th>创建时间</th><th>正式版本</th><th>测算参数</th><th>格式</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody><tr v-for="job in jobs" :key="job.id" :data-current="job.isCurrentFormat && job.snapshotId === workflow?.publishedSnapshot?.id ? 'true' : 'false'"><td>{{ new Date(job.createdAt).toLocaleString("zh-CN", { hour12: false }) }}</td><td>{{ versionLabel(job) }}</td><td>利润率 {{ formatRatio(job.profitRate ?? undefined) }} / 下限 {{ formatRatio(job.minimumSalesCostRate ?? undefined) }}</td><td>{{ job.format }}<span v-if="!job.isCurrentFormat">（旧版格式）</span></td><td>{{ job.status }}<small v-if="job.status === 'FAILED'"><br />{{ job.error || "EXPORT_GENERATION_FAILED" }}</small></td><td><strong>{{ job.progress }}%</strong><br /><small>{{ progressDetails(job) }}</small></td><td><div class="table-actions"><button v-if="['QUEUED','RUNNING'].includes(job.status)" class="secondary-button compact" type="button" @click="cancel(job)">取消</button><button v-if="job.status === 'SUCCEEDED'" class="primary-button compact" type="button" @click="download(job)">{{ job.isCurrentFormat ? "下载" : "下载旧版" }}</button><button v-if="job.status === 'FAILED' && canCreateExport" class="secondary-button compact" type="button" :disabled="busy || preferencesStatus !== 'ready'" @click="createExport">重新生成</button><span v-if="job.status === 'REVOKED'">授权已撤销</span></div></td></tr></tbody></table></div>
+        <div class="table-scroll" tabindex="0"><table><thead><tr><th>创建时间</th><th>正式版本</th><th>测算参数</th><th>格式</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody><tr v-for="job in jobs" :key="job.id" :data-current="job.isCurrentFormat && job.snapshotId === workflow?.publishedSnapshot?.id ? 'true' : 'false'"><td>{{ new Date(job.createdAt).toLocaleString("zh-CN", { hour12: false }) }}</td><td>{{ versionLabel(job) }}</td><td>利润率 {{ formatRatio(job.profitRate ?? undefined) }} / 下限 {{ formatRatio(job.minimumSalesCostRate ?? undefined) }}</td><td>{{ job.format }}<span v-if="!job.isCurrentFormat">（旧版格式）</span></td><td>{{ exportStatusLabels[job.status] }}<small v-if="job.status === 'FAILED'"><br />报告没有生成成功，请重新生成。</small></td><td><strong>{{ job.progress }}%</strong><br /><small>{{ progressDetails(job) }}</small></td><td><div class="table-actions"><button v-if="['QUEUED','RUNNING'].includes(job.status)" class="secondary-button compact" type="button" @click="cancel(job)">取消</button><button v-if="job.status === 'SUCCEEDED'" class="primary-button compact" type="button" @click="download(job)">{{ job.isCurrentFormat ? "下载" : "下载旧版" }}</button><button v-if="job.status === 'FAILED' && canCreateExport" class="secondary-button compact" type="button" :disabled="busy || preferencesStatus !== 'ready'" @click="createExport">重新生成</button><span v-if="job.status === 'REVOKED'">授权已撤销</span></div></td></tr></tbody></table></div>
       </AsyncState>
     </section>
   </section>

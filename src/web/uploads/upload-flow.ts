@@ -31,7 +31,7 @@ function errorMessage(error: unknown): string {
 
 function validOffset(value: string, size: number): number {
   const offset = Number(value);
-  if (!Number.isSafeInteger(offset) || offset < 0 || offset > size) throw new Error("服务端返回了无效的上传 offset");
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > size) throw new Error("服务器返回的上传位置不正确，请重新选择该文件后再试");
   return offset;
 }
 
@@ -39,7 +39,7 @@ export async function uploadFilesContinuing(
   items: readonly UploadFileItem[],
   dependencies: UploadFlowDependencies,
 ): Promise<UploadFlowResult> {
-  if (!Number.isSafeInteger(dependencies.chunkBytes) || dependencies.chunkBytes < 1) throw new Error("上传分片大小无效");
+  if (!Number.isSafeInteger(dependencies.chunkBytes) || dependencies.chunkBytes < 1) throw new Error("每次上传的数据大小设置不正确");
   const fileConcurrency = dependencies.fileConcurrency ?? 1;
   if (!Number.isSafeInteger(fileConcurrency) || fileConcurrency < 1 || fileConcurrency > 4) {
     throw new Error("上传文件并发数无效");
@@ -63,7 +63,7 @@ export async function uploadFilesContinuing(
         const chunk = item.source.slice(offset, Math.min(offset + dependencies.chunkBytes, item.size), item.source.type);
         const next = await dependencies.uploadChunk(item.remoteId, String(offset), chunk);
         const nextOffset = validOffset(next.offset, item.size);
-        if (nextOffset <= offset) throw new Error("服务端返回了无效的上传 offset");
+        if (nextOffset <= offset) throw new Error("服务器返回的上传位置不正确，请重新选择该文件后再试");
         sent += nextOffset - offset;
         offset = nextOffset;
         dependencies.onProgress?.(sent);
@@ -95,7 +95,7 @@ export async function uploadFilesContinuing(
 }
 
 export function uploadFailureMessage(failed: number): string {
-  return `${failed} 个文件上传失败；其他文件已继续处理。请检查失败项后点击“继续上传”，系统会从服务端确认的 offset 续传。`;
+  return `${failed} 个文件上传失败，其他文件不受影响。请检查失败项后点击“继续上传”，系统会从上次成功的位置接着上传。`;
 }
 
 export function uploadBatchConclusion(items: readonly Pick<UploadFileItem, "state">[]): {
@@ -110,13 +110,13 @@ export function uploadBatchConclusion(items: readonly Pick<UploadFileItem, "stat
     return { tone: "error", title: "无可计算数据", detail: "所有文件上传失败；修复连接或浏览器环境后可继续上传。" };
   }
   if (skipped > 0) {
-    return { tone: "warning", title: "部分文件已跳过", detail: `${skipped} 个失败文件不会进入计算，${complete} 个文件已进入预检。` };
+    return { tone: "warning", title: "部分文件已跳过", detail: `${skipped} 个失败文件不会用于计算，系统正在检查其余 ${complete} 个文件。` };
   }
   if (failed > 0) {
-    return { tone: "warning", title: "批次尚未完成", detail: `${failed} 个文件失败，${complete} 个文件已完成；失败项续传成功前不会开始预检。` };
+    return { tone: "warning", title: "还有文件未上传", detail: `${failed} 个文件上传失败，${complete} 个文件已上传。请继续上传失败文件，完成后系统才会检查文件内容。` };
   }
   if (items.length > 0 && complete === items.length) {
-    return { tone: "success", title: "文件上传完成", detail: "全部文件已接收，正在进入预检。" };
+    return { tone: "success", title: "文件上传完成", detail: "全部文件已收到，系统正在检查哪些资料可以用于计算。" };
   }
   return { tone: "neutral", title: "等待选择", detail: "可继续追加文件；确认清单后点击“开始上传”。" };
 }

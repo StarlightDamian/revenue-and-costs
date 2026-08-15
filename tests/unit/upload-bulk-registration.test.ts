@@ -72,7 +72,38 @@ describe("upload bulk registration", () => {
     expect(calls.some((call) => call.sql.includes("INSERT INTO import_file") && call.sql.includes("file.metadata_only"))).toBe(true);
     expect(calls.some((call) => call.sql.includes("INSERT INTO outbox_event") && call.sql.includes("upload.finalize"))).toBe(true);
     expect(calls[0]?.sql).toBe("BEGIN");
+    const existingIndex = calls.findIndex((call) => call.sql.includes("idempotency_key=$2"));
+    const shopLockIndex = calls.findIndex((call) => call.sql.includes("FROM shop") && call.sql.includes("FOR UPDATE"));
+    const replayCheckIndex = calls.findIndex((call) => call.sql.includes("idempotency_key LIKE 'admin-source-replay:%'"));
+    const batchInsertIndex = calls.findIndex((call) => call.sql.includes("INSERT INTO upload_batch"));
+    expect(shopLockIndex).toBeGreaterThan(existingIndex);
+    expect(replayCheckIndex).toBeGreaterThan(shopLockIndex);
+    expect(batchInsertIndex).toBeGreaterThan(replayCheckIndex);
     expect(calls.at(-1)?.sql).toBe("COMMIT");
+  });
+
+  it("fails closed before creating an ordinary batch while a source replay owns the shop workflow", async () => {
+    const calls: string[] = [];
+    const client = {
+      async query(sql: string) {
+        calls.push(sql);
+        if (sql.includes("idempotency_key=$2")) return { rows: [], rowCount: 0 };
+        if (sql.includes("idempotency_key LIKE 'admin-source-replay:%'")) {
+          return { rows: [{ id: "active-replay" }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      },
+      release: vi.fn(),
+    };
+    const pool = { connect: async () => client as unknown as PoolClient } as unknown as Pool;
+    const service = new UploadService(pool, await storageRoot());
+
+    await expect(service.createBatch("shop-id", "account-id", "ordinary-upload"))
+      .rejects.toMatchObject({ code: "UPLOAD_SOURCE_REPLAY_IN_PROGRESS", statusCode: 409 });
+
+    expect(calls.some((sql) => sql.includes("FROM shop") && sql.includes("FOR UPDATE"))).toBe(true);
+    expect(calls.some((sql) => sql.includes("INSERT INTO upload_batch"))).toBe(false);
+    expect(calls.at(-1)).toBe("ROLLBACK");
   });
 
   it("replays the committed file list in request order with current offsets", async () => {

@@ -99,6 +99,7 @@ describe("browser ZIP PDF preflight", () => {
       allowed: false,
       reason: "PDF_ENTRY",
       entryName: "docs/invoice.pdf",
+      message: expect.stringContaining("整个 ZIP 都没有上传"),
     });
   });
 
@@ -124,6 +125,7 @@ describe("browser ZIP PDF preflight", () => {
     await expect(preflightZipForPdf(zipBlob(damaged))).resolves.toMatchObject({
       allowed: false,
       reason: "EOCD_MISSING",
+      message: expect.not.stringMatching(/结束记录|中央目录|预检/u),
     });
   });
 

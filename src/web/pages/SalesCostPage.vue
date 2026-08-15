@@ -2,6 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { Shop, ShopMembership } from "../api/types";
 import AsyncState from "../components/AsyncState.vue";
 import DataTutorialDialog from "../components/DataTutorialDialog.vue";
@@ -68,12 +69,24 @@ const creationButtonLabel = computed(() => isAdmin.value
     ? `创建（消耗${creationCostLabel.value}）`
     : "正在读取价格");
 
+const shopStatusNames: Record<Shop["status"], string> = {
+  ACTIVE: "使用中",
+  EXPIRED: "已到期，只能查看",
+  TRASHED: "回收站",
+};
+
+const memberStatusNames: Record<ShopMembership["status"], string> = {
+  ACTIVE: "已授权",
+  REVOKED: "已撤销",
+  EXPIRED: "已失效",
+};
+
 async function openCreateDialog() {
   showCreate.value = true;
   formError.value = "";
   if (creationOffer.value) return;
   try { creationOffer.value = await api.getAmazonShopOffer(); }
-  catch (caught) { formError.value = caught instanceof Error ? caught.message : "无法读取当前公司价格"; }
+  catch (caught) { formError.value = userFacingError(caught, "暂时无法读取公司价格，请检查网络后重试"); }
 }
 
 function closeCreateDialog() {
@@ -109,7 +122,7 @@ async function bulkTrash() {
     bulkReason.value = "";
     bulkDialogOpen.value = false;
     await reload();
-  } catch (caught) { bulkError.value = caught instanceof Error ? caught.message : "批量删除失败"; }
+  } catch (caught) { bulkError.value = userFacingError(caught, "暂时无法批量删除，请检查网络后重试"); }
   finally { bulkSaving.value = false; }
 }
 
@@ -130,7 +143,7 @@ async function createShop() {
     showCreate.value = false;
     name.value = "";
     await reload();
-  } catch (caught) { formError.value = caught instanceof Error ? caught.message : "创建失败"; }
+  } catch (caught) { formError.value = userFacingError(caught, "暂时无法创建公司，请检查网络后重试"); }
   finally { saving.value = false; }
 }
 
@@ -151,7 +164,7 @@ async function openManagement(shop: Shop) {
   manageError.value = "";
   if (!managingShopId.value || shop.status === "TRASHED") { members.value = []; return; }
   try { members.value = [...await api.listShopMembers(shop.id)]; }
-  catch (caught) { manageError.value = caught instanceof Error ? caught.message : "客户成员加载失败"; }
+  catch (caught) { manageError.value = userFacingError(caught, "暂时无法读取客户成员，请检查网络后重试"); }
 }
 
 function closeManagement() {
@@ -163,7 +176,7 @@ function closeManagement() {
 async function rename(shop: Shop) {
   managing.value = true; manageError.value = "";
   try { await api.renameShop(shop.id, manageName.value); await reload(); managingShopId.value = ""; }
-  catch (caught) { manageError.value = caught instanceof Error ? caught.message : "改名失败"; }
+  catch (caught) { manageError.value = userFacingError(caught, "暂时无法修改公司名称，请检查网络后重试"); }
   finally { managing.value = false; }
 }
 
@@ -171,7 +184,7 @@ async function renew(shop: Shop) {
   managing.value = true; manageError.value = "";
   if (hasPlatformRole(session.me, "ADMIN") && !manageReason.value.trim()) { manageError.value = "管理员免费续期必须填写减免原因"; managing.value = false; return; }
   try { await api.renewShop(shop.id, renewCloseDate.value, manageReason.value.trim() || undefined); await reload(); managingShopId.value = ""; }
-  catch (caught) { manageError.value = caught instanceof Error ? caught.message : "续期失败"; }
+  catch (caught) { manageError.value = userFacingError(caught, "暂时无法续期，请检查网络后重试"); }
   finally { managing.value = false; }
 }
 
@@ -183,7 +196,7 @@ async function changeLifecycle(shop: Shop, action: "TRASH" | "RESTORE") {
     if (action === "TRASH") await api.trashShop(shop.id, manageReason.value.trim());
     else await api.restoreShop(shop.id, manageReason.value.trim());
     await reload(); managingShopId.value = "";
-  } catch (caught) { manageError.value = caught instanceof Error ? caught.message : "公司状态变更失败"; }
+  } catch (caught) { manageError.value = userFacingError(caught, "暂时无法修改公司状态，请检查网络后重试"); }
   finally { managing.value = false; }
 }
 
@@ -198,7 +211,7 @@ async function inviteMember(shop: Shop) {
       : "邀请已创建，客户使用该手机号注册并登录后将直接进入该公司。";
     memberPhone.value = ""; memberExportAllowed.value = false;
     if (invitation.status === "ACTIVE") members.value = [...await api.listShopMembers(shop.id)];
-  } catch (caught) { manageError.value = caught instanceof Error ? caught.message : "创建客户邀请失败"; }
+  } catch (caught) { manageError.value = userFacingError(caught, "暂时无法创建客户邀请，请检查网络后重试"); }
   finally { managing.value = false; }
 }
 
@@ -210,21 +223,21 @@ async function updateMember(member: ShopMembership, action: "EXPORT" | "REVOKE")
     if (action === "EXPORT") await api.setMemberExport(member.id, !member.exportAllowed, manageReason.value.trim());
     else await api.revokeMember(member.id, manageReason.value.trim());
     members.value = [...await api.listShopMembers(member.shopId)];
-  } catch (caught) { manageError.value = caught instanceof Error ? caught.message : "客户授权变更失败"; }
+  } catch (caught) { manageError.value = userFacingError(caught, "暂时无法修改客户权限，请检查网络后重试"); }
   finally { managing.value = false; }
 }
 </script>
 
 <template>
   <section>
-    <PageHeader title="销售成本" description="按公司查看数据版本、完整性、试算与已发布快照。" />
+    <PageHeader title="销售成本" description="按公司查看资料是否齐全、计算结果和已发布的正式报告。" />
 
     <AsyncState :status="status" :error="error" empty-title="还没有可访问的公司" empty-message="请先创建或加入企业；公司客户授权会额外显示在这里。" @retry="reload">
       <template #empty-action><div class="empty-actions"><button v-if="canCreate" class="primary-button compact" type="button" @click="openCreateDialog">创建公司</button><button class="tutorial-trigger compact" type="button" @click="openTutorial">获取资料教程</button></div></template>
 
       <div v-if="owned.length" class="surface-section shop-index-panel">
         <div class="shop-index-heading">
-          <div class="section-heading"><h2>我的公司</h2><p>选择公司后可批量移入30天回收站，打开后进入独立六阶段工作台。</p></div>
+          <div class="section-heading"><h2>我的公司</h2><p>选择公司后可批量移入 30 天回收站；打开公司后，可在资料准备、计算复核和报告交付三个页面完成工作。</p></div>
           <div class="shop-index-actions"><button v-if="canCreate" class="primary-button compact" type="button" @click="openCreateDialog">创建公司</button><button class="tutorial-trigger compact" type="button" @click="openTutorial">获取资料教程</button></div>
           <div class="shop-filter" role="group" aria-label="公司状态筛选"><button type="button" :class="{ 'is-active': shopFilter === 'ACTIVE' }" @click="shopFilter = 'ACTIVE'; selectedShopIds = new Set()">使用中</button><button type="button" :class="{ 'is-active': shopFilter === 'TRASHED' }" @click="shopFilter = 'TRASHED'; selectedShopIds = new Set()">回收站</button></div>
         </div>
@@ -247,11 +260,11 @@ async function updateMember(member: ShopMembership, action: "EXPORT" | "REVOKE")
       </div>
 
       <div v-if="shared.length" class="surface-section shop-index-panel">
-        <div class="section-heading"><h2>客户访问</h2><p>客户只能查看正式结果，未授权的草稿、预检和原件不会暴露。</p></div>
+        <div class="section-heading"><h2>客户访问</h2><p>客户只能查看已发布的正式结果；未完成的计算和上传的源文件不会显示给客户。</p></div>
         <div class="shop-list">
           <article v-for="shop in shared" :key="shop.id" class="shop-row shop-row-redesigned is-shared">
             <div class="shop-identity"><h3>{{ shop.name }}</h3><button type="button" @click="copyName(shop)">复制名称</button><span class="access-label">客户只读</span></div>
-            <dl><div><dt>状态</dt><dd>{{ shop.status }}</dd></div><div><dt>正式结果</dt><dd>{{ shop.publishedSnapshot ? "可查看" : "尚未发布" }}</dd></div></dl>
+            <dl><div><dt>状态</dt><dd>{{ shopStatusNames[shop.status] }}</dd></div><div><dt>正式结果</dt><dd>{{ shop.publishedSnapshot ? "可查看" : "尚未发布" }}</dd></div></dl>
             <div class="row-actions shop-primary-actions"><RouterLink class="shop-open-button compact" :to="`/shops/${shop.id}/workflow/calculate`" target="_blank" rel="noopener">打开</RouterLink></div>
           </article>
         </div>
@@ -267,7 +280,7 @@ async function updateMember(member: ShopMembership, action: "EXPORT" | "REVOKE")
         <div v-if="managingShop.status === 'TRASHED'" class="drawer-section"><p>该公司位于30天回收站，恢复后保留原期限、数据版本和改名状态。</p><label class="form-field"><span>恢复原因</span><input v-model.trim="manageReason" /></label><button class="primary-button" type="button" :disabled="managing" @click="changeLifecycle(managingShop, 'RESTORE')">从回收站恢复</button></div>
         <template v-else>
           <section class="drawer-section"><h3>基本信息</h3><label class="form-field"><span>公司名称</span><input v-model.trim="manageName" :disabled="!managingShop.renameAvailable" /></label><button class="secondary-button" type="button" :disabled="managing || !managingShop.renameAvailable" @click="rename(managingShop)">使用唯一一次改名</button><label class="form-field"><span>续期至（关闭日）</span><input v-model="renewCloseDate" type="date" /></label><button class="secondary-button" type="button" :disabled="managing" @click="renew(managingShop)">续期</button></section>
-          <section class="drawer-section"><h3>客户授权</h3><p>客户默认不可导出，且不能查看草稿或下载原件。已注册客户立即生效，未注册手机号将在注册后自动生效。</p><label class="form-field"><span>客户手机号</span><input v-model.trim="memberPhone" inputmode="numeric" maxlength="11" /></label><label class="form-field"><span>导出权限</span><select v-model="memberExportAllowed"><option :value="false">默认关闭</option><option :value="true">允许无 PII 快照导出</option></select></label><button class="secondary-button" type="button" :disabled="managing" @click="inviteMember(managingShop)">邀请客户</button><div v-if="invitationStatusMessage" class="sandbox-notice" role="status"><strong>邀请状态</strong><span>{{ invitationStatusMessage }}</span></div><div v-if="members.length" class="table-scroll" tabindex="0"><table><thead><tr><th>客户账号</th><th>状态</th><th>导出</th><th>操作</th></tr></thead><tbody><tr v-for="member in members" :key="member.id"><td>{{ member.accountId }}</td><td>{{ member.status }}</td><td>{{ member.exportAllowed ? "允许" : "关闭" }}</td><td><div class="table-actions"><button v-if="member.status === 'ACTIVE'" class="secondary-button compact" type="button" :disabled="managing" @click="updateMember(member, 'EXPORT')">{{ member.exportAllowed ? "关闭导出" : "允许导出" }}</button><button v-if="member.status === 'ACTIVE'" class="secondary-button compact" type="button" :disabled="managing" @click="updateMember(member, 'REVOKE')">撤权</button></div></td></tr></tbody></table></div></section>
+          <section class="drawer-section"><h3>客户授权</h3><p>客户默认不能下载报告，也不能查看未完成的计算或上传的源文件。已注册客户立即生效；未注册客户用这个手机号注册并登录后自动生效。</p><label class="form-field"><span>客户手机号</span><input v-model.trim="memberPhone" inputmode="numeric" maxlength="11" /></label><label class="form-field"><span>允许下载报告</span><select v-model="memberExportAllowed"><option :value="false">不允许</option><option :value="true">允许下载不含个人信息的正式报告</option></select></label><button class="secondary-button" type="button" :disabled="managing" @click="inviteMember(managingShop)">邀请客户</button><div v-if="invitationStatusMessage" class="sandbox-notice" role="status"><strong>邀请状态</strong><span>{{ invitationStatusMessage }}</span></div><div v-if="members.length" class="table-scroll" tabindex="0"><table><thead><tr><th>客户账号</th><th>状态</th><th>下载报告</th><th>操作</th></tr></thead><tbody><tr v-for="member in members" :key="member.id"><td>{{ member.accountId }}</td><td>{{ memberStatusNames[member.status] }}</td><td>{{ member.exportAllowed ? "允许" : "不允许" }}</td><td><div class="table-actions"><button v-if="member.status === 'ACTIVE'" class="secondary-button compact" type="button" :disabled="managing" @click="updateMember(member, 'EXPORT')">{{ member.exportAllowed ? "关闭下载" : "允许下载" }}</button><button v-if="member.status === 'ACTIVE'" class="secondary-button compact" type="button" :disabled="managing" @click="updateMember(member, 'REVOKE')">取消授权</button></div></td></tr></tbody></table></div></section>
           <section class="drawer-section danger-zone"><h3>移入回收站</h3><p>公司在30天内可以恢复，不退款，也不会物理删除财务事实。</p><label class="form-field"><span>删除原因</span><input v-model.trim="manageReason" /></label><button class="secondary-button" type="button" :disabled="managing" @click="changeLifecycle(managingShop, 'TRASH')">删除公司</button></section>
         </template>
         <p v-if="manageError" class="form-error" role="alert">{{ manageError }}</p>
@@ -279,13 +292,13 @@ async function updateMember(member: ShopMembership, action: "EXPORT" | "REVOKE")
       <form class="confirm-dialog create-shop-dialog" role="dialog" aria-modal="true" aria-labelledby="create-shop-title" @submit.prevent="createShop">
         <span>亚马逊销售成本</span>
         <h2 id="create-shop-title">创建公司</h2>
-        <p>{{ isAdmin ? "管理员创建公司不扣钱包；系统仍记录原价、实付 0 元、价格版本和操作审计。" : "填写公司信息后从当前企业钱包扣费。取消不会产生任何费用。" }}</p>
+        <p>{{ isAdmin ? "管理员创建公司不扣企业钱包；系统仍会记录当时的原价和操作人，方便日后核对。" : "填写公司信息后从当前企业钱包扣费。取消不会产生任何费用。" }}</p>
         <div class="form-grid three">
           <label class="form-field"><span>公司名称</span><input v-model.trim="name" maxlength="120" autocomplete="off" autofocus /></label>
           <label class="form-field"><span>开始日期</span><input v-model="termStart" type="date" /></label>
           <label class="form-field"><span>计费年数</span><select v-model="billingYears"><option value="1">1 年</option><option value="2">2 年</option><option value="3">3 年</option></select></label>
         </div>
-        <div v-if="creationOffer" class="create-shop-price"><span>{{ isAdmin ? "管理员免费" : "当前费用" }}</span><strong>{{ isAdmin ? "0￥" : creationCostLabel }}</strong><small>{{ isAdmin ? `原价 ${creationCostLabel}，提交时写入 ADMIN_FREE 审计` : `${billingYears} 年，提交时按当前价格版本核验` }}</small></div>
+        <div v-if="creationOffer" class="create-shop-price"><span>{{ isAdmin ? "管理员免费" : "当前费用" }}</span><strong>{{ isAdmin ? "0￥" : creationCostLabel }}</strong><small>{{ isAdmin ? `原价 ${creationCostLabel}，系统会记录本次免费操作` : `${billingYears} 年，提交时会再次确认当前价格` }}</small></div>
         <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
         <div class="form-actions"><button class="secondary-button" type="button" :disabled="saving" @click="closeCreateDialog">取消</button><button class="primary-button" type="submit" :disabled="saving || !creationOffer">{{ saving ? "正在创建" : creationButtonLabel }}</button></div>
       </form>

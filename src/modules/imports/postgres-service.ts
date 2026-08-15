@@ -1,28 +1,109 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { TransactionRunner, SqlClient } from "../authorization/index.js";
+import { INTERMEDIATE_REPORT_COLUMNS } from "../../shared/intermediate-report.js";
 
 const RETRYABLE_COMMIT_FAILURES = new Set([
   "IMPORT_DATABASE_CAPACITY_UNAVAILABLE",
   "IMPORT_DATABASE_CAPACITY_INSUFFICIENT",
 ]);
 
+const importFieldNames = new Map<string, string>([
+  ["total", "总金额"],
+  ["quantity", "数量"],
+  ...Object.values(INTERMEDIATE_REPORT_COLUMNS).flat().map((column) => [
+    column.key.replace(/[A-Z]/gu, (letter) => `_${letter.toLowerCase()}`),
+    column.header,
+  ] as const),
+]);
+
 export function describeImportIssue(code: string, count: number, fieldName: string | null, exactCount = true): { message: string; action: string } {
-  const field = fieldName ? `（字段：${fieldName}）` : "";
+  const field = fieldName ? `（${importFieldNames.get(fieldName) ?? "某个金额"}列）` : "";
   const messages: Record<string, [string, string]> = {
-    AWAITING_MAPPING: ["未识别文件结构，文件已过滤", "如该文件应参与计算，请补充经过确认的字段映射后重新上传。"],
-    UNKNOWN_STRUCTURE_EXCLUDED: ["未识别文件结构，文件已过滤", "如该文件应参与计算，请补充经过确认的字段映射后重新上传。"],
-    DUPLICATE_SOURCE: ["检测到重复来源，未重复入库", "无需处理；系统已按原件哈希去重。"],
-    IMPORT_FINANCIAL_VALUE_REQUIRED: [`必需金额为空${field}，相关行已过滤`, "请补充该行的总金额或必需数量后重新上传。"],
-    IMPORT_FINANCIAL_VALUE_INVALID: [`金额格式无效${field}，相关行已过滤`, "请改为明确的十进制金额后重新上传。"],
-    IMPORT_UNKNOWN_MARKETPLACE: ["销售站点无法识别，相关行已过滤", "请补充可识别的 Amazon 销售渠道；交易报告还需确保同一文件只有一个可识别站点。"],
-    IMPORT_REPORT_DATE_INVALID: ["报表日期无法识别，相关行已过滤", "请修正日期格式后重新上传。"],
+    AWAITING_MAPPING: ["系统看不懂这个表格，每一列代表什么还不清楚", "这个文件暂时不会用于计算。请联系管理员确认表格每一列代表什么，然后重新上传。"],
+    UNKNOWN_STRUCTURE_EXCLUDED: ["系统看不懂这个表格，每一列代表什么还不清楚", "这个文件没有用于计算。请联系管理员确认表格每一列代表什么，然后重新上传。"],
+    DUPLICATE_SOURCE: ["这个文件之前已经上传过", "系统没有重复保存，也不会重复计算，不需要处理。"],
+    IMPORT_FINANCIAL_VALUE_REQUIRED: [`有一行没有填写计算所需的金额或数量${field}`, "请补充空白单元格后重新上传。这一行目前没有用于计算。"],
+    IMPORT_FINANCIAL_VALUE_INVALID: [`有一行的金额不是系统能识别的数字${field}`, "请把金额改成普通数字，例如 1234.56，然后重新上传。这一行目前没有用于计算。"],
+    IMPORT_UNKNOWN_MARKETPLACE: ["有一行的销售站点无法识别", "请填写明确的 Amazon 站点名称。如果是交易报告，同一个文件内只保留一个站点，然后重新上传。这一行目前没有用于计算。"],
+    IMPORT_REPORT_DATE_INVALID: ["有一行的日期无法识别", "请把日期改成表格中其他日期使用的格式，然后重新上传。这一行目前没有用于计算。"],
     NO_USABLE_UPLOAD_FILES: ["没有可用于计算的文件", "请补充交易报告或配送货件后重新上传。"],
   };
   const known = messages[code];
   return {
-    message: known?.[0] ?? `检测到 ${code}`,
-    action: `${known?.[1] ?? "请根据问题代码检查源文件。"}${count > 1 ? exactCount ? ` 共 ${count} 条。` : ` 已记录 ${count} 条诊断样例。` : ""}`,
+    message: known?.[0] ?? "系统发现一个暂时无法自动说明的问题",
+    action: `${known?.[1] ?? "这个文件暂时不会用于计算。请检查文件内容；如果仍不知道怎么处理，请联系管理员。"}${count > 1 ? exactCount ? ` 共 ${count} 条。` : ` 已记录 ${count} 条示例。` : ""}`,
   };
+}
+
+export interface ConfirmImportBatchInput {
+  readonly actorAccountId: string;
+  readonly idempotencyKey: string;
+}
+
+export async function confirmImportBatch(
+  client: SqlClient,
+  shopId: string,
+  batchId: string,
+  input: ConfirmImportBatchInput,
+) {
+  const batch = await client.query<{ status: string; failure_code: string | null }>(
+    "SELECT status,failure_code FROM import_batch WHERE id=$1 AND shop_id=$2 FOR UPDATE",
+    [batchId, shopId],
+  );
+  const status = batch.rows[0]?.status;
+  if (!status) throw new Error("IMPORT_BATCH_NOT_FOUND");
+  if ([
+    "COMMITTING", "COMMITTED", "COMMITTED_WITH_EXCLUSIONS", "CALCULATING",
+    "READY_FOR_REVIEW", "RESULT_PUBLISHING", "RESULT_PUBLISHED",
+  ].includes(status)) return { id: batchId, status };
+  const awaitingHardExclusion = status === "FAILED"
+    && batch.rows[0]?.failure_code === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED";
+  if (awaitingHardExclusion) {
+    const pending = await client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM dataset_slice slice
+         JOIN dataset_version version ON version.id=slice.current_version_id
+        WHERE slice.shop_id=$1 AND version.status='INCOMPLETE'
+          AND NOT EXISTS (
+            SELECT 1 FROM quality_acknowledgement acknowledgement
+             WHERE acknowledgement.dataset_version_id=version.id
+               AND acknowledgement.calculation_run_id IS NULL
+               AND acknowledgement.issue_kind='HARD_INCOMPLETE'
+          )`,
+      [shopId],
+    );
+    if (BigInt(pending.rows[0]?.count ?? "0") > 0n) throw new Error("HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
+    await client.query(
+      "UPDATE import_batch SET status='COMMITTED_WITH_EXCLUSIONS',current_stage='COMMITTED',failure_code=NULL,updated_at=clock_timestamp() WHERE id=$1",
+      [batchId],
+    );
+    await client.query(
+      `INSERT INTO outbox_event (id,topic,business_key,payload) VALUES ($1,'calculation.requested',$2,$3::jsonb)
+       ON CONFLICT (topic,business_key) DO NOTHING`,
+      [randomUUID(), `resume:${batchId}:${input.idempotencyKey}`, JSON.stringify({ batchId, actorAccountId: input.actorAccountId })],
+    );
+    await client.query(
+      `UPDATE shop SET last_operated_by_account_id=$2,updated_at=clock_timestamp() WHERE id=$1`,
+      [shopId, input.actorAccountId],
+    );
+    return { id: batchId, status: "COMMITTED_WITH_EXCLUSIONS" };
+  }
+  const retryableFailure = status === "FAILED" && RETRYABLE_COMMIT_FAILURES.has(batch.rows[0]?.failure_code ?? "");
+  if (status !== "AWAITING_COMMIT_CONFIRMATION" && !retryableFailure) throw new Error("IMPORT_BATCH_NOT_READY");
+  await client.query(
+    "UPDATE import_batch SET status='COMMITTING',current_stage='COPY',failure_code=NULL,updated_at=clock_timestamp() WHERE id=$1",
+    [batchId],
+  );
+  await client.query(
+    `INSERT INTO outbox_event (id,topic,business_key,payload) VALUES ($1,'import.commit',$2,$3::jsonb)
+     ON CONFLICT (topic,business_key) DO NOTHING`,
+    [randomUUID(), `${batchId}:${input.idempotencyKey}`, JSON.stringify({ batchId, shopId, actorAccountId: input.actorAccountId })],
+  );
+  await client.query(
+    `UPDATE shop SET last_operated_by_account_id=$2,updated_at=clock_timestamp() WHERE id=$1`,
+    [shopId, input.actorAccountId],
+  );
+  return { id: batchId, status: "COMMITTING" };
 }
 
 export class PostgresImportService {
@@ -40,8 +121,14 @@ export class PostgresImportService {
   }
 
   async getBatch(shopId: string, batchId: string) {
-    const batch = await this.database.query<{ id: string; status: string; current_stage: string; failure_code: string | null }>(
-      "SELECT id,status,current_stage,failure_code FROM import_batch WHERE id=$1 AND shop_id=$2",
+    const batch = await this.database.query<{
+      id: string; status: string; current_stage: string; failure_code: string | null;
+      upload_batch_id: string; upload_ready: boolean;
+    }>(
+      `SELECT batch.id,batch.status,batch.current_stage,batch.failure_code,batch.upload_batch_id,
+              NOT EXISTS (SELECT 1 FROM upload_file file
+                WHERE file.batch_id=batch.upload_batch_id AND file.status IN ('PENDING','UPLOADING')) AS upload_ready
+         FROM import_batch batch WHERE batch.id=$1 AND batch.shop_id=$2`,
       [batchId, shopId],
     );
     const row = batch.rows[0];
@@ -79,6 +166,8 @@ export class PostgresImportService {
     });
     return {
       id: row.id,
+      uploadBatchId: row.upload_batch_id,
+      uploadReady: row.upload_ready,
       status: publicStatus,
       progress: publicStatus === "PUBLISHED" || publicStatus === "READY" ? "100" : publicStatus === "PROCESSING" ? "75" : "0",
       stage: row.current_stage,
@@ -147,60 +236,7 @@ export class PostgresImportService {
   }
 
   async confirm(shopId: string, batchId: string, input: { actorAccountId: string; idempotencyKey: string }) {
-    return this.transactions.transaction(async (client) => {
-      const batch = await client.query<{ status: string; failure_code: string | null }>("SELECT status,failure_code FROM import_batch WHERE id=$1 AND shop_id=$2 FOR UPDATE", [batchId, shopId]);
-      const status = batch.rows[0]?.status;
-      if (!status) throw new Error("IMPORT_BATCH_NOT_FOUND");
-      if ([
-        "COMMITTING", "COMMITTED", "COMMITTED_WITH_EXCLUSIONS", "CALCULATING",
-        "READY_FOR_REVIEW", "RESULT_PUBLISHING", "RESULT_PUBLISHED",
-      ].includes(status)) return { id: batchId, status };
-      const awaitingHardExclusion = status === "FAILED"
-        && batch.rows[0]?.failure_code === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED";
-      if (awaitingHardExclusion) {
-        const pending = await client.query<{ count: string }>(
-          `SELECT count(*)::text AS count
-             FROM dataset_slice slice
-             JOIN dataset_version version ON version.id=slice.current_version_id
-            WHERE slice.shop_id=$1 AND version.status='INCOMPLETE'
-              AND NOT EXISTS (
-                SELECT 1 FROM quality_acknowledgement acknowledgement
-                 WHERE acknowledgement.dataset_version_id=version.id
-                   AND acknowledgement.calculation_run_id IS NULL
-                   AND acknowledgement.issue_kind='HARD_INCOMPLETE'
-              )`,
-          [shopId],
-        );
-        if (BigInt(pending.rows[0]?.count ?? "0") > 0n) throw new Error("HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
-        await client.query(
-          "UPDATE import_batch SET status='COMMITTED_WITH_EXCLUSIONS',current_stage='COMMITTED',failure_code=NULL,updated_at=clock_timestamp() WHERE id=$1",
-          [batchId],
-        );
-        await client.query(
-          `INSERT INTO outbox_event (id,topic,business_key,payload) VALUES ($1,'calculation.requested',$2,$3::jsonb)
-           ON CONFLICT (topic,business_key) DO NOTHING`,
-          [randomUUID(), `resume:${batchId}:${input.idempotencyKey}`, JSON.stringify({ batchId, actorAccountId: input.actorAccountId })],
-        );
-        await client.query(
-          `UPDATE shop SET last_operated_by_account_id=$2,updated_at=clock_timestamp() WHERE id=$1`,
-          [shopId, input.actorAccountId],
-        );
-        return { id: batchId, status: "COMMITTED_WITH_EXCLUSIONS" };
-      }
-      const retryableFailure = status === "FAILED" && RETRYABLE_COMMIT_FAILURES.has(batch.rows[0]?.failure_code ?? "");
-      if (status !== "AWAITING_COMMIT_CONFIRMATION" && !retryableFailure) throw new Error("IMPORT_BATCH_NOT_READY");
-      await client.query("UPDATE import_batch SET status='COMMITTING',current_stage='COPY',failure_code=NULL,updated_at=clock_timestamp() WHERE id=$1", [batchId]);
-      await client.query(
-        `INSERT INTO outbox_event (id,topic,business_key,payload) VALUES ($1,'import.commit',$2,$3::jsonb)
-         ON CONFLICT (topic,business_key) DO NOTHING`,
-        [randomUUID(), `${batchId}:${input.idempotencyKey}`, JSON.stringify({ batchId, shopId, actorAccountId: input.actorAccountId })],
-      );
-      await client.query(
-        `UPDATE shop SET last_operated_by_account_id=$2,updated_at=clock_timestamp() WHERE id=$1`,
-        [shopId, input.actorAccountId],
-      );
-      return { id: batchId, status: "COMMITTING" };
-    });
+    return this.transactions.transaction((client) => confirmImportBatch(client, shopId, batchId, input));
   }
 
   async acknowledge(shopId: string, issueId: string, input: { actorAccountId: string; reason: string; confirmations: string; idempotencyKey: string }) {

@@ -133,6 +133,30 @@ test("做账员在销售成本页切换企业并按每年 188 元创建公司", 
   await expect(tutorialTrigger).toBeFocused();
 });
 
+test("深色主题的企业下拉框和选项保持深底浅字", async ({ page }) => {
+  await mockEnterpriseWorkspace(page, { ...accountant, theme: "dark" });
+  await page.route("**/api/v1/shops**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+
+  await page.goto("/sales-cost");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  const enterpriseSwitch = page.locator(".global-enterprise-switch select");
+  const colors = await enterpriseSwitch.evaluate((element) => {
+    const option = element.querySelector("option");
+    return {
+      selectColor: getComputedStyle(element).color,
+      selectBackground: getComputedStyle(element).backgroundColor,
+      optionColor: option ? getComputedStyle(option).color : "",
+      optionBackground: option ? getComputedStyle(option).backgroundColor : "",
+    };
+  });
+  expect(colors).toEqual({
+    selectColor: "rgb(238, 243, 240)",
+    selectBackground: "rgb(24, 35, 31)",
+    optionColor: "rgb(238, 243, 240)",
+    optionBackground: "rgb(24, 35, 31)",
+  });
+});
+
 test("管理员侧栏按 MECE 分组并提供平台治理入口", async ({ page }, testInfo) => {
   const admin = { ...accountant, roles: ["ADMIN"] };
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(admin) }));
@@ -256,7 +280,7 @@ test("管理员侧栏按 MECE 分组并提供平台治理入口", async ({ page 
   await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
 });
 
-test("账号名称可修改并即时同步侧栏，手机号区号独立置灰", async ({ page }, testInfo) => {
+test("账号设置采用同级信息行，名称只在弹窗中修改", async ({ page }, testInfo) => {
   let currentAccount = { ...accountant, phoneMasked: "+86 138****0000" };
   let profilePayload: Record<string, unknown> | undefined;
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentAccount) }));
@@ -268,10 +292,12 @@ test("账号名称可修改并即时同步侧栏，手机号区号独立置灰",
   });
 
   await page.goto("/account");
-  const nameInput = page.getByLabel("账号名称");
-  await expect(nameInput).toHaveValue("浏览器验收做账员");
-  await expect(nameInput).toHaveAttribute("placeholder", "例如：香港公司名称");
-  const phone = page.locator(".definition-list .phone-display");
+  await expect(page.locator(".account-settings-panel")).toHaveCount(1);
+  await expect(page.locator(".account-settings-list > div")).toHaveCount(5);
+  await expect(page.getByRole("textbox", { name: "账号名称" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "企业钱包" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "查看企业钱包" })).toHaveCount(0);
+  const phone = page.locator(".account-settings-list .phone-display");
   await expect(phone.locator(".phone-country-code")).toHaveText("+86");
   await expect(phone).toContainText("138****0000");
   const colors = await phone.evaluate((element) => {
@@ -284,16 +310,26 @@ test("账号名称可修改并即时同步侧栏，手机号区号独立置灰",
   expect(await page.locator(".account-avatar-toggle").evaluate((element) => getComputedStyle(element, "::after").content))
     .toMatch(/^(none|normal)$/u);
 
+  await page.getByRole("button", { name: "修改名称" }).click();
+  const dialog = page.getByRole("dialog", { name: "修改账号名称" });
+  const nameInput = dialog.getByLabel("账号名称");
+  await expect(nameInput).toHaveValue("浏览器验收做账员");
+  await expect(nameInput).toHaveAttribute("placeholder", "例如：张三或星河财务");
   await nameInput.fill("😀".repeat(80));
-  await expect(page.getByRole("button", { name: "保存名称" })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "保存名称" })).toBeEnabled();
 
   await nameInput.fill("测试做账员");
-  await page.getByRole("button", { name: "保存名称" }).click();
+  await dialog.getByRole("button", { name: "保存名称" }).click();
+  await expect(dialog).not.toBeVisible();
   await expect(page.getByText("账号名称已更新")).toBeVisible();
   expect(profilePayload).toEqual({ displayName: "测试做账员" });
   if ((page.viewportSize()?.width ?? 1440) <= 1180) await page.getByRole("button", { name: "菜单" }).click();
   await expect(page.locator(".account-summary").getByText("测试做账员", { exact: true })).toBeVisible();
   await expect(page.locator(".account-summary")).not.toContainText("138****0000");
+  if ((page.viewportSize()?.width ?? 1440) <= 1180) {
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("button", { name: "关闭导航" })).toBeHidden();
+  }
 
   const evidenceDirectory = resolve(".work/evidence/account-settings");
   await mkdir(evidenceDirectory, { recursive: true });
@@ -322,7 +358,7 @@ test("管理员为选定企业免费创建公司并记录 188 元原价", async 
   await page.locator(".shop-index-heading").getByRole("button", { name: "创建公司", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建公司" });
   await expect(dialog.getByText("0￥", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("原价 188￥，提交时写入 ADMIN_FREE 审计", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("原价 188￥，系统会记录本次免费操作", { exact: true })).toBeVisible();
   await expect(dialog.getByLabel("减免原因")).toHaveCount(0);
   await dialog.getByLabel("公司名称").fill("已有公司");
   await dialog.getByRole("button", { name: "创建（管理员免费）" }).click();

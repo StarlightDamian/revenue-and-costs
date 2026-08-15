@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import { session } from "../session";
 import {
   applyTheme,
@@ -41,7 +42,7 @@ async function select(theme: ThemeId) {
     if (session.status !== "authenticated" || session.me?.id !== accountId) return;
     stageThemePreference(theme);
     failedTheme.value = theme;
-    error.value = caught instanceof Error ? caught.message : "主题尚未同步到账号";
+    error.value = userFacingError(caught, "界面样式已经切换，但暂时无法保存到账号，请稍后再试");
   } finally {
     saving.value = false;
   }

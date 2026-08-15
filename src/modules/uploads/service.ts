@@ -437,6 +437,21 @@ export class UploadService {
           availableStorageBytes = disk.bavail * disk.bsize;
         }
 
+        // Source replay and normal upload creation share the shop row as their
+        // serialization boundary. Keep this and the replay lookup as separate
+        // statements so a waiter observes the replay committed before it.
+        await tx.query("SELECT id FROM shop WHERE id=$1 FOR UPDATE", [shopId]);
+        const activeReplay = await tx.query<{ id: string }>(
+          `SELECT id FROM import_batch
+            WHERE shop_id=$1 AND idempotency_key LIKE 'admin-source-replay:%'
+              AND status NOT IN ('RESULT_PUBLISHED','CANCELLED','FAILED')
+            ORDER BY created_at,id LIMIT 1`,
+          [shopId],
+        );
+        if (activeReplay.rows[0]) {
+          throw new AppError("UPLOAD_SOURCE_REPLAY_IN_PROGRESS", "当前公司正在安全重算历史资料，请稍后重试", 409);
+        }
+
         const batchId = randomUUID();
         await tx.query(
           `INSERT INTO upload_batch (id,shop_id,created_by,status,expires_at)

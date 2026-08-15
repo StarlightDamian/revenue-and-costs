@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { AdminUser } from "../api/types";
 import { avatarById } from "../avatars";
 import AsyncState from "../components/AsyncState.vue";
@@ -12,11 +13,12 @@ const search = ref("");
 const { data: users, status, error, reload } = useAsyncResource(() => api.listAdminUsers(search.value));
 const reason = ref(""); const actionError = ref(""); const selectedId = ref("");
 const roleLabel = (user: AdminUser) => user.roles[0] === "ADMIN" ? "管理员" : "做账员";
+const userStatusLabel = (user: AdminUser) => user.status === "ACTIVE" ? "正常使用" : "已禁用";
 async function act(user: AdminUser, action: string) {
   actionError.value = "";
   if (!reason.value.trim()) { selectedId.value = user.id; actionError.value = "角色、状态和调账操作必须填写原因"; return; }
   try { await api.updateAdminUser(user.id, { action, reason: reason.value.trim() }); reason.value = ""; selectedId.value = ""; await reload(); }
-  catch (caught) { selectedId.value = user.id; actionError.value = caught instanceof Error ? caught.message : "操作失败"; }
+  catch (caught) { selectedId.value = user.id; actionError.value = userFacingError(caught); }
 }
 </script>
 
@@ -64,7 +66,7 @@ async function act(user: AdminUser, action: string) {
                       alt=""
                     ><div><strong>{{ user.displayName || "未设置名称" }}</strong><small><PhoneDisplay :value="user.phoneMasked" /></small></div>
                   </div>
-                </td><td>{{ roleLabel(user) }}</td><td>{{ user.status }}</td><td class="numeric">
+                </td><td>{{ roleLabel(user) }}</td><td>{{ userStatusLabel(user) }}</td><td class="numeric">
                   {{ user.enterpriseCount }}
                 </td><td class="numeric">
                   {{ user.companyCount }}

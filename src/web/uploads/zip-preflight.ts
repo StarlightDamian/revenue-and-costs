@@ -39,16 +39,16 @@ export type ZipPdfPreflightResult =
   };
 
 const REJECTION_MESSAGES = {
-  PDF_ENTRY: "ZIP 中包含 PDF。为避免上传 PDF 原文，请改用文件夹上传；本次 ZIP 已全部拒绝。",
-  EOCD_MISSING: "无法读取 ZIP 的结束记录，文件可能已损坏或截断；本次 ZIP 未上传。",
-  ZIP64_UNSUPPORTED: "暂不支持 ZIP64；本次 ZIP 未上传。请重新打包为普通单卷 ZIP，或改用文件夹上传。",
-  MULTI_DISK_UNSUPPORTED: "暂不支持多卷 ZIP；本次 ZIP 未上传。请重新打包为普通单卷 ZIP，或改用文件夹上传。",
-  TOO_MANY_ENTRIES: "ZIP 条目过多，无法安全预检；本次 ZIP 未上传。请拆分后重试，或改用文件夹上传。",
-  CENTRAL_DIRECTORY_TOO_LARGE: "ZIP 中央目录过大，无法安全预检；本次 ZIP 未上传。请拆分后重试，或改用文件夹上传。",
-  CENTRAL_DIRECTORY_OUT_OF_BOUNDS: "ZIP 中央目录位置无效，文件可能已损坏；本次 ZIP 未上传。",
-  CENTRAL_DIRECTORY_TRUNCATED: "ZIP 中央目录不完整，文件可能已截断；本次 ZIP 未上传。",
-  CENTRAL_DIRECTORY_INVALID: "ZIP 中央目录格式无效，无法安全判定内容；本次 ZIP 未上传。",
-  READ_FAILED: "浏览器无法读取 ZIP 的有界预检数据；本次 ZIP 未上传。请重试或改用文件夹上传。",
+  PDF_ENTRY: "这个 ZIP 中有 PDF。为避免上传 PDF 正文，整个 ZIP 都没有上传。请解压后改用“选择文件夹”，PDF 只会登记文件名。",
+  EOCD_MISSING: "这个 ZIP 无法完整打开，可能已经损坏。文件没有上传，请重新压缩后再试，或改用“选择文件夹”。",
+  ZIP64_UNSUPPORTED: "这个 ZIP 使用了系统暂不支持的超大文件格式。文件没有上传，请拆成较小的普通 ZIP，或改用“选择文件夹”。",
+  MULTI_DISK_UNSUPPORTED: "这个 ZIP 被分成了多个压缩包，系统暂时无法读取。文件没有上传，请重新压成一个 ZIP，或改用“选择文件夹”。",
+  TOO_MANY_ENTRIES: "这个 ZIP 中的文件太多，系统无法一次检查完。文件没有上传，请拆成多个较小的 ZIP，或改用“选择文件夹”。",
+  CENTRAL_DIRECTORY_TOO_LARGE: "这个 ZIP 的文件清单太大，系统无法一次检查完。文件没有上传，请拆成多个较小的 ZIP，或改用“选择文件夹”。",
+  CENTRAL_DIRECTORY_OUT_OF_BOUNDS: "这个 ZIP 的内容不完整或已经损坏。文件没有上传，请重新压缩后再试，或改用“选择文件夹”。",
+  CENTRAL_DIRECTORY_TRUNCATED: "这个 ZIP 没有下载或复制完整。文件没有上传，请取得完整文件后再试。",
+  CENTRAL_DIRECTORY_INVALID: "这个 ZIP 无法正常打开。文件没有上传，请重新压缩后再试，或改用“选择文件夹”。",
+  READ_FAILED: "浏览器无法读取这个 ZIP。文件没有上传，请重试，或解压后改用“选择文件夹”。",
 } satisfies Record<ZipPdfPreflightRejectReason, string>;
 
 class ZipPreflightFailure extends Error {

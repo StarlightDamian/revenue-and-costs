@@ -501,6 +501,14 @@ describe("worker retry lifecycle", () => {
       terminal,
     )).resolves.toEqual({ status: "deadletter", output: { errorCode: "IMPORT_QUERY_INVALID" } });
     expect(terminal).not.toHaveBeenCalled();
+
+    const staleReplay = new Error("SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED");
+    expect(safeImportCommitFailureCode(staleReplay)).toBe("SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED");
+    await expect(runImportCommitJob(
+      { retryCount: 0, retryLimit: 5 },
+      async () => { throw staleReplay; },
+      terminal,
+    )).resolves.toEqual({ status: "deadletter", output: { errorCode: "SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED" } });
   });
 
   it("retries an unclassified import commit failure and projects it only when exhausted", async () => {
