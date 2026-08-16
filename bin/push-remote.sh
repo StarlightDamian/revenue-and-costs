@@ -70,14 +70,31 @@ cleanup() {
       rm -f "$current_database_manifest"
     fi
     if [[ "$database_matches_previous" == '1' ]]; then
+      rollback_failed=0
       if [[ "$(readlink -f "$current_link" 2>/dev/null)" == "$target/app" ]]; then
-        ln -s "$previous_app" "$rollback_link" && mv -Tf "$rollback_link" "$current_link"
+        if ln -s "$previous_app" "$rollback_link"; then
+          mv -Tf "$rollback_link" "$current_link" || rollback_failed=1
+        else
+          rollback_failed=1
+        fi
       fi
       if [[ "$services_stopped" == '1' ]]; then
-        restore_initial_service_state "$api_service" "$initial_api_state"
-        restore_initial_service_state "$worker_service" "$initial_worker_state"
+        restore_initial_service_state "$api_service" "$initial_api_state" || rollback_failed=1
+        restore_initial_service_state "$worker_service" "$initial_worker_state" || rollback_failed=1
       fi
-      echo "RELEASE_FAILED_ROLLED_BACK:$release_id" >&2
+      [[ "$(readlink -f "$current_link" 2>/dev/null)" == "$previous_app" ]] || rollback_failed=1
+      if [[ "$initial_api_state" == 'active' ]] && ! systemctl is-active --quiet "$api_service"; then
+        rollback_failed=1
+      fi
+      if [[ "$initial_worker_state" == 'active' ]] && ! systemctl is-active --quiet "$worker_service"; then
+        rollback_failed=1
+      fi
+      if [[ "$rollback_failed" == '0' ]]; then
+        echo "RELEASE_FAILED_ROLLED_BACK:$release_id" >&2
+      else
+        echo "RELEASE_FAILED_ROLLBACK_FAILED:$release_id" >&2
+        [[ "$status" != '0' ]] || status=1
+      fi
     else
     # The forward migration is committed and immutable. Keep both services
     # stopped; starting the previous code against the new schema is unsafe.
@@ -407,9 +424,13 @@ anonymous_me_once() {
 }
 
 worker_heartbeat_once() {
-  [[ "$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
-    -v started_at="$release_started_at" -c \
-    "SELECT EXISTS (SELECT 1 FROM job_operation WHERE business_key='service:worker' AND status='RUNNING' AND last_heartbeat_at > :'started_at'::timestamptz AND last_heartbeat_at >= clock_timestamp()-interval '30 seconds')")" == 't' ]]
+  local heartbeat_status
+  heartbeat_status="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
+    -v started_at="$release_started_at" -f - <<'WORKER_HEARTBEAT_SQL'
+SELECT EXISTS (SELECT 1 FROM job_operation WHERE business_key='service:worker' AND status='RUNNING' AND last_heartbeat_at > :'started_at'::timestamptz AND last_heartbeat_at >= clock_timestamp()-interval '30 seconds');
+WORKER_HEARTBEAT_SQL
+  )" || return 1
+  [[ "$heartbeat_status" == 't' ]]
 }
 
 connection_budget_once() {
