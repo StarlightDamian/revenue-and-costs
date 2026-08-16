@@ -121,6 +121,19 @@ describe("one-click code release guardrails", () => {
     expect(acceptancePassed).toBeGreaterThan(remote.indexOf("authenticated_me_once ||"));
   });
 
+  it("passes the release timestamp to the worker heartbeat query through psql stdin", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const heartbeat = remote.slice(
+      remote.indexOf("worker_heartbeat_once() {"),
+      remote.indexOf("connection_budget_once() {"),
+    );
+
+    expect(heartbeat).toContain('-v started_at="$release_started_at" -f - <<\'WORKER_HEARTBEAT_SQL\'');
+    expect(heartbeat).toContain("last_heartbeat_at > :'started_at'::timestamptz");
+    expect(heartbeat).toContain(')" || return 1');
+    expect(heartbeat).not.toMatch(/\s-c\s/gu);
+  });
+
   it("publishes the passed receipt only at an interruption-safe success boundary", async () => {
     const remote = await readFile("bin/push-remote.sh", "utf8");
     const preCommitMetadataCleanup = 'rm -f "$target/.release-migrations"';
@@ -256,6 +269,27 @@ describe("one-click code release guardrails", () => {
     expect(cleanup.slice(preStopGuard, databaseRollbackCheck)).toContain('exit "$status"');
     expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('systemctl stop "$api_service" "$worker_service"');
     expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('mv -Tf "$rollback_link" "$current_link"');
+  });
+
+  it("reports rollback success only after restoring current and every previously active service", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const cleanup = remote.slice(remote.indexOf("cleanup() {"), remote.indexOf("trap cleanup EXIT"));
+    const rollback = cleanup.slice(
+      cleanup.indexOf('if [[ "$database_matches_previous" == \'1\' ]]; then'),
+      cleanup.indexOf("# The forward migration is committed and immutable."),
+    );
+    const rollbackSuccess = rollback.indexOf('echo "RELEASE_FAILED_ROLLED_BACK:$release_id"');
+    const rollbackFailure = rollback.indexOf('echo "RELEASE_FAILED_ROLLBACK_FAILED:$release_id"');
+
+    expect(rollback).toContain("rollback_failed=0");
+    expect(rollback).toContain('restore_initial_service_state "$api_service" "$initial_api_state" || rollback_failed=1');
+    expect(rollback).toContain('restore_initial_service_state "$worker_service" "$initial_worker_state" || rollback_failed=1');
+    expect(rollback).toContain('[[ "$(readlink -f "$current_link" 2>/dev/null)" == "$previous_app" ]] || rollback_failed=1');
+    expect(rollback).toContain('if [[ "$initial_api_state" == \'active\' ]] && ! systemctl is-active --quiet "$api_service"; then');
+    expect(rollback).toContain('if [[ "$initial_worker_state" == \'active\' ]] && ! systemctl is-active --quiet "$worker_service"; then');
+    expect(rollbackSuccess).toBeGreaterThan(rollback.indexOf('if [[ "$rollback_failed" == \'0\' ]]; then'));
+    expect(rollbackFailure).toBeGreaterThan(rollbackSuccess);
+    expect(rollback.slice(rollbackFailure)).toContain('[[ "$status" != \'0\' ]] || status=1');
   });
 
   it("fails closed when remote current differs from the expected active release", async () => {
