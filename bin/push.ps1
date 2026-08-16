@@ -312,7 +312,7 @@ try {
 
   Write-Host '[5/5] Remote backup, atomic switch, health checks, and automatic code rollback'
   Assert-GitReleaseCommit $gitCommit
-  $remoteCommand = "chmod 700 '$incoming/push-$releaseId.sh.partial' && bash '$incoming/push-$releaseId.sh.partial' '$releaseId' '$incoming/release-$releaseId.tar.gz.partial' '$appSha' '$incoming/dependencies-$releaseId.tar.gz.partial' '$dependencySha' '$remoteRoot' '$configRoot' '$nodeRoot' '$apiService' '$workerService' '$databaseName' '$apiPort' '$publicUrl' '$gitCommit'"
+  $remoteCommand = "chmod 700 '$incoming/push-$releaseId.sh.partial' && bash '$incoming/push-$releaseId.sh.partial' '$releaseId' '$incoming/release-$releaseId.tar.gz.partial' '$appSha' '$incoming/dependencies-$releaseId.tar.gz.partial' '$dependencySha' '$remoteRoot' '$configRoot' '$nodeRoot' '$apiService' '$workerService' '$databaseName' '$apiPort' '$publicUrl' '$gitCommit' '$activeRelease'"
   Invoke-Native 'ssh.exe' ($sshOptions + @($target, $remoteCommand))
 
   $receipt.deploymentAcceptance = 'passed'

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-[[ "$#" -eq 14 ]] || { echo 'REMOTE_ARGUMENTS_INVALID' >&2; exit 64; }
+[[ "$#" -eq 15 ]] || { echo 'REMOTE_ARGUMENTS_INVALID' >&2; exit 64; }
 release_id="$1"; app_archive="$2"; app_sha="$3"; dependency_archive="$4"; dependency_sha="$5"
 root="$6"; config_root="$7"; node_root="$8"; api_service="$9"; worker_service="${10}"
 database_name="${11}"; api_port="${12}"; public_url="${13%/}"
 git_commit="${14}"
+expected_current_release="${15}"
 
 [[ "$(id -u)" == '0' ]] || { echo 'REMOTE_ROOT_REQUIRED' >&2; exit 77; }
 [[ "$release_id" =~ ^[0-9]{8}-[0-9]{6}$ ]] || { echo 'RELEASE_ID_INVALID' >&2; exit 64; }
@@ -16,6 +17,7 @@ git_commit="${14}"
 [[ "$public_url" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$ ]] || { echo 'PUBLIC_URL_INVALID' >&2; exit 64; }
 [[ "$app_sha" =~ ^[a-f0-9]{64}$ && "$dependency_sha" =~ ^[a-f0-9]{64}$ ]] || { echo 'ARCHIVE_SHA_INVALID' >&2; exit 64; }
 [[ "$git_commit" =~ ^[a-f0-9]{40}$ ]] || { echo 'GIT_COMMIT_INVALID' >&2; exit 64; }
+[[ "$expected_current_release" =~ ^[0-9]{8}-[0-9]{6}$ ]] || { echo 'EXPECTED_CURRENT_RELEASE_INVALID' >&2; exit 64; }
 umask 027
 
 target="$root/releases/$release_id"
@@ -24,7 +26,8 @@ current_link="$root/current"
 backup_root='/var/backups/revenue-and-costs'
 backup_path="$backup_root/pre-release-$release_id.dump"
 backup_partial="$backup_path.partial"
-previous_app="$(readlink -f "$current_link")"
+previous_app="$(readlink -f "$current_link" 2>/dev/null || true)"
+expected_previous_app="$root/releases/$expected_current_release/app"
 next_link="$root/.current-$release_id"
 rollback_link="$root/.current-rollback-$release_id"
 services_stopped=0; switched=0; success=0; cleanup_running=0
@@ -50,6 +53,10 @@ cleanup() {
   set +e
   rm -f "$next_link" "$rollback_link" "$backup_partial"
   if [[ "$success" != '1' ]]; then
+    if [[ "$services_stopped" != '1' ]]; then
+      echo "RELEASE_FAILED_BEFORE_SERVICE_STOP:$release_id" >&2
+      exit "$status"
+    fi
     database_matches_previous=0
     if [[ -f "$staging/.previous-migrations" || -f "$target/.previous-migrations" ]]; then
       release_state="$staging"
@@ -95,6 +102,7 @@ trap 'exit 143' TERM
 
 fail() { echo "$1" >&2; return 1; }
 [[ -d "$previous_app" && -f "$previous_app/package.json" && -f "$previous_app/pnpm-lock.yaml" ]] || fail 'CURRENT_RELEASE_MISSING'
+[[ "$previous_app" == "$expected_previous_app" ]] || fail 'CURRENT_RELEASE_MISMATCH'
 [[ ! -e "$target" && ! -e "$staging" ]] || fail 'TARGET_RELEASE_EXISTS'
 [[ -f "$app_archive" && -f "$dependency_archive" ]] || fail 'UPLOAD_PARTIAL_MISSING'
 [[ "$(sha256sum "$app_archive" | awk '{print $1}')" == "$app_sha" ]] || fail 'APP_ARCHIVE_HASH_MISMATCH'

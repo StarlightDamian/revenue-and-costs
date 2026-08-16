@@ -88,8 +88,9 @@ describe("one-click code release guardrails", () => {
     expect(script).toContain("deploymentAcceptance = 'passed'");
     expect(script).toContain("$dependencySha");
     expect(script).toContain("$gitCommit");
-    expect(remote).toContain('[[ "$#" -eq 14 ]]');
+    expect(remote).toContain('[[ "$#" -eq 15 ]]');
     expect(remote).toContain('git_commit="${14}"');
+    expect(remote).toContain('expected_current_release="${15}"');
     expect(remote).toContain('[[ "$git_commit" =~ ^[a-f0-9]{40}$ ]]');
     expect(remote).toContain('receipt="$staging/.release-receipt.json"');
     expect(remote).toContain("revenue-costs-release-receipt-v1");
@@ -205,6 +206,30 @@ describe("one-click code release guardrails", () => {
     expect(remote.indexOf("umask 027")).toBeLessThan(remote.indexOf('migration_manifest "$previous_app/migrations"'));
     expect(remote).toContain("payload.service !== \"api\"");
     expect(remote).toContain("setfacl -R -m u:www:r-X");
+  });
+
+  it("does not stop services or switch current while handling a pre-stop failure", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const cleanup = remote.slice(remote.indexOf("cleanup() {"), remote.indexOf("trap cleanup EXIT"));
+    const preStopGuard = cleanup.indexOf('if [[ "$services_stopped" != \'1\' ]]; then');
+    const databaseRollbackCheck = cleanup.indexOf("database_matches_previous=0");
+
+    expect(preStopGuard).toBeGreaterThan(0);
+    expect(preStopGuard).toBeLessThan(databaseRollbackCheck);
+    expect(cleanup.slice(preStopGuard, databaseRollbackCheck)).toContain('exit "$status"');
+    expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('systemctl stop "$api_service" "$worker_service"');
+    expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('mv -Tf "$rollback_link" "$current_link"');
+  });
+
+  it("fails closed when remote current differs from the expected active release", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const currentGate = '[[ "$previous_app" == "$expected_previous_app" ]] || fail \'CURRENT_RELEASE_MISMATCH\'';
+
+    expect(script).toContain("'$gitCommit' '$activeRelease'");
+    expect(remote).toContain('expected_previous_app="$root/releases/$expected_current_release/app"');
+    expect(remote).toContain(currentGate);
+    expect(remote.indexOf(currentGate)).toBeLessThan(remote.indexOf('validate_archive "$app_archive"'));
   });
 
   it("allows script-only package changes that cannot run during install", async () => {
