@@ -78,6 +78,18 @@ describe("one-click code release guardrails", () => {
     expect(script.match(/Assert-GitReleaseCommit \$gitCommit/gu)).toHaveLength(2);
   });
 
+  it("limits SSH negotiation and bounds every authenticated transfer", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+    const strictOptions = script.slice(script.indexOf("$strictOptions = @("), script.indexOf("$sshOptions = @("));
+
+    expect(script).toContain("ssh-keyscan.exe -p $sshPort -t ed25519 $hostName");
+    expect(strictOptions).toContain("'ConnectTimeout=10'");
+    expect(strictOptions).toContain("'ServerAliveInterval=5'");
+    expect(strictOptions).toContain("'ServerAliveCountMax=2'");
+    expect(script).toContain("$sshOptions = @('-p', $sshPort) + $strictOptions");
+    expect(script).toContain("$scpOptions = @('-P', $sshPort) + $strictOptions");
+  });
+
   it("persists the Git and archive provenance locally and in the remote release", async () => {
     const script = await readFile("bin/push.ps1", "utf8");
     const remote = await readFile("bin/push-remote.sh", "utf8");
@@ -269,6 +281,25 @@ describe("one-click code release guardrails", () => {
     expect(cleanup.slice(preStopGuard, databaseRollbackCheck)).toContain('exit "$status"');
     expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('systemctl stop "$api_service" "$worker_service"');
     expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('mv -Tf "$rollback_link" "$current_link"');
+  });
+
+  it("takes one fixed remote release lock before observing or mutating deployment state", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const lockPath = "release_lock='/run/lock/revenue-costs-release.lock'";
+    const commandGate = "command -v flock >/dev/null 2>&1 && command -v stat >/dev/null 2>&1";
+    const lockAcquire = "if flock -n -E 75 9; then";
+    const previousApp = 'previous_app="$(readlink -f "$current_link" 2>/dev/null || true)"';
+    const initialServiceState = 'initial_api_state="$(systemctl show --property=ActiveState --value "$api_service")"';
+
+    for (const marker of [lockPath, commandGate, lockAcquire, previousApp, initialServiceState]) {
+      expect(remote).toContain(marker);
+    }
+    expect(remote.indexOf(lockPath)).toBeLessThan(remote.indexOf('target="$root/releases/$release_id"'));
+    expect(remote.indexOf(lockAcquire)).toBeLessThan(remote.indexOf(previousApp));
+    expect(remote.indexOf(lockAcquire)).toBeLessThan(remote.indexOf(initialServiceState));
+    expect(remote).toContain("{ echo 'RELEASE_LOCK_UNAVAILABLE' >&2; exit 69; }");
+    expect(remote).toContain("echo 'RELEASE_ALREADY_IN_PROGRESS' >&2\n    exit 75");
+    expect(remote).toContain("{ echo 'RELEASE_LOCK_OWNER_INVALID' >&2; exit 77; }");
   });
 
   it("reports rollback success only after restoring current and every previously active service", async () => {

@@ -20,6 +20,24 @@ expected_current_release="${15}"
 [[ "$expected_current_release" =~ ^[0-9]{8}-[0-9]{6}$ ]] || { echo 'EXPECTED_CURRENT_RELEASE_INVALID' >&2; exit 64; }
 umask 027
 
+release_lock='/run/lock/revenue-costs-release.lock'
+command -v flock >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 ||
+  { echo 'RELEASE_LOCK_UNAVAILABLE' >&2; exit 69; }
+exec 9>>"$release_lock" || { echo 'RELEASE_LOCK_UNAVAILABLE' >&2; exit 69; }
+if flock -n -E 75 9; then
+  release_lock_owner="$(stat -Lc '%u' -- "/proc/$$/fd/9" 2>/dev/null || true)"
+  [[ "$release_lock_owner" == '0' ]] || { echo 'RELEASE_LOCK_OWNER_INVALID' >&2; exit 77; }
+else
+  release_lock_status=$?
+  exec 9>&-
+  if [[ "$release_lock_status" == '75' ]]; then
+    echo 'RELEASE_ALREADY_IN_PROGRESS' >&2
+    exit 75
+  fi
+  echo 'RELEASE_LOCK_UNAVAILABLE' >&2
+  exit 69
+fi
+
 target="$root/releases/$release_id"
 staging="$root/releases/.$release_id.partial"
 current_link="$root/current"
