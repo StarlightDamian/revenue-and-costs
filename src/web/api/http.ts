@@ -20,6 +20,10 @@ export function isApiErrorCode(error: unknown, code: string): error is ApiError 
   return error instanceof ApiError && error.code === code;
 }
 
+export function userFacingError(error: unknown, fallback = "操作没有成功，请检查网络后重试"): string {
+  return error instanceof ApiError && /\p{Script=Han}/u.test(error.message) ? error.message : fallback;
+}
+
 function idempotencyKey(): string {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }

@@ -92,7 +92,19 @@ describe("单文件上传失败恢复", () => {
     });
   });
 
-  it("标记失败文件、继续其余文件，重试时跳过已完成文件并按服务端 offset 续传", async () => {
+  it("all upload status messages avoid internal terms", () => {
+    const messages = [
+      uploadFailureMessage(1),
+      ...[
+        [{ state: "failed" as const }],
+        [{ state: "skipped" as const }, { state: "complete" as const }],
+        [{ state: "complete" as const }],
+      ].flatMap((items) => Object.values(uploadBatchConclusion(items))),
+    ].join(" ");
+    expect(messages).not.toMatch(/预检|入库|阻断|相对路径|制表符|原生选择器|切片|诊断|offset|分片|批次/u);
+  });
+
+  it("标记失败文件、继续其余文件，重试时跳过已完成文件并从服务器确认的位置续传", async () => {
     const first = { ...item("first.csv", "abcd"), initialOffset: "0" };
     const second = { ...item("second.csv", "xy"), initialOffset: "0" };
     const chunks: string[] = [];
@@ -115,6 +127,8 @@ describe("单文件上传失败恢复", () => {
     expect(chunks).toContain(`remote-${second.path}:0:2`);
     expect(getOffset).not.toHaveBeenCalled();
     expect(uploadFailureMessage(failed.failed)).toContain("继续上传");
+    expect(uploadFailureMessage(failed.failed)).toContain("上次成功的位置");
+    expect(uploadFailureMessage(failed.failed)).not.toContain("offset");
 
     chunks.length = 0;
     const retried = await uploadFilesContinuing([first, second], { chunkBytes: 2, fileConcurrency: 4, getOffset, uploadChunk });
@@ -148,7 +162,7 @@ describe("单文件上传失败恢复", () => {
       uploadChunk: async (_remoteId, offset, chunk) => ({ offset: String(Number(offset) + chunk.size) }),
     });
     expect(result).toEqual({ completed: 1, failed: 1 });
-    expect(broken.error).toBe("服务端返回了无效的上传 offset");
+    expect(broken.error).toBe("服务器返回的上传位置不正确，请重新选择该文件后再试");
     expect(healthy.state).toBe("complete");
   });
 

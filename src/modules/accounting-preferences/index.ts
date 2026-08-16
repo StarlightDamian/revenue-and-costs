@@ -78,7 +78,9 @@ export function normalizeAccountingAssumptions(input: AccountingAssumptions): Ac
   };
 }
 
-export function normalizeAccountingPreferences(input: AccountingPreferences): AccountingPreferences {
+export function normalizeAccountingPreferences(
+  input: AccountingAssumptions & { readonly continentPrefixes: readonly string[] },
+): AccountingPreferences {
   return {
     ...normalizeAccountingAssumptions(input),
     continentPrefixes: normalizeContinentPrefixes(input.continentPrefixes),
@@ -117,6 +119,32 @@ export interface AccountingPreferencesService {
   update(actor: Actor, preferences: AccountingPreferences, requestId: string): Promise<AccountingPreferences>;
 }
 
+interface AccountingPreferencesRow extends Record<string, unknown> {
+  readonly profit_rate: string | null;
+  readonly minimum_sales_cost_rate: string | null;
+  readonly continent_prefixes: string[];
+}
+
+export async function findAccountingPreferences(
+  client: SqlClient,
+  accountId: string,
+): Promise<AccountingPreferences | null> {
+  const result = await client.query<AccountingPreferencesRow>(
+    `SELECT accounting_profit_rate::text AS profit_rate,
+            minimum_sales_cost_rate::text AS minimum_sales_cost_rate,
+            accounting_continent_prefixes AS continent_prefixes
+       FROM account
+      WHERE id=$1`,
+    [accountId],
+  );
+  const row = result.rows[0];
+  return row ? normalizeAccountingPreferences({
+    profitRate: row.profit_rate,
+    minimumSalesCostRate: row.minimum_sales_cost_rate,
+    continentPrefixes: row.continent_prefixes,
+  }) : null;
+}
+
 export class PostgresAccountingPreferencesService implements AccountingPreferencesService {
   constructor(
     private readonly reader: SqlClient,
@@ -125,25 +153,9 @@ export class PostgresAccountingPreferencesService implements AccountingPreferenc
   ) {}
 
   async get(accountId: string): Promise<AccountingPreferences> {
-    const result = await this.reader.query<{
-      profit_rate: string | null;
-      minimum_sales_cost_rate: string | null;
-      continent_prefixes: string[];
-    }>(
-      `SELECT accounting_profit_rate::text AS profit_rate,
-              minimum_sales_cost_rate::text AS minimum_sales_cost_rate,
-              accounting_continent_prefixes AS continent_prefixes
-         FROM account
-        WHERE id=$1`,
-      [accountId],
-    );
-    const row = result.rows[0];
-    if (!row) throw new AppError("RESOURCE_NOT_FOUND", "资源不存在或无权访问", 404);
-    return normalizeAccountingPreferences({
-      profitRate: row.profit_rate,
-      minimumSalesCostRate: row.minimum_sales_cost_rate,
-      continentPrefixes: normalizeContinentPrefixes(row.continent_prefixes),
-    });
+    const preferences = await findAccountingPreferences(this.reader, accountId);
+    if (!preferences) throw new AppError("RESOURCE_NOT_FOUND", "资源不存在或无权访问", 404);
+    return preferences;
   }
 
   async update(actor: Actor, rawPreferences: AccountingPreferences, requestId: string): Promise<AccountingPreferences> {

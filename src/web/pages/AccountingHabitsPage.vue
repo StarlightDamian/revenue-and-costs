@@ -2,6 +2,7 @@
 import { onMounted, ref } from "vue";
 import { percentInputToRatio, ratioToPercentInput } from "../accounting-rates";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import AsyncState from "../components/AsyncState.vue";
 import PageHeader from "../components/PageHeader.vue";
 
@@ -19,6 +20,14 @@ const continentOptions = [
 ] as const;
 const saving = ref(false);
 const saveMessage = ref("");
+const accountingRateErrorText = (caught: unknown) => {
+  if (!(caught instanceof Error)) return userFacingError(caught, "暂时无法保存做账习惯，请检查网络后重试");
+  const invalidNumber = /^(利润率|最低销售成本率)请输入非负十进制百分比$/u.exec(caught.message);
+  if (invalidNumber) return `请为${invalidNumber[1]}输入 0 到 100 之间的数字`;
+  return /^(利润率|最低销售成本率)(最多保留 6 位小数|必须在 0% 到 100% 之间)$/u.test(caught.message)
+    ? caught.message
+    : userFacingError(caught, "暂时无法保存做账习惯，请检查网络后重试");
+};
 
 async function load() {
   status.value = "loading";
@@ -30,7 +39,7 @@ async function load() {
     continentPrefixes.value = [...preferences.continentPrefixes];
     status.value = "ready";
   } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "读取做账习惯失败";
+    error.value = userFacingError(caught, "暂时无法读取做账习惯，请检查网络后重试");
     status.value = "error";
   }
 }
@@ -49,7 +58,7 @@ async function save() {
     continentPrefixes.value = [...saved.continentPrefixes];
     saveMessage.value = "做账习惯已保存";
   } catch (caught) {
-    saveMessage.value = caught instanceof Error ? caught.message : "保存做账习惯失败";
+    saveMessage.value = accountingRateErrorText(caught);
   } finally {
     saving.value = false;
   }
@@ -86,7 +95,7 @@ onMounted(() => { void load(); });
           <label class="form-field">
             <span>最低销售成本率（可选）</span>
             <span class="suffix-input"><input v-model="minimumSalesCostRate" inputmode="decimal" autocomplete="off" placeholder="例如 15" /><b>%</b></span>
-            <small>低于下限时提高采购成本，并相应降低利润以保持勾稽一致。</small>
+            <small>算出的销售成本率低于这个数时，系统会把采购成本提高到这个比例，并重新计算利润，保证各项金额能对得上。</small>
           </label>
         </div>
         <div class="form-actions">
@@ -95,7 +104,7 @@ onMounted(() => { void load(); });
         </div>
       </section>
       <section class="surface-section">
-        <div class="section-heading"><h2>计算顺序</h2><p>最低销售成本率是约束，触发时优先于目标利润率。</p></div>
+        <div class="section-heading"><h2>系统怎样计算</h2><p>如果设置了最低销售成本率，系统会先保证采购成本不低于这个比例，再计算最终利润。</p></div>
         <ol class="calculation-steps">
           <li>利润率为空时沿用平台结余作为利润，采购成本保持 0。</li>
           <li>填写利润率后，先计算目标利润与基础采购成本。</li>

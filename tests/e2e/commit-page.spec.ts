@@ -33,7 +33,7 @@ const preview = {
     { relativePath: "notes.pdf", reason: "LIST_ONLY" },
     { relativePath: "unknown.csv", reason: "UNKNOWN_STRUCTURE" },
   ],
-  issues: [{ id: "issue-1", kind: "UNKNOWN_STRUCTURE_EXCLUDED", severity: "WARNING", count: 1, exactCount: true, message: "未识别文件结构，文件已过滤", action: "请检查源文件。" }],
+  issues: [{ id: "issue-1", kind: "UNKNOWN_STRUCTURE_EXCLUDED", severity: "WARNING", count: 1, exactCount: true, message: "系统看不懂这个表格，每一列代表什么还不清楚", action: "这个文件没有用于计算。请联系管理员确认表格每一列代表什么，然后重新上传。" }],
   affectedVersions: [],
 };
 
@@ -44,7 +44,7 @@ const completeness = [
   { sliceId: "slice-ae", datasetVersionId: "version-ae", marketplace: "AE", month: "2025-11", state: "MISSING_SHIPMENT", missingReports: ["SHIPMENT"] },
 ];
 
-test("资料准备页只展示缺失月份，并在当前页确认阻断", async ({ page }, testInfo) => {
+test("资料准备页用白话说明缺少的资料和处理方法", async ({ page }, testInfo) => {
   let acknowledged = 0;
   let confirmed = 0;
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
@@ -83,16 +83,18 @@ test("资料准备页只展示缺失月份，并在当前页确认阻断", async
   await page.goto(`/shops/${shopId}/workflow/commit`);
 
   const blocker = page.getByRole("alertdialog", { name: "资料缺失，等待处理" });
+  await expect(blocker).toContainText("处理编号");
   await expect(blocker).toContainText("I0000000000000000000009");
+  await expect(blocker).not.toContainText(/阻断|切片|诊断/u);
   await blocker.getByRole("button", { name: "我知道了" }).click();
   await expect(page.getByRole("heading", { name: "资料准备" })).toBeVisible();
   await expect(page.locator("input[webkitdirectory]")).toHaveCount(1);
   await expect(page.getByText("选择文件夹", { exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "拖放文件夹或文件" })).toContainText("拖入文件夹");
-  await expect(page.getByRole("heading", { name: "站点 × 月份资料完整性" })).toBeVisible();
-  await expect(page.locator(".commit-summary > div").filter({ hasText: "可识别文件" })).toContainText("2");
-  await expect(page.locator(".commit-summary > div").filter({ hasText: "过滤文件" })).toContainText("2");
-  const table = page.getByRole("region", { name: "站点月份资料完整性" });
+  await expect(page.getByRole("heading", { name: "缺少资料的站点和月份" })).toBeVisible();
+  await expect(page.locator(".commit-summary > div").filter({ hasText: "可用于计算" })).toContainText("2");
+  await expect(page.locator(".commit-summary > div").filter({ hasText: "未参与计算" })).toContainText("2");
+  const table = page.getByRole("region", { name: "缺少资料的站点和月份" });
   await expect(table.locator("tbody tr")).toHaveCount(3);
   await expect(table.locator("tbody tr").first()).toHaveAttribute("data-missing", "true");
   await expect(table.locator(".missing-data-chip")).toHaveCount(3);
@@ -100,11 +102,21 @@ test("资料准备页只展示缺失月份，并在当前页确认阻断", async
   await expect(table.locator(".missing-data-chip").nth(1)).toContainText("缺少交易报告");
   await expect(table.locator(".missing-data-chip").nth(2)).toContainText("缺少配送货件");
   await expect(table).not.toContainText("US");
-  await expect(page.getByRole("heading", { name: "需要确认排除缺失切片" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "确认不计算缺少资料的项目" })).toBeVisible();
   await expect(page.locator(".workflow-commit-panel > .commit-coverage-table table")).toHaveCount(1);
   await expect(page.locator("details.preflight-detail")).not.toHaveAttribute("open", "");
+  await page.locator("details.preflight-detail").click();
+  await expect(page.getByRole("cell", { name: "交易报告", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "配送货件", exact: true })).toBeVisible();
+  await expect(page.locator(".workflow-stage-page")).not.toContainText(/PARSED|LIST_ONLY|UNKNOWN_STRUCTURE_EXCLUDED/u);
+  await expect(page.locator(".workflow-stage-page")).not.toContainText(/预检|入库|阻断|相对路径|制表符|原生选择器|offset|切片|口径/u);
+  await expect(page.locator(".workflow-stage-page")).toContainText("从表格软件导出的 TXT");
 
-  await page.getByRole("button", { name: "确认排除并继续" }).click();
+  const evidenceDirectory = resolve(".work/evidence/commit-single-page");
+  await mkdir(evidenceDirectory, { recursive: true });
+  await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
+
+  await page.getByRole("button", { name: "确认不计算并继续" }).click();
   await expect.poll(() => acknowledged).toBe(3);
   await expect.poll(() => confirmed).toBe(1);
   await expect(page).toHaveURL(new RegExp(`/shops/${shopId}/workflow/commit`));
@@ -112,12 +124,9 @@ test("资料准备页只展示缺失月份，并在当前页确认阻断", async
   await page.goto(`/shops/${shopId}/workflow/receive`);
   await expect(page).toHaveURL(new RegExp(`/shops/${shopId}/workflow/commit$`));
 
-  const evidenceDirectory = resolve(".work/evidence/commit-single-page");
-  await mkdir(evidenceDirectory, { recursive: true });
-  await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
 });
 
-test("资料完整时不展示月份行，并给出两类报告齐全反馈", async ({ page }) => {
+test("资料可核算时不展示月份行，并给出来源覆盖反馈", async ({ page }) => {
   const completePreview = { ...preview, status: "PUBLISHED", stage: "RESULT_PUBLISHED", failureCode: null };
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
   await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{
@@ -140,20 +149,29 @@ test("资料完整时不展示月份行，并给出两类报告齐全反馈", as
   ]) }));
 
   await page.goto(`/shops/${shopId}/workflow/commit`);
-  await expect(page.getByRole("region", { name: "站点月份资料完整性" })).toHaveCount(0);
-  const completeState = page.locator(".workflow-commit-panel .warning-panel[data-tone='success']").filter({ hasText: "资料已齐全" });
-  await expect(completeState.getByText("资料已齐全", { exact: true })).toBeVisible();
-  await expect(completeState.getByText("当前站点与月份均同时包含交易报告和配送货件，可以继续核算。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "缺少资料的站点和月份" })).toHaveCount(0);
+  const completeState = page.locator(".workflow-commit-panel .warning-panel[data-tone='success']").filter({ hasText: "资料已可核算" });
+  await expect(completeState.getByText("资料已可核算", { exact: true })).toBeVisible();
+  await expect(completeState.getByText("配送货件或纯 FMB 交易资料已覆盖当前站点和月份，可以继续核算。", { exact: true })).toBeVisible();
 });
 
 test("上传前可连续追加文件夹和文件，并以最后一次选择解决同路径冲突", async ({ page }, testInfo) => {
   let uploadBatchRequests = 0;
+  let completeUploadRequests = 0;
   let uploadedPaths: string[] = [];
   let failNextChunk = true;
   let restoredPreviewRequests = 0;
   let releaseRestoredPreview!: () => void;
   const restoredPreviewGate = new Promise<void>((resolveGate) => { releaseRestoredPreview = resolveGate; });
   const restoredPreview = { id: batchId, status: "READY", progress: "100", stage: "PREFLIGHT_READY", failureCode: null, files: [], ignored: [], issues: [], affectedVersions: [] };
+  const currentRestoredPreview = () => completeUploadRequests === 1 ? {
+    ...restoredPreview,
+    status: "RUNNING",
+    progress: "0",
+    stage: "UPLOAD",
+    uploadBatchId: batchId,
+    uploadReady: true,
+  } : restoredPreview;
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
   await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{
     id: shopId, enterpriseId, createdByAccountId: me.id, lastOperatedByAccountId: me.id,
@@ -167,7 +185,7 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
     latestBatch: null,
     download: { available: false, usesPreviousPublishedVersion: false },
   }) }));
-  await page.route(`**/api/v1/imports/shops/${shopId}/batches/latest`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(restoredPreview) }));
+  await page.route(`**/api/v1/imports/shops/${shopId}/batches/latest`, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentRestoredPreview()) }));
   await page.route("**/api/v1/uploads/batches", async (route) => {
     uploadBatchRequests += 1;
     if (uploadBatchRequests === 1) {
@@ -194,15 +212,22 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
     const bytes = Number(headers["upload-uncompressed-length"] ?? route.request().postDataBuffer()?.length ?? 0);
     return route.fulfill({ status: 204, headers: { "Upload-Offset": String(offset + bytes), "Tus-Resumable": "1.0.0" } });
   });
-  await page.route(`**/api/v1/uploads/batches/${batchId}/complete`, (route) => route.fulfill({
-    status: 202,
-    contentType: "application/json",
-    body: JSON.stringify({ id: batchId, status: "QUEUED" }),
-  }));
+  await page.route(`**/api/v1/uploads/batches/${batchId}/complete`, (route) => {
+    completeUploadRequests += 1;
+    return route.fulfill(completeUploadRequests === 1 ? {
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ code: "TEMPORARY_UNAVAILABLE", message: "temporary unavailable" }),
+    } : {
+      status: 202,
+      contentType: "application/json",
+      body: JSON.stringify({ id: batchId, status: "QUEUED" }),
+    });
+  });
   await page.route(`**/api/v1/imports/shops/${shopId}/batches/${batchId}`, async (route) => {
     restoredPreviewRequests += 1;
     if (restoredPreviewRequests === 1) await restoredPreviewGate;
-    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(restoredPreview) });
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(currentRestoredPreview()) });
   });
   await page.route("**/api/v1/imports/completeness?**", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
 
@@ -224,7 +249,7 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
   releaseRestoredPreview();
   await expect(folderInput).toBeEnabled();
   await expect(fileInput).toBeEnabled();
-  await expect(page.getByRole("heading", { name: "当前批次" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "本次资料" })).toBeVisible();
 
   await folderInput.setInputFiles(usFolder);
 
@@ -248,6 +273,10 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
 
   await page.getByRole("button", { name: "开始上传" }).click();
   await expect.poll(() => uploadBatchRequests).toBe(1);
+  await expect(page.getByRole("alert")).toContainText("现在无法开始上传");
+  await expect(page.getByRole("alert")).toContainText("重试开始上传");
+  await expect(page.getByRole("alert")).not.toContainText("继续上传");
+  await expect(page.getByRole("alert")).not.toContainText("temporary unavailable");
   await expect(page.getByRole("button", { name: "重试开始上传" })).toBeVisible();
   await page.getByRole("button", { name: "重试开始上传" }).click();
   await expect.poll(() => uploadBatchRequests).toBe(2);
@@ -256,6 +285,13 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
   await expect(fileInput).toBeDisabled();
   expect([...uploadedPaths].sort()).toEqual(["US/transaction.csv", "DE/transaction.csv", "DE/shipment.csv", "notes.pdf"].sort());
   await page.getByRole("button", { name: "继续上传" }).click();
-  await expect(page.getByRole("heading", { name: "当前批次" })).toBeVisible();
+  await expect.poll(() => completeUploadRequests).toBe(1);
+  await expect(page.getByRole("alert")).toContainText("文件已经上传");
+  await expect(page.getByRole("alert")).not.toContainText("temporary unavailable");
+  await page.reload();
+  await expect(page.getByRole("alert")).toContainText("文件已经上传");
+  await page.getByRole("button", { name: "重新检查已上传文件" }).click();
+  await expect.poll(() => completeUploadRequests).toBe(2);
+  await expect(page.getByRole("heading", { name: "本次资料" })).toBeVisible();
   expect(uploadBatchRequests).toBe(2);
 });

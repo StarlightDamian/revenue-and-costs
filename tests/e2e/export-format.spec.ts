@@ -61,8 +61,8 @@ test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分�
       total: { incomeTotalCny: "0", netIncomeCny: "0", platformExpensesCny: "0", targetProfitCny: null, profitCny: "0", procurementCny: "0", salesCostRate: "0", minimumAdjusted: false },
     }),
   }));
-  const current = { id: "80000000-0000-4000-8000-000000000019", shopId, snapshotId, status: "SUCCEEDED", progress: "100", format: "XLSX", isCurrentFormat: true, profitRate: null, minimumSalesCostRate: null, createdAt: "2026-08-02T13:00:00.000Z" };
-  const legacy = { id: "80000000-0000-4000-8000-000000000018", shopId, snapshotId, status: "SUCCEEDED", progress: "100", format: "XLSX", isCurrentFormat: false, profitRate: null, minimumSalesCostRate: null, createdAt: "2026-08-02T11:00:00.000Z" };
+  const current = { id: "80000000-0000-4000-8000-000000000019", shopId, snapshotId, status: "SUCCEEDED", progress: "100", stage: "SUCCEEDED", processedRows: "0", totalRows: null, heartbeatAt: null, format: "XLSX", isCurrentFormat: true, profitRate: null, minimumSalesCostRate: null, createdAt: "2026-08-02T13:00:00.000Z" };
+  const legacy = { id: "80000000-0000-4000-8000-000000000018", shopId, snapshotId, status: "SUCCEEDED", progress: "100", stage: "SUCCEEDED", processedRows: "0", totalRows: null, heartbeatAt: null, format: "XLSX", isCurrentFormat: false, profitRate: null, minimumSalesCostRate: null, createdAt: "2026-08-02T11:00:00.000Z" };
   await page.route(`**/api/v1/exports?shopId=${shopId}`, (route) => route.fulfill({
     status: 200,
     contentType: "application/json",
@@ -84,7 +84,7 @@ test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分�
   const onboarding = page.locator("body > .onboarding-overlay");
   await expect(onboarding).toHaveCount(0);
   expect(onboardingRequests).toBe(0);
-  const sheetList = page.getByRole("list", { name: "导出工作簿结构" });
+  const sheetList = page.getByRole("list", { name: "报告包含的表格" });
   await expect(sheetList.getByRole("listitem")).toHaveCount(5);
   await expect(sheetList).toContainText("成本核算表-人民币");
   await expect(sheetList).not.toContainText("完整性检查");

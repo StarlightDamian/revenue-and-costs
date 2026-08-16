@@ -1,4 +1,5 @@
 import { onMounted, ref, type Ref } from "vue";
+import { userFacingError } from "../api/http";
 
 export function useAsyncResource<T>(loader: () => Promise<T>): {
   data: Ref<T | null>;
@@ -22,7 +23,7 @@ export function useAsyncResource<T>(loader: () => Promise<T>): {
       status.value = Array.isArray(result) && result.length === 0 ? "empty" : "ready";
     } catch (caught) {
       if (request !== latestRequest) return;
-      error.value = caught instanceof Error ? caught.message : "读取失败，请稍后重试";
+      error.value = userFacingError(caught, "暂时无法读取内容，请检查网络后重试");
       status.value = "error";
     }
   }

@@ -67,7 +67,8 @@ describe("workflow blocker presentation", () => {
     });
 
     expect(workflowBlockerPresentation(input, false)).toMatchObject({
-      title: "预检解析被阻断",
+      title: "当前处理已暂停",
+      message: expect.not.stringContaining("预检"),
       action: { label: "查看资料准备", to: "/shops/shop-1/workflow/commit" },
     });
   });
@@ -77,7 +78,7 @@ describe("workflow blocker presentation", () => {
 
     expect(workflowBlockerPresentation(input, false)).toMatchObject({
       title: "后台处理服务暂不可用",
-      message: expect.stringContaining("请稍后重试或联系管理员，并提供诊断 ID"),
+      message: expect.stringContaining("请把处理编号发给管理员"),
     });
   });
 
@@ -88,8 +89,8 @@ describe("workflow blocker presentation", () => {
     });
 
     expect(workflowBlockerPresentation(input, false)).toMatchObject({
-      title: "后台任务恢复受阻",
-      message: expect.stringContaining("当前流程已明确标记为阻断"),
+      title: "后台处理暂时无法恢复",
+      message: expect.stringContaining("系统已经暂停"),
     });
     expect(workflowBlockerPresentation(input, false)?.key).toContain("TERMINAL_RECOVERY_BLOCKED");
   });
@@ -123,5 +124,17 @@ describe("workflow blocker presentation", () => {
     });
 
     expect(workflowBlockerPresentation(input, false)).toBeNull();
+  });
+
+  it("does not expose an unknown internal failure code", () => {
+    const input = workflow({
+      latestBatch: { id: "batch-6", status: "FAILED", stage: "COMMIT_FAILED", failureCode: "INTERNAL_STORAGE_WRITE_FAILED" },
+    });
+
+    const blocker = workflowBlockerPresentation(input, false);
+
+    expect(blocker).toMatchObject({ title: "当前处理已暂停" });
+    expect(blocker?.message).not.toContain("INTERNAL_STORAGE_WRITE_FAILED");
+    expect(blocker?.message).toContain("处理编号");
   });
 });

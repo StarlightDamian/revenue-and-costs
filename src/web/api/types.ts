@@ -166,6 +166,8 @@ export interface FxConversionRow {
 
 export interface ImportPreview {
   id: string;
+  uploadBatchId?: string;
+  uploadReady?: boolean;
   status: "QUEUED" | "RUNNING" | "AWAITING_MAPPING" | "READY" | "PROCESSING" | "PUBLISHED" | "FAILED" | "CANCELLED";
   progress: string;
   stage?: string;

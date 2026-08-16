@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { FxConversionRow, FxOverride, FxOverrideInput, FxQuote } from "../api/types";
 import { writeTextToClipboard } from "../clipboard";
 import AsyncState from "../components/AsyncState.vue";
@@ -20,7 +21,8 @@ const from = ref("CNY"); const to = ref("USD"); const lines = ref(""); const row
 const overrides = ref<FxOverride[]>([]); const overrideState = ref<"loading" | "ready" | "error">("loading"); const overrideListError = ref(""); const overrideMessage = ref("");
 const overrideDialog = ref<globalThis.HTMLDialogElement | null>(null); const currencyInput = ref<globalThis.HTMLInputElement | null>(null); const editingOverride = ref<FxOverride | null>(null); const overrideSaving = ref(false); const overrideFormError = ref("");
 const overrideCurrency = ref(""); const overrideValidFrom = ref(""); const overrideValidTo = ref(""); const overrideRate = ref(""); const overrideSource = ref(""); const overrideReason = ref("");
-const taskLabel = computed(() => fxStatus.value?.taskStatus ?? "未知");
+const taskStatusNames: Record<string, string> = { DISABLED: "不会自动更新", IDLE: "等待更新", RUNNING: "正在更新", SUCCEEDED: "更新完成", FAILED: "更新失败" };
+const taskLabel = computed(() => taskStatusNames[fxStatus.value?.taskStatus ?? ""] ?? "状态未知");
 const historyPivot = computed(() => pivotFxHistory(history.value));
 const isAdmin = computed(() => Boolean(session.me?.roles.includes("ADMIN")));
 const requestedCurrency = computed(() => typeof route.query.currency === "string" && /^[A-Za-z]{3}$/u.test(route.query.currency) ? route.query.currency.toUpperCase() : "");
@@ -32,14 +34,14 @@ async function queryHistory() {
   try {
     const query = new URLSearchParams(); if (start.value) query.set("from", start.value); if (end.value) query.set("to", end.value); if (currencies.value.trim()) query.set("currencies", currencies.value.trim());
     history.value = await api.getFxHistory(query); historyState.value = "idle";
-  } catch (caught) { historyState.value = "error"; historyError.value = caught instanceof Error ? caught.message : "查询失败"; }
+  } catch (caught) { historyState.value = "error"; historyError.value = userFacingError(caught, "暂时无法查询汇率，请检查网络后重试"); }
 }
 
 async function loadOverrides() {
   if (!isAdmin.value) return;
   overrideState.value = "loading"; overrideListError.value = "";
   try { overrides.value = await api.listFxOverrides(); overrideState.value = "ready"; }
-  catch (caught) { overrideState.value = "error"; overrideListError.value = caught instanceof Error ? caught.message : "读取人工汇率失败"; }
+  catch (caught) { overrideState.value = "error"; overrideListError.value = userFacingError(caught, "暂时无法读取人工汇率，请检查网络后重试"); }
 }
 
 onMounted(() => { void queryHistory(); void loadOverrides(); });
@@ -48,7 +50,7 @@ async function convert() {
   convertError.value = ""; copyMessage.value = "";
   from.value = normalizeCurrencyCode(from.value); to.value = normalizeCurrencyCode(to.value);
   try { rows.value = await api.convertFx({ from: from.value, to: to.value, lines: lines.value.split(/\r?\n/) }); }
-  catch (caught) { convertError.value = caught instanceof Error ? caught.message : "换算失败"; }
+  catch (caught) { convertError.value = userFacingError(caught, "暂时无法换算，请检查网络后重试"); }
 }
 
 async function copyRates() {
@@ -112,7 +114,7 @@ async function saveOverride() {
     closeOverride();
     await loadOverrides();
   } catch (caught) {
-    overrideFormError.value = caught instanceof Error ? caught.message : "保存人工汇率失败";
+    overrideFormError.value = userFacingError(caught, "暂时无法保存人工汇率，请检查网络后重试");
   } finally { overrideSaving.value = false; }
 }
 
@@ -120,20 +122,26 @@ function formatCreatedAt(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
 }
+
+function conversionResult(row: FxConversionRow): string {
+  if (row.reason) return row.reason;
+  const names: Record<string, string> = { EXACT: "使用当天汇率", FALLBACK: "使用之后最近的可用汇率", INVALID_DATE: "日期格式无法识别", INVALID_CURRENCY: "币种无法识别", NO_AVAILABLE_QUOTE: "没有可用汇率" };
+  return names[row.status] ?? "已完成";
+}
 </script>
 
 <template>
   <section>
-    <PageHeader title="外汇市场" description="查询 ChinaMoney 规范化报价，并按报表显示日期批量换算。" :status="`同步任务：${taskLabel}`" :tone="fxStatus?.gaps.length ? 'warning' : 'official'">
+    <PageHeader title="外汇市场" description="查询中国外汇交易中心公布的汇率，并按报表上的日期批量换算。" :status="`更新状态：${taskLabel}`" :tone="fxStatus?.gaps.length ? 'warning' : 'official'">
       <template #actions><button v-if="isAdmin" class="primary-button compact" type="button" @click="openOverride()">新增人工汇率</button></template>
     </PageHeader>
     <AsyncState :status="status" :error="error" @retry="reload">
       <section class="status-strip fx-status-strip"><div><span>数据来源</span><strong>{{ fxStatus?.source }}</strong></div><div><span>数据库覆盖</span><strong>{{ fxStatus?.coverageStart || "未回填" }} 至 {{ fxStatus?.coverageEnd || "未回填" }}</strong></div><div><span>已保存报价</span><strong>{{ fxStatus?.quoteCount ?? 0 }} 条</strong></div><div><span>最后同步</span><strong>{{ fxStatus?.lastSucceededAt || "尚未成功" }}</strong></div></section>
-      <div v-if="fxStatus && !fxStatus.syncEnabled" class="warning-panel" role="status"><strong>自动汇率同步未启用</strong><p>当前页面展示数据库中最近一次手工同步的数据；管理员可运行 <code>pnpm fx:sync</code> 更新全量历史报价。</p></div>
-      <div v-if="fxStatus?.gaps.length" class="warning-panel" role="alert"><strong>存在官方报价缺口</strong><p>开市日缺少目标币对时不会继续寻找其他日期报价，相关切片将阻止发布。</p><ul><li v-for="gap in fxStatus.gaps" :key="`${gap.date}-${gap.currency}`">{{ gap.date }} {{ gap.currency }}：{{ gap.reason }}</li></ul></div>
+      <div v-if="fxStatus && !fxStatus.syncEnabled" class="warning-panel" role="status"><strong>汇率不会自动更新</strong><p>当前页面显示上次由管理员更新的数据。需要最新汇率时，请联系管理员更新。</p></div>
+      <div v-if="fxStatus?.gaps.length" class="warning-panel" role="alert"><strong>部分日期缺少官方汇率</strong><p>这些日期无法计算准确的人民币金额，因此相关资料暂时不能生成正式结果。</p><ul><li v-for="gap in fxStatus.gaps" :key="`${gap.date}-${gap.currency}`">{{ gap.date }} {{ gap.currency }}：{{ gap.reason }}</li></ul></div>
     </AsyncState>
     <section v-if="isAdmin" class="surface-section fx-override-section" aria-labelledby="fx-override-title">
-      <div class="section-heading split-heading"><div><h2 id="fx-override-title">人工授权汇率</h2><p>只用于填补官方报价缺口。新增和修改都保留来源、原因与修订历史，不改写既有计算或正式快照。</p></div><button class="secondary-button compact" type="button" :disabled="overrideState === 'loading'" @click="loadOverrides">刷新</button></div>
+      <div class="section-heading split-heading"><div><h2 id="fx-override-title">人工授权汇率</h2><p>只用于补上官方没有公布的汇率。每次新增和修改都会保留来源、原因和时间，不会改变已经完成的计算或正式结果。</p></div><button class="secondary-button compact" type="button" :disabled="overrideState === 'loading'" @click="loadOverrides">刷新</button></div>
       <div v-if="requestedSubject" class="warning-panel" data-tone="error" role="alert"><strong>当前计算缺少 {{ requestedSubject }}</strong><p>请依据授权来源新增覆盖该日期的汇率；保存后返回公司重新导入。</p><button class="primary-button compact" type="button" @click="openOverride()">新增该日期汇率</button></div>
       <p v-if="overrideMessage" class="form-success" role="status">{{ overrideMessage }}</p>
       <div v-if="overrideState === 'loading'" class="skeleton-stack" aria-busy="true"><div class="skeleton-line is-wide"></div><div class="skeleton-line"></div></div>
@@ -156,7 +164,7 @@ function formatCreatedAt(value: string): string {
       <div class="form-actions"><button class="primary-button compact" type="button" @click="convert">批量换算</button><button v-if="rows.length" class="secondary-button compact" type="button" @click="copyRates">复制汇率（Excel）</button></div>
       <p v-if="convertError" class="form-error" role="alert">{{ convertError }}</p>
       <p v-if="copyMessage" :class="copyFailed ? 'form-error' : 'form-success'" :role="copyFailed ? 'alert' : 'status'">{{ copyMessage }}</p>
-      <div v-if="rows.length" class="table-scroll" tabindex="0"><table><thead><tr><th>输入日期</th><th>命中日期</th><th>币对</th><th>汇率</th><th>顺延天数</th><th>状态</th></tr></thead><tbody><tr v-for="(row, index) in rows" :key="index"><td>{{ row.input }}</td><td>{{ row.quoteDate || "" }}</td><td>{{ row.from }}/{{ row.to }}</td><td class="numeric">{{ row.rate || "" }}</td><td>{{ row.fallbackDays ?? "" }}</td><td>{{ row.reason || row.status }}</td></tr></tbody></table></div>
+      <div v-if="rows.length" class="table-scroll" tabindex="0"><table><thead><tr><th>输入日期</th><th>使用的汇率日期</th><th>币对</th><th>汇率</th><th>向后查找天数</th><th>结果</th></tr></thead><tbody><tr v-for="(row, index) in rows" :key="index"><td>{{ row.input }}</td><td>{{ row.quoteDate || "" }}</td><td>{{ row.from }}/{{ row.to }}</td><td class="numeric">{{ row.rate || "" }}</td><td>{{ row.fallbackDays ?? "" }}</td><td>{{ conversionResult(row) }}</td></tr></tbody></table></div>
     </section>
     <dialog ref="overrideDialog" class="confirm-dialog fx-override-dialog" aria-labelledby="fx-override-dialog-title" @cancel.prevent="closeOverride">
       <span>管理员数据治理</span>

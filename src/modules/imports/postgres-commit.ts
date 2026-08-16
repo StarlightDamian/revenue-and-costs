@@ -13,6 +13,11 @@ import type { FieldMappingDefinition } from "../mappings/types.js";
 import { parseMappedDelimitedStream, type MappedImportRow } from "./stream-parser.js";
 import { parseMappedXlsxStream, XLSX_IMPORT_ENCODING } from "./xlsx-stream.js";
 import { marketplaceProfile, normalizedDecimal, normalizedSparseDecimal, normalizeFulfillment, normalizeReportDate, normalizeTransactionDescription, normalizeTransactionType, SingleSiteMarketplaceInference, type MarketplaceProfile } from "./normalize-row.js";
+import {
+  inheritSourceReplayHardAcknowledgements,
+  sourceReplayClosureHash,
+  type SourceReplayClosureRow,
+} from "./source-replay-contract.js";
 
 const STAGE_COLUMNS = [
   "report_kind", "file_id", "row_number", "row_hash", "date_text", "parsed_at", "source_timezone",
@@ -83,6 +88,7 @@ const SAFE_COMMIT_CODES = new Set([
   "IMPORT_DATABASE_CAPACITY_UNAVAILABLE",
   "IMPORT_DELIMITED_RECORD_TOO_LARGE",
   "NO_USABLE_IMPORT_ROWS",
+  "SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED",
 ]);
 const MAX_RECORDED_ROW_ISSUE_GROUPS_PER_FILE = 100;
 
@@ -104,6 +110,36 @@ export interface ImportDatabaseCapacityEstimate {
   readonly walBytes: bigint;
   readonly safetyBytes: bigint;
   readonly requiredBytes: bigint;
+}
+
+export async function assertSourceReplayClosureCurrent(client: PoolClient, batchId: string): Promise<void> {
+  const replay = await client.query<{ shop_id: string; source_closure_hash: string }>(
+    `SELECT batch.shop_id,event.metadata->>'sourceClosureHash' source_closure_hash
+       FROM import_batch batch
+       JOIN audit_event event ON event.object_type='import_batch' AND event.object_id=batch.id
+        AND event.action='ADMIN_SOURCE_REPLAY_CREATED'
+      WHERE batch.id=$1`,
+    [batchId],
+  );
+  const expected = replay.rows[0]?.source_closure_hash;
+  if (!expected) return;
+  await client.query(
+    "SELECT id FROM dataset_slice WHERE shop_id=$1 ORDER BY id FOR UPDATE",
+    [replay.rows[0]!.shop_id],
+  );
+  const current = await client.query<SourceReplayClosureRow>(
+    `SELECT version.id::text dataset_version_id,binding.report_kind,binding.import_file_id::text,
+            file.stored_object_id::text,binding.mapping_version_id::text
+       FROM dataset_slice slice
+       JOIN dataset_version version ON version.id=slice.current_version_id
+       JOIN dataset_source_binding binding ON binding.dataset_version_id=version.id
+       JOIN import_file file ON file.id=binding.import_file_id
+      WHERE slice.shop_id=$1
+      ORDER BY version.id,binding.report_kind,binding.import_file_id`,
+    [replay.rows[0]!.shop_id],
+  );
+  const actual = sourceReplayClosureHash(current.rows);
+  if (actual !== expected) throw new Error("SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED");
 }
 
 export function estimateImportDatabaseCapacity(sourceBytes: bigint): ImportDatabaseCapacityEstimate {
@@ -553,7 +589,7 @@ export async function materializeImportSlices(
     version_id uuid NOT NULL,
     version_no integer NOT NULL,
     complete boolean NOT NULL,
-    transaction_only_fmb boolean NOT NULL,
+    one_sided_complete_reason text,
     retired boolean NOT NULL,
     mapping_version_id uuid,
     PRIMARY KEY(marketplace,local_month)
@@ -593,11 +629,19 @@ export async function materializeImportSlices(
           )
      ), slice_input AS (
        SELECT marketplace,local_month,kinds,false retired,
-              cardinality(kinds)=1 AND kinds @> ARRAY['TRANSACTION']::text[]
-                AND has_merchant_order AND NOT has_non_merchant_order transaction_only_fmb
+              kinds @> ARRAY['SHIPMENT']::text[] OR (
+                cardinality(kinds)=1 AND kinds @> ARRAY['TRANSACTION']::text[]
+                  AND has_merchant_order AND NOT has_non_merchant_order
+              ) complete,
+              CASE
+                WHEN cardinality(kinds)=1 AND kinds @> ARRAY['SHIPMENT']::text[] THEN 'SHIPMENT_ONLY'
+                WHEN cardinality(kinds)=1 AND kinds @> ARRAY['TRANSACTION']::text[]
+                  AND has_merchant_order AND NOT has_non_merchant_order THEN 'TRANSACTION_ONLY_FMB'
+              END one_sided_complete_reason
          FROM staged_slice_input
        UNION ALL
-       SELECT replayed.marketplace,replayed.local_month,ARRAY[]::text[] kinds,true retired,false transaction_only_fmb
+       SELECT replayed.marketplace,replayed.local_month,ARRAY[]::text[] kinds,true retired,
+              false complete,NULL::text one_sided_complete_reason
          FROM replayed_current_slices replayed
         WHERE NOT EXISTS (
           SELECT 1 FROM staged_slice_input staged
@@ -619,14 +663,13 @@ export async function materializeImportSlices(
      )
      INSERT INTO import_version_stage(
        marketplace,local_month,kinds,dataset_slice_id,supersedes_version_id,
-       version_id,version_no,complete,transaction_only_fmb,retired,mapping_version_id
+       version_id,version_no,complete,one_sided_complete_reason,retired,mapping_version_id
      )
      SELECT input.marketplace,input.local_month,input.kinds,upserted.id,upserted.current_version_id,
             gen_random_uuid(),
             (SELECT COALESCE(max(version.version_no),0)+1 FROM dataset_version version WHERE version.dataset_slice_id=upserted.id),
-             (cardinality(input.kinds)=2 AND input.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[])
-               OR input.transaction_only_fmb,
-             input.transaction_only_fmb,input.retired,mapping.mapping_version_id
+             input.complete,
+             input.one_sided_complete_reason,input.retired,mapping.mapping_version_id
        FROM slice_input input
        JOIN upserted USING(marketplace,local_month)
        LEFT JOIN mapping_input mapping USING(marketplace,local_month)
@@ -643,9 +686,9 @@ export async function materializeImportSlices(
      SELECT version_id,dataset_slice_id,$1::uuid,version_no,
             CASE WHEN complete THEN 'ACTIVE' ELSE 'INCOMPLETE' END,
             digest(convert_to(jsonb_build_object(
-              'batchId',$1::uuid::text,'sliceId',dataset_slice_id::text,'marketplace',marketplace,
+               'batchId',$1::uuid::text,'sliceId',dataset_slice_id::text,'marketplace',marketplace,
                'localMonth',local_month::text,'kinds',to_jsonb(kinds),
-               'transactionOnlyFmb',transaction_only_fmb,'retiredBySourceReplay',retired
+               'oneSidedCompleteReason',one_sided_complete_reason,'retiredBySourceReplay',retired
             )::text,'UTF8'),'sha256'),
             supersedes_version_id,clock_timestamp(),$2::uuid
        FROM import_version_stage ORDER BY local_month,marketplace
@@ -721,10 +764,15 @@ export async function materializeImportSlices(
      )
      INSERT INTO reconciliation_result(dataset_version_id,mapping_version_id,applicable,shipment_quantity,transaction_quantity,
        intersection_quantity,unmatched_absolute,unmatched_ratio,warning)
-     SELECT version.version_id,version.mapping_version_id,true,totals.ship,totals.trans,
-            least(totals.ship,totals.trans),abs(totals.ship-totals.trans),
-            CASE WHEN totals.ship+totals.trans=0 THEN 0 ELSE abs(totals.ship-totals.trans)/(totals.ship+totals.trans) END,
-            totals.ship<>totals.trans
+     SELECT version.version_id,version.mapping_version_id,
+            version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[],
+            CASE WHEN version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[] THEN totals.ship END,
+            CASE WHEN version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[] THEN totals.trans END,
+            CASE WHEN version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[] THEN least(totals.ship,totals.trans) END,
+            CASE WHEN version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[] THEN abs(totals.ship-totals.trans) END,
+            CASE WHEN NOT (version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[]) THEN NULL
+                 WHEN totals.ship+totals.trans=0 THEN 0 ELSE abs(totals.ship-totals.trans)/(totals.ship+totals.trans) END,
+            version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[] AND totals.ship<>totals.trans
        FROM import_version_stage version
        CROSS JOIN LATERAL (SELECT
          COALESCE((SELECT quantity FROM shipment_totals WHERE dataset_version_id=version.version_id),0) ship,
@@ -791,14 +839,17 @@ export async function commitImportBatch(
         WHERE batch.id=$1 FOR UPDATE OF shop`,
       [batchId],
     );
+    await assertSourceReplayClosureCurrent(client, batchId);
     const materializeStarted = performance.now();
     const slices = await materializeImportSlices(client, batchId, actorAccountId);
+    const inheritedAcknowledgements = await inheritSourceReplayHardAcknowledgements(client, batchId, actorAccountId);
     const materializeMs = performance.now() - materializeStarted;
     if (!slices.some((slice) => !slice.retired)) throw new Error("NO_USABLE_IMPORT_ROWS");
     structuredLog("info", "worker", "import_commit_materialization_completed", {
       batchId,
       slices: slices.length,
       retiredSlices: slices.filter((slice) => slice.retired).length,
+      inheritedHardAcknowledgements: inheritedAcknowledgements.acknowledgementIds.length,
       durationMs: materializeMs,
     });
     const finalizeStarted = performance.now();

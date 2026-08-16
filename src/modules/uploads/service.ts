@@ -12,14 +12,19 @@ import { AppError } from "../../shared/errors";
 import { safeErrorDiagnostic } from "../../shared/diagnostics.js";
 import { structuredLog } from "../../shared/structured-logger.js";
 import {
+  MAX_UPLOAD_BATCH_BYTES,
+  MAX_UPLOAD_BATCH_FILES,
+  UPLOAD_FILE_IO_CONCURRENCY,
+} from "../../shared/upload-limits.js";
+import {
   type ClientUploadFailureCode,
   recordUploadFileFailure,
   refreshUploadPreflight,
 } from "./partial-failure.js";
 import { cleanupUploadStagingArtifacts } from "./staging-cleanup.js";
 
-const MAX_BATCH_BYTES = 2n * 1024n * 1024n * 1024n;
-export const MAX_UPLOAD_FILES = 20_000;
+const MAX_BATCH_BYTES = BigInt(MAX_UPLOAD_BATCH_BYTES);
+export const MAX_UPLOAD_FILES = MAX_UPLOAD_BATCH_FILES;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
 
 export interface CreateUploadFile { batchId: string; relativePath: string; declaredSize: bigint; contentType?: string; metadataOnly?: boolean }
@@ -42,6 +47,19 @@ interface FailedStagingFile {
   readonly archive_reservation_state: "NONE" | "RESERVED" | "COMMITTED";
   readonly archive_expanded_bytes: string;
   readonly archive_file_count: number;
+}
+
+async function forEachUploadFile<T>(
+  values: readonly T[],
+  operation: (value: T) => Promise<void>,
+): Promise<void> {
+  for (let offset = 0; offset < values.length; offset += UPLOAD_FILE_IO_CONCURRENCY) {
+    await Promise.all(values.slice(offset, offset + UPLOAD_FILE_IO_CONCURRENCY).map(operation));
+  }
+}
+
+async function removeTemporaryUploadPaths(paths: readonly string[]): Promise<void> {
+  await forEachUploadFile(paths, async (path) => unlink(path).catch(() => undefined));
 }
 
 async function releaseReservedArchiveBudgets(tx: PoolClient, files: readonly FailedStagingFile[]): Promise<void> {
@@ -119,20 +137,18 @@ export async function expireUploadStaging(pool: Pool): Promise<number> {
     return files.rows;
   });
   let cleaned = 0;
-  for (let offset = 0; offset < stagingFiles.length; offset += 16) {
-    await Promise.all(stagingFiles.slice(offset, offset + 16).map(async (file) => {
-      try {
-        await cleanupUploadStagingArtifacts(pool, { fileId: file.id, tempPath: file.temp_path });
-        cleaned += 1;
-      } catch (error) {
-        structuredLog("error", "worker", "upload_staging_cleanup_failed", {
-          fileId: file.id,
-          batchId: file.batch_id,
-          ...safeErrorDiagnostic(error),
-        });
-      }
-    }));
-  }
+  await forEachUploadFile(stagingFiles, async (file) => {
+    try {
+      await cleanupUploadStagingArtifacts(pool, { fileId: file.id, tempPath: file.temp_path });
+      cleaned += 1;
+    } catch (error) {
+      structuredLog("error", "worker", "upload_staging_cleanup_failed", {
+        fileId: file.id,
+        batchId: file.batch_id,
+        ...safeErrorDiagnostic(error),
+      });
+    }
+  });
   return cleaned;
 }
 
@@ -437,6 +453,21 @@ export class UploadService {
           availableStorageBytes = disk.bavail * disk.bsize;
         }
 
+        // Source replay and normal upload creation share the shop row as their
+        // serialization boundary. Keep this and the replay lookup as separate
+        // statements so a waiter observes the replay committed before it.
+        await tx.query("SELECT id FROM shop WHERE id=$1 FOR UPDATE", [shopId]);
+        const activeReplay = await tx.query<{ id: string }>(
+          `SELECT id FROM import_batch
+            WHERE shop_id=$1 AND idempotency_key LIKE 'admin-source-replay:%'
+              AND status NOT IN ('RESULT_PUBLISHED','CANCELLED','FAILED')
+            ORDER BY created_at,id LIMIT 1`,
+          [shopId],
+        );
+        if (activeReplay.rows[0]) {
+          throw new AppError("UPLOAD_SOURCE_REPLAY_IN_PROGRESS", "当前公司正在安全重算历史资料，请稍后重试", 409);
+        }
+
         const batchId = randomUUID();
         await tx.query(
           `INSERT INTO upload_batch (id,shop_id,created_by,status,expires_at)
@@ -468,7 +499,7 @@ export class UploadService {
       }
       return result;
     } catch (error) {
-      await Promise.all(createdTempPaths.map((path) => unlink(path).catch(() => undefined)));
+      await removeTemporaryUploadPaths(createdTempPaths);
       throw error;
     }
   }
@@ -537,11 +568,9 @@ export class UploadService {
       );
       return files.rows;
     });
-    for (let offset = 0; offset < stagingFiles.length; offset += 16) {
-      await Promise.all(stagingFiles.slice(offset, offset + 16).map(async (file) => {
-        await cleanupUploadStagingArtifacts(this.pool, { fileId: file.id, tempPath: file.temp_path });
-      }));
-    }
+    await forEachUploadFile(stagingFiles, async (file) => {
+      await cleanupUploadStagingArtifacts(this.pool, { fileId: file.id, tempPath: file.temp_path });
+    });
   }
 
   async createFile(input: CreateUploadFile): Promise<string> {
@@ -575,7 +604,7 @@ export class UploadService {
       }
       return result;
     } catch (error) {
-      await Promise.all(createdTempPaths.map((path) => unlink(path).catch(() => undefined)));
+      await removeTemporaryUploadPaths(createdTempPaths);
       throw error;
     }
   }

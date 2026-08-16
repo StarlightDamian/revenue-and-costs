@@ -12,6 +12,7 @@ import { CoreTransactionSideEffects } from "../authorization/events.js";
 import {
   calculateCostAccounting,
   DEFAULT_CONTINENT_PREFIXES,
+  findAccountingPreferences,
   formatMarketplaceForExport,
   normalizeAccountingAssumptions,
   normalizeAccountingPreferences,
@@ -373,24 +374,12 @@ export class PostgresExportService {
     client: Pick<Pool, "query"> = this.pool,
   ): Promise<AccountingPreferences> {
     let defaults: AccountingPreferences = { profitRate: null, minimumSalesCostRate: null, continentPrefixes: DEFAULT_CONTINENT_PREFIXES };
-    if (input.profitRate === undefined || input.minimumSalesCostRate === undefined || input.continentPrefixes === undefined) {
-      const result = await client.query<{
-        profit_rate: string | null;
-        minimum_sales_cost_rate: string | null;
-        continent_prefixes: string[];
-      }>(
-        `SELECT accounting_profit_rate::text AS profit_rate,
-                minimum_sales_cost_rate::text AS minimum_sales_cost_rate,
-                accounting_continent_prefixes AS continent_prefixes
-           FROM account
-          WHERE id=$1`,
-        [accountId],
-      );
-      const row = result.rows[0];
-      if (!row) throw new AuthorizationError();
-      defaults = { profitRate: row.profit_rate, minimumSalesCostRate: row.minimum_sales_cost_rate, continentPrefixes: normalizeContinentPrefixes(row.continent_prefixes) };
-    }
     try {
+      if (input.profitRate === undefined || input.minimumSalesCostRate === undefined || input.continentPrefixes === undefined) {
+        const stored = await findAccountingPreferences(client, accountId);
+        if (!stored) throw new AuthorizationError();
+        defaults = stored;
+      }
       return normalizeAccountingPreferences({
         profitRate: input.profitRate === undefined ? defaults.profitRate : input.profitRate,
         minimumSalesCostRate: input.minimumSalesCostRate === undefined

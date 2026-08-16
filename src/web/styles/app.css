@@ -243,12 +243,24 @@ button:disabled { cursor: not-allowed; opacity: 0.52; }
 .shop-row dt { color: var(--text-muted); font-size: 9px; }
 .shop-row dd { margin: 0; color: var(--text-secondary); font-size: 11px; }
 
-.account-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-.account-profile-form { display: grid; gap: 8px; margin: 17px 0 4px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--surface-muted); }
-.account-name-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 8px; }
-.account-name-control .primary-button { white-space: nowrap; }
-.account-avatar-panel { align-content: start; }
-.account-avatar-panel .avatar-picker-trigger { justify-self: start; }
+.account-settings-panel { padding-block: 4px; }
+.account-settings-list { display: grid; margin: 0; }
+.account-settings-list > div { display: grid; grid-template-columns: 140px minmax(0, 1fr); align-items: center; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.account-settings-list > div:last-child { border-bottom: 0; }
+.account-settings-list dt { color: var(--text-muted); font-size: 11px; }
+.account-settings-list dd { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-width: 0; margin: 0; font-weight: 650; }
+.account-settings-list dd > strong { min-width: 0; overflow-wrap: anywhere; }
+.account-settings-list dd > small { color: var(--text-muted); font-size: 10px; font-weight: 500; line-height: 1.55; }
+.account-avatar-setting dd, .account-theme-setting dd { justify-content: flex-start; }
+.account-avatar-setting .avatar-picker-trigger { flex: 0 0 auto; }
+.account-theme-setting .theme-control { width: min(420px, 100%); }
+.account-settings-message { margin: 0 0 12px; }
+.account-name-dialog { width: min(520px, calc(100% - 24px)); color: var(--text-primary); background: var(--surface-solid); }
+.account-name-dialog::backdrop { background: var(--overlay-modal); backdrop-filter: blur(7px); }
+.account-name-dialog form > span { color: var(--accent); font-size: 10px; font-weight: 800; }
+.account-name-dialog form > h2 { margin: 7px 0 10px; font-size: 25px; }
+.account-name-dialog form > p { margin: 0 0 18px; color: var(--text-secondary); font-size: 12px; line-height: 1.65; }
+.account-name-dialog .form-field, .account-name-dialog .form-actions { margin-top: 18px; }
 .definition-list { display: grid; margin: 0; }
 .definition-list div { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line); }
 .definition-list div:last-child { border-bottom: 0; }
@@ -544,7 +556,7 @@ td small { display: block; margin-top: 3px; color: var(--text-muted); }
 .avatar-menu-panel > span { color: var(--text-muted); font-size: 10px; }
 .avatar-menu-panel .theme-control, .avatar-menu-panel .theme-switch { width: 100%; }
 .avatar-menu-panel > a, .avatar-menu-panel > button { display: grid; place-items: center; min-height: 34px; padding: 0 10px; color: var(--text-secondary); border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); text-align: center; text-decoration: none; font-size: 10px; font-weight: 700; }
-.workflow-content { width: min(1540px, 100%); margin: 18px auto 0; }
+.workflow-content { width: min(1540px, 100%); margin: 18px auto 0; scroll-margin-top: 96px; }
 .workflow-phases { grid-template-columns: repeat(3, minmax(120px, 1fr)); justify-self: center; width: min(720px, 100%); min-width: 0; }
 .workflow-phases .workflow-step { min-width: 120px; }
 .workflow-phases .stage-label b { font-size: 10px; }
@@ -641,6 +653,7 @@ td small { display: block; margin-top: 3px; color: var(--text-muted); }
 .field-picker > div { grid-template-columns: repeat(2, minmax(180px, 1fr)); min-width: 440px; }
 .compact-filter { display: grid; gap: 3px; color: var(--text-muted); font-size: 9px; }
 .compact-filter input, .compact-filter select { min-height: 36px; padding: 0 8px; color: var(--text-primary); border: 1px solid var(--line-strong); border-radius: var(--radius-control); background: var(--surface-muted); }
+[data-theme="dark"] select, [data-theme="dark"] select > option { color: var(--text-primary); background-color: var(--surface-solid); }
 .intermediate-table-scroll { max-height: 58vh; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius-control); }
 .intermediate-table-scroll table { min-width: max-content; margin: 0; }
 .intermediate-table-scroll thead th { position: sticky; z-index: 4; top: 0; background: var(--surface-solid); }
@@ -697,7 +710,6 @@ td small { display: block; margin-top: 3px; color: var(--text-muted); }
   .version-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .preflight-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .issue-list article { grid-template-columns: 1fr; gap: 4px; }
-  .account-grid { grid-template-columns: 1fr; }
   .sheet-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .summary-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .shop-index-heading { align-items: stretch; flex-direction: column; gap: 8px; }
@@ -750,8 +762,10 @@ td small { display: block; margin-top: 3px; color: var(--text-muted); }
   .page-header { align-items: stretch; flex-direction: column; gap: 12px; padding: 20px 17px; }
   .page-header-actions { justify-content: flex-start; }
   .surface-section { padding: 16px 12px; }
-  .account-name-control { grid-template-columns: 1fr; }
-  .account-name-control .primary-button { width: 100%; }
+  .account-settings-list > div { grid-template-columns: 86px minmax(0, 1fr); gap: 10px; padding: 13px 0; }
+  .account-avatar-setting dd, .account-theme-setting dd { align-items: flex-start; flex-direction: column; }
+  .account-theme-setting .theme-control, .account-theme-setting .theme-switch { width: 100%; }
+  .account-name-dialog { max-height: calc(100dvh - 24px); overflow-y: auto; padding: 22px 17px; }
   .form-grid.three, .form-grid.four, .quote-grid, .convert-grid, .accounting-rate-grid, .fx-override-form { grid-template-columns: 1fr; }
   .upload-drop-zone { grid-template-columns: auto minmax(0, 1fr); }
   .upload-source-actions { grid-column: 1 / -1; width: 100%; }

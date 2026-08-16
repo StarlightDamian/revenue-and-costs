@@ -56,6 +56,7 @@ async function mockWorkspace(page: Page) {
   let releasePreferencesRead: () => void = () => undefined;
   let preferencesReadStarted = Promise.resolve();
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
+  await page.route("**/api/v1/enterprises", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
   await page.route("**/api/v1/me/accounting-preferences", async (route) => {
     if (route.request().method() === "PATCH") {
       savedPayload = route.request().postDataJSON() as Record<string, unknown>;
@@ -125,6 +126,10 @@ test("做账习惯保存默认参数，报告页带入后可预览最低销售�
   await expect(page.getByLabel("最低销售成本率（可选）")).toHaveValue("15");
   await expect(page.getByLabel("欧洲")).toBeChecked();
   await expect(page.getByLabel("美洲")).not.toBeChecked();
+  await page.getByLabel("利润率（可选）").fill("101");
+  await page.getByRole("button", { name: "保存做账习惯" }).click();
+  await expect(page.getByText("利润率必须在 0% 到 100% 之间", { exact: true })).toBeVisible();
+  expect(state.savedPayload()).toBeUndefined();
   await page.getByLabel("美洲").check();
   await page.getByLabel("利润率（可选）").fill("5.25");
   await page.getByRole("button", { name: "保存做账习惯" }).click();

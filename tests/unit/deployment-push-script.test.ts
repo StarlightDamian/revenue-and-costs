@@ -63,6 +63,64 @@ describe("one-click code release guardrails", () => {
     expect(script).toContain("$program | & node.exe - $ExpectedPath $ActualPath");
   });
 
+  it("binds every release to a clean local main that matches GitHub main", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+
+    expect(script).toContain("DEPLOY_GIT_WORKTREE_DIRTY");
+    expect(script).toContain("DEPLOY_GIT_BRANCH_NOT_MAIN");
+    expect(script).toContain("DEPLOY_GIT_REMOTE_MAIN_MISMATCH");
+    expect(script).toContain("git.exe status --porcelain=v1 --untracked-files=all");
+    expect(script).toContain("git.exe branch --show-current");
+    expect(script).toContain("git.exe rev-parse HEAD");
+    expect(script).toContain("git.exe ls-remote --exit-code origin refs/heads/main");
+    expect(script).toContain("$gitCommit");
+    expect(script).toContain("DEPLOY_GIT_COMMIT_CHANGED");
+    expect(script.match(/Assert-GitReleaseCommit \$gitCommit/gu)).toHaveLength(2);
+  });
+
+  it("persists the Git and archive provenance locally and in the remote release", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+
+    expect(script).toContain("revenue-costs-release-receipt-v1");
+    expect(script).toContain("release-$releaseId.receipt.json");
+    expect(script).toContain("release-$releaseId.tar.gz.partial");
+    expect(script).toContain("deploymentAcceptance = 'passed'");
+    expect(script).toContain("$dependencySha");
+    expect(script).toContain("$gitCommit");
+    expect(remote).toContain('[[ "$#" -eq 15 ]]');
+    expect(remote).toContain('git_commit="${14}"');
+    expect(remote).toContain('expected_current_release="${15}"');
+    expect(remote).toContain('[[ "$git_commit" =~ ^[a-f0-9]{40}$ ]]');
+    expect(remote).toContain('receipt="$staging/.release-receipt.json"');
+    expect(remote).toContain("revenue-costs-release-receipt-v1");
+    expect(remote).toContain('"deploymentAcceptance":"passed"');
+    expect(remote.indexOf('receipt="$staging/.release-receipt.json"')).toBeLessThan(
+      remote.indexOf('find "$staging" -type f -exec chmod 0640 {} +'),
+    );
+  });
+
+  it("marks acceptance passed only after strict auth, worker, capacity, and stability checks", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const acceptancePassed = remote.lastIndexOf('"deploymentAcceptance":"passed"');
+
+    expect(remote).toContain('health_once "$public_url/health/ready" degraded');
+    expect(remote).toContain("anonymous_me_once");
+    expect(remote).toContain("authenticated_me_once");
+    expect(remote).toContain("worker_heartbeat_once");
+    expect(remote).toContain("connection_budget_once");
+    expect(remote).toContain("stability_deadline=$((SECONDS + 90))");
+    expect(remote).toContain('await request("/api/v1/me", { headers: { cookie } }, 401);');
+    expect(remote).toContain("RELEASE_RUNTIME_LOG_UNAVAILABLE");
+    expect(remote).toContain("RELEASE_RUNTIME_ERROR_DETECTED");
+    expect(remote).toContain("release_journal_since=\"$(date '+%Y-%m-%d %H:%M:%S')\"");
+    expect(remote).toContain('journalctl -u "$api_service" -u "$worker_service" --since "$release_journal_since" --no-pager --output=cat > "$runtime_log"');
+    expect(remote).toContain("grep -Eiq");
+    expect(remote).not.toContain("--output=cat |\n    grep -Eiq");
+    expect(acceptancePassed).toBeGreaterThan(remote.indexOf("stability_deadline=$((SECONDS + 90))"));
+    expect(acceptancePassed).toBeGreaterThan(remote.indexOf("authenticated_me_once ||"));
+  });
+
   it("allows only append-only migrations after draining work and taking a recoverable backup", async () => {
     const remote = await readFile("bin/push-remote.sh", "utf8");
 
@@ -100,6 +158,9 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain("http://127.0.0.1:$api_port/health/ready");
     expect(remote).toContain("$public_url/health/ready");
     expect(remote).toContain('--resolve "$public_host:443:127.0.0.1"');
+    const releaseMetadataCleanup = 'rm -f "$target/.previous-migrations"';
+    expect(remote.indexOf(releaseMetadataCleanup)).toBeGreaterThan(remote.indexOf("PUBLIC_INDEX_MISMATCH"));
+    expect(remote.indexOf(releaseMetadataCleanup)).toBeLessThan(remote.indexOf("success=1"));
     expect(remote).not.toMatch(/bootstrap-admin|assert-production-initial-state/);
     expect(remote).toContain("ACTIVE_CALCULATIONS_REQUIRE_DRAIN");
     expect(remote).toContain("ACTIVE_IMPORTS_REQUIRE_DRAIN");
@@ -115,6 +176,7 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain("DATABASE_IDENTITY_EXPECTED_SERVER");
     expect(remote).toContain("pg_postmaster_start_time()");
     expect(remote).toContain("server_is_local");
+    expect(remote).toContain("row?.server_is_local === true");
     expect(remote).toContain("session_has_limited_owner_membership");
     expect(remote).toContain("session_membership_count === 0");
     expect(remote).toContain("unset DATABASE_URL PGOPTIONS");
@@ -124,6 +186,11 @@ describe("one-click code release guardrails", () => {
     expect(remote.indexOf("dist/cli/migrate.js")).toBeLessThan(remote.indexOf('source "$config_root/database-app.env"'));
     expect(remote.indexOf('source "$config_root/database-app.env"')).toBeLessThan(remote.indexOf("dist/cli/bootstrap-mappings.js"));
     expect(remote).toContain("RELEASE_FAILED_AFTER_MIGRATION_SERVICES_STOPPED");
+    expect(remote).toContain('initial_api_state="$(systemctl show --property=ActiveState --value "$api_service")"');
+    expect(remote).toContain('initial_worker_state="$(systemctl show --property=ActiveState --value "$worker_service")"');
+    expect(remote).toContain('restore_initial_service_state "$api_service" "$initial_api_state"');
+    expect(remote).toContain('restore_initial_service_state "$worker_service" "$initial_worker_state"');
+    expect(remote).not.toContain('systemctl restart "$api_service" "$worker_service"');
     const migratedFailure = remote.slice(
       remote.indexOf("# The forward migration is committed and immutable."),
       remote.indexOf("fi\n  fi", remote.indexOf("# The forward migration is committed and immutable.")),
@@ -135,8 +202,34 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain("database_matches_previous");
     expect(remote).toContain("RESULT_PUBLISHED','FAILED','CANCELLED");
     expect(remote).toContain("tar --no-same-owner --no-same-permissions");
+    expect(remote).toContain("umask 027");
+    expect(remote.indexOf("umask 027")).toBeLessThan(remote.indexOf('migration_manifest "$previous_app/migrations"'));
     expect(remote).toContain("payload.service !== \"api\"");
     expect(remote).toContain("setfacl -R -m u:www:r-X");
+  });
+
+  it("does not stop services or switch current while handling a pre-stop failure", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const cleanup = remote.slice(remote.indexOf("cleanup() {"), remote.indexOf("trap cleanup EXIT"));
+    const preStopGuard = cleanup.indexOf('if [[ "$services_stopped" != \'1\' ]]; then');
+    const databaseRollbackCheck = cleanup.indexOf("database_matches_previous=0");
+
+    expect(preStopGuard).toBeGreaterThan(0);
+    expect(preStopGuard).toBeLessThan(databaseRollbackCheck);
+    expect(cleanup.slice(preStopGuard, databaseRollbackCheck)).toContain('exit "$status"');
+    expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('systemctl stop "$api_service" "$worker_service"');
+    expect(cleanup.slice(0, databaseRollbackCheck)).not.toContain('mv -Tf "$rollback_link" "$current_link"');
+  });
+
+  it("fails closed when remote current differs from the expected active release", async () => {
+    const script = await readFile("bin/push.ps1", "utf8");
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const currentGate = '[[ "$previous_app" == "$expected_previous_app" ]] || fail \'CURRENT_RELEASE_MISMATCH\'';
+
+    expect(script).toContain("'$gitCommit' '$activeRelease'");
+    expect(remote).toContain('expected_previous_app="$root/releases/$expected_current_release/app"');
+    expect(remote).toContain(currentGate);
+    expect(remote.indexOf(currentGate)).toBeLessThan(remote.indexOf('validate_archive "$app_archive"'));
   });
 
   it("allows script-only package changes that cannot run during install", async () => {

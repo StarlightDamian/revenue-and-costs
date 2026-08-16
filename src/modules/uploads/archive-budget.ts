@@ -1,8 +1,9 @@
 import type { Pool, PoolClient } from "pg";
 import { stat, statfs } from "node:fs/promises";
 import { withTransaction } from "../../db/pool.js";
+import { MAX_UPLOAD_BATCH_FILES } from "../../shared/upload-limits.js";
 
-export const MAX_UPLOAD_FILES = 20_000;
+export const MAX_UPLOAD_FILES = MAX_UPLOAD_BATCH_FILES;
 export const MAX_BATCH_EXPANDED_BYTES = 8n * 1024n * 1024n * 1024n;
 export const ARCHIVE_STORAGE_RESERVE_BYTES = 4n * 1024n * 1024n * 1024n;
 

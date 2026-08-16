@@ -202,7 +202,7 @@ describe("report filtering", () => {
       expect.objectContaining({ marketplace: "amazon.com", month: "2026-05" }),
     ]);
     expect(result.metrics.find((metric) => metric.key === "balance")?.amountCny).toBe("75.00000000");
-    expect(result.notices).toContain("筛选视图不可直接发布，请清除筛选后发布完整公司结果");
+    expect(result.notices).toContain("当前只显示筛选后的部分结果，不能直接发布。请清除筛选后再发布完整结果。");
     expect(result.canPublish).toBe(false);
     const financialCall = query.mock.calls.find(([sql]) => sql.includes("FILTER (WHERE r.component"));
     const feeCall = query.mock.calls.find(([sql]) => sql.includes("GROUP BY r.component"));

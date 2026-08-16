@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
+import { MAX_UPLOAD_BATCH_BYTES, MAX_UPLOAD_BATCH_FILES } from "../../shared/upload-limits";
 import { api } from "../api/client";
 import type { CompletenessSlice, ImportPreview } from "../api/types";
 import PageHeader from "../components/PageHeader.vue";
@@ -32,7 +33,9 @@ const selectedPaths = new WeakMap<File, string>();
 let pollingGeneration = 0;
 let stateEpoch = 0;
 const totalBytes = computed(() => uploadItems.value.reduce((sum, item) => sum + item.size, 0));
-const accepted = computed(() => files.value.length > 0 && files.value.length <= 20_000 && totalBytes.value <= 2 * 1024 * 1024 * 1024);
+const accepted = computed(() => files.value.length > 0
+  && files.value.length <= MAX_UPLOAD_BATCH_FILES
+  && totalBytes.value <= MAX_UPLOAD_BATCH_BYTES);
 const selectionLocked = computed(() => restoringLatest.value
   || checkingSelection.value
   || resuming.value
@@ -46,8 +49,42 @@ const canStartUpload = computed(() => !restoringLatest.value
   && ["idle", "error"].includes(status.value));
 const uploadConclusion = computed(() => uploadBatchConclusion(uploadItems.value));
 const canContinue = computed(() => Boolean(batchId.value) && uploadItems.value.some((item) => item.state === "failed"));
+const canRetryCompletion = computed(() => Boolean(batchId.value)
+  && status.value === "error"
+  && (preview.value?.uploadReady === true || (uploadItems.value.length > 0
+    && uploadItems.value.every((item) => ["complete", "skipped"].includes(item.state)))));
 const uploadStateNames = { pending: "等待", uploading: "上传中", complete: "成功", failed: "失败", skipped: "已跳过" } as const;
-const ignoredReason = (reason: string) => reason === "UNKNOWN_STRUCTURE" ? "未知结构，已过滤" : reason === "LIST_ONLY" ? "未解析" : reason;
+const uploadErrorText = (message?: string) => /read|读取|notreadable/iu.test(message ?? "")
+  ? "浏览器无法读取这个文件，请重新选择文件后再试"
+  : "这个文件上传失败，请检查网络后点击“继续上传”";
+const uploadStartErrorText = (message?: string) => /read|读取|notreadable/iu.test(message ?? "")
+  ? "浏览器无法读取所选文件，请重新选择后再试"
+  : "现在无法开始上传。已选文件仍保留，请稍后点击“重试开始上传”。";
+const uploadAttemptErrorText = (message?: string) => uploadItems.value.some((item) => item.state === "failed")
+  ? uploadErrorText(message)
+  : "服务器没有正确接收文件清单。请点击“安全取消”，再重新选择文件。";
+const progressErrorText = (message?: string) => /401|403|登录|权限|unauth|forbidden/iu.test(message ?? "")
+  ? "登录已失效或您没有权限。请重新登录；如果仍无法继续，请联系管理员。"
+  : "暂时无法取得最新进度。请检查网络后刷新页面。";
+const classificationNames: Record<string, string> = {
+  TRANSACTION: "交易报告",
+  SHIPMENT: "配送货件",
+  LIST_ONLY: "只保留文件信息",
+  TEMPORARY: "临时文件，不参与计算",
+  UNKNOWN: "无法识别",
+};
+const fileStatusNames: Record<string, string> = {
+  PARSED: "可用于计算",
+  LIST_ONLY: "未参与计算",
+  EXCLUDED: "未参与计算",
+  EXCLUDED_UNKNOWN_STRUCTURE: "未参与计算",
+  AWAITING_MAPPING: "等待管理员确认表格内容",
+  PENDING: "等待检查",
+  FAILED: "处理失败",
+};
+const ignoredReason = (reason: string) => reason === "UNKNOWN_STRUCTURE"
+  ? "系统看不懂这个表格，暂时不会用于计算"
+  : reason === "LIST_ONLY" ? "只保留文件信息，不读取正文，也不用于计算" : "该文件不会用于计算";
 const ignoredPaths = computed(() => new Map((preview.value?.ignored ?? []).map((item) => [item.relativePath, ignoredReason(item.reason)])));
 const retryableCommitFailure = computed(() => preview.value?.status === "FAILED"
   && ["IMPORT_DATABASE_CAPACITY_UNAVAILABLE", "IMPORT_DATABASE_CAPACITY_INSUFFICIENT"].includes(preview.value.failureCode ?? ""));
@@ -63,20 +100,20 @@ const preflightIssueCount = computed(() => (preview.value?.issues ?? []).reduce(
 const preflightFiles = computed(() => {
   const rows = (preview.value?.files ?? []).map((file) => ({
     path: file.relativePath,
-    classification: file.classification ?? "未分类",
-    status: ignoredPaths.value.has(file.relativePath) ? "忽略" : /FAILED|ERROR/u.test(file.status) ? "失败" : "成功",
-    detail: ignoredPaths.value.get(file.relativePath) ?? file.status,
+    classification: classificationNames[file.classification ?? ""] ?? "无法识别",
+    status: ignoredPaths.value.has(file.relativePath) ? "未参与计算" : fileStatusNames[file.status] ?? (/FAILED|ERROR/u.test(file.status) ? "处理失败" : "已检查"),
+    detail: ignoredPaths.value.get(file.relativePath) ?? fileStatusNames[file.status] ?? "系统已检查这个文件",
   }));
   for (const ignored of preview.value?.ignored ?? []) {
-    if (!rows.some((row) => row.path === ignored.relativePath)) rows.push({ path: ignored.relativePath, classification: "忽略", status: "忽略", detail: ignoredReason(ignored.reason) });
+    if (!rows.some((row) => row.path === ignored.relativePath)) rows.push({ path: ignored.relativePath, classification: classificationNames[ignored.reason] ?? "无法识别", status: "未参与计算", detail: ignoredReason(ignored.reason) });
   }
   for (const item of uploadItems.value) {
     if (!rows.some((row) => row.path === item.path)) {
       rows.push({
         path: item.path,
-        classification: item.state === "complete" ? "等待分类" : "上传",
-        status: item.state === "complete" ? "成功" : item.state === "skipped" ? "失败" : uploadStateNames[item.state],
-        detail: item.state === "skipped" ? "上传失败后由做账员跳过，未进入计算" : item.error ?? "等待预检分析",
+        classification: item.state === "complete" ? "等待系统识别" : "正在上传",
+        status: item.state === "complete" ? "等待检查" : item.state === "skipped" ? "未参与计算" : uploadStateNames[item.state],
+        detail: item.state === "skipped" ? "这个文件上传失败后被跳过，其他文件不受影响" : item.error ? uploadErrorText(item.error) : "上传后系统会检查文件内容",
       });
     }
   }
@@ -84,30 +121,30 @@ const preflightFiles = computed(() => {
 });
 const preflightConclusion = computed(() => {
   if (!preview.value) return "";
-  const failed = preflightFiles.value.filter((file) => file.status === "失败").length;
-  const usable = preflightFiles.value.filter((file) => file.status === "成功" && ["SHIPMENT", "TRANSACTION"].includes(file.classification)).length;
+  const failed = preflightFiles.value.filter((file) => file.status === "处理失败").length;
+  const usable = recognizedFileCount.value;
   if (preflightFiles.value.length > 0 && failed === preflightFiles.value.length) return "无可计算数据：所有文件均处理失败。";
-  if (preview.value.status === "AWAITING_MAPPING") return "待管理员确认字段映射；确认前不会把未知结构静默纳入计算。";
-  if (usable === 0 && !["QUEUED", "RUNNING", "PROCESSING", "PUBLISHED"].includes(preview.value.status)) return "无可计算数据：当前批次没有成功识别的交易报告或配送货件。";
-  if (failed > 0) return `部分完成：${failed} 个文件失败，其余文件已继续预检。`;
-  if (preview.value.status === "READY") return "预检完成：可确认正常数据入库；未知结构文件会被过滤并保留诊断。";
-  if (preview.value.status === "PROCESSING") return "正在入库、计算并发布安全快照，完成后客户会自动看到新结果。";
-  if (preview.value.status === "PUBLISHED") return "已完成入库、计算和发布，客户现在可以看到新结果。";
-  if (preview.value.failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED") return "发现缺失资料。补充文件，或确认排除缺失切片后即可继续。";
-  if (preview.value.failureCode === "CALCULATION_DATE_ATTRIBUTION_MODE_MIXED") return "当前公司仍混有旧日期口径数据；请按相同日期口径完整重传当前数据范围，不能确认绕过。";
+  if (preview.value.status === "AWAITING_MAPPING") return "有表格的列名无法识别，暂时不会用于计算。请联系管理员确认每一列代表什么，然后重新上传。";
+  if (usable === 0 && !["QUEUED", "RUNNING", "PROCESSING", "PUBLISHED"].includes(preview.value.status)) return "没有可用于计算的资料。请补充交易报告或配送货件后重新上传。";
+  if (failed > 0) return `有 ${failed} 个文件处理失败，其他文件仍会继续检查。请打开明细查看失败文件并重新上传。`;
+  if (preview.value.status === "READY") return "文件检查完成。系统会保存能用于计算的资料，看不懂的表格不会参与计算。";
+  if (preview.value.status === "PROCESSING") return "系统正在保存资料并计算结果。完成后客户会自动看到新的正式结果。";
+  if (preview.value.status === "PUBLISHED") return "资料已保存并计算完成，客户现在可以看到新的正式结果。";
+  if (preview.value.failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED") return "有些站点或月份缺少资料。请补充文件；如果确定不需要计算这些项目，也可以确认不计算后继续。";
+  if (preview.value.failureCode === "CALCULATION_DATE_ATTRIBUTION_MODE_MIXED") return "同一批资料使用了不同的日期计算方式，系统无法正确合并。请统一日期格式和计算方式后，重新上传这一范围的全部资料。";
   const fxFailure = /^(FX_DATA_GAP|FX_NO_AVAILABLE_QUOTE)(?::([A-Z]{3}):(\d{4}-\d{2}-\d{2}))?$/u.exec(preview.value.failureCode ?? "");
   if (fxFailure) {
     const subject = fxFailure[2] && fxFailure[3] ? `${fxFailure[3]} ${fxFailure[2]}/CNY` : "报表日期对应币种";
     return `计算所需的 ${subject} 汇率缺失，系统已停止而不是继续等待。请先由管理员依据授权来源补齐汇率，再重新导入。`;
   }
-  if (preview.value.failureCode === "IMPORT_DATABASE_CAPACITY_UNAVAILABLE") return "数据库容量检查配置不可用；配置恢复后可直接重试，无需重新上传。";
-  if (preview.value.failureCode === "IMPORT_DATABASE_CAPACITY_INSUFFICIENT") return "数据库可用空间不足；释放空间后可直接重试，无需重新上传。";
+  if (preview.value.failureCode === "IMPORT_DATABASE_CAPACITY_UNAVAILABLE") return "系统暂时无法确认服务器是否有足够空间，因此没有继续保存资料。恢复后可直接重试，无需重新上传。";
+  if (preview.value.failureCode === "IMPORT_DATABASE_CAPACITY_INSUFFICIENT") return "服务器可用空间不足，资料暂时无法保存。管理员释放空间后可直接重试，无需重新上传。";
   if (preview.value.status === "FAILED") return "处理未完成，请按本页提示处理后重试。";
-  return "预检处理中：页面会自动刷新，并已持久化当前批次。";
+  return "系统正在检查文件，页面会自动刷新。当前进度已经保存，离开后也可以继续。";
 });
 const previewStatusLabel = computed(() => ({
-  DRAFT: "待上传", UPLOADING: "上传中", ANALYZING: "预检中", AWAITING_FILES: "待补文件",
-  AWAITING_MAPPING: "待确认映射", READY: "预检完成", PROCESSING: "自动处理中",
+  DRAFT: "待上传", UPLOADING: "上传中", ANALYZING: "正在检查文件", AWAITING_FILES: "等待补充文件",
+  AWAITING_MAPPING: "等待管理员确认表格内容", READY: "文件检查完成", PROCESSING: "正在保存和计算",
   PUBLISHED: "已完成", FAILED: "需要处理", CANCELLED: "已取消",
 } as Record<string, string>)[preview.value?.status ?? ""] ?? "处理中");
 
@@ -147,8 +184,8 @@ async function acceptSelection(selection: readonly DroppedFile[]) {
     const action = previous.length > 0 ? `已追加 ${merged.added} 个文件` : `已选择 ${merged.added} 个文件`;
     const replacement = merged.replaced > 0 ? `，已用最后一次选择替换 ${merged.replaced} 个同路径文件` : "";
     selectionNotice.value = `${action}${replacement}；当前共 ${merged.files.length} 个文件，可继续追加，确认后再开始上传。`;
-    if (files.value.length > 20_000) error.value = "单批文件数不能超过 20,000";
-    else if (totalBytes.value > 2 * 1024 * 1024 * 1024) error.value = "单批上传不能超过 2GB";
+    if (files.value.length > MAX_UPLOAD_BATCH_FILES) error.value = "单批文件数不能超过 20,000";
+    else if (totalBytes.value > MAX_UPLOAD_BATCH_BYTES) error.value = "单批上传不能超过 2GB";
   } finally {
     checkingSelection.value = false;
   }
@@ -166,8 +203,8 @@ async function collectDrop(event: globalThis.DragEvent) {
   if (selectionLocked.value || !event.dataTransfer) return;
   try {
     await acceptSelection(await collectDroppedFiles(event.dataTransfer));
-  } catch (caught) {
-    error.value = caught instanceof Error ? `无法读取拖入的文件夹：${caught.message}` : "无法读取拖入的文件夹";
+  } catch {
+    error.value = "浏览器无法读取拖入的文件夹。请改用“选择文件夹”，或重新拖入后再试。";
   }
 }
 
@@ -210,10 +247,10 @@ async function awaitPreview(importBatchId: string) {
       error.value = "";
     } catch (caught) {
       consecutiveFailures += 1;
-      const detail = caught instanceof Error ? caught.message : "未知网络错误";
+      const detail = progressErrorText(caught instanceof Error ? caught.message : undefined);
       if (consecutiveFailures >= 3) {
         status.value = "error";
-        error.value = `自动刷新连续失败，已停止等待：${detail}。请手动刷新；如仍未恢复，请复制顶部诊断 ID 联系管理员。`;
+        error.value = `页面连续 3 次无法取得最新进度：${detail}。请手动刷新；如仍未恢复，请把页面顶部的处理编号发给管理员。`;
         emit("workflowChange");
         return;
       }
@@ -233,13 +270,34 @@ async function restoreLatestPreview() {
     if (restoreEpoch !== stateEpoch) return;
     if (!latest) return;
     if (!await refreshPreview(latest.id, restoreEpoch)) return;
+    if (preview.value?.status === "RUNNING" && preview.value.stage === "UPLOAD" && preview.value.uploadBatchId) {
+      batchId.value = preview.value.uploadBatchId;
+      status.value = "error";
+      error.value = preview.value.uploadReady
+        ? "文件已经上传，但系统还没有开始检查。请点击“重新检查已上传文件”；不需要重新选择文件。"
+        : "上次上传还没有完成。刷新页面后，浏览器无法继续读取原来的本地文件；请点击“安全取消”，再重新选择文件。";
+      return;
+    }
     if (preview.value && ["QUEUED", "RUNNING", "PROCESSING"].includes(preview.value.status)) void awaitPreview(latest.id);
   } catch (caught) {
     if (restoreEpoch !== stateEpoch) return;
-    const detail = caught instanceof Error ? caught.message : "未知网络错误";
-    error.value = `恢复最近批次失败：${detail}。可刷新页面重试；确认没有进行中的批次后，也可继续选择文件。`;
+    const detail = progressErrorText(caught instanceof Error ? caught.message : undefined);
+    error.value = `无法取得上次上传的进度：${detail}。请刷新页面重试；确认没有正在处理的文件后，也可以重新选择文件。`;
   } finally {
     if (restoreEpoch === stateEpoch) restoringLatest.value = false;
+  }
+}
+
+async function completeCurrentUpload() {
+  if (!batchId.value) return;
+  status.value = "preflight";
+  error.value = "";
+  try {
+    const completion = await api.completeUpload(batchId.value);
+    await awaitPreview(completion.id);
+  } catch {
+    status.value = "error";
+    error.value = "文件已经上传，但系统暂时无法开始检查。请点击“重新检查已上传文件”；不需要重新选择文件。";
   }
 }
 
@@ -272,12 +330,11 @@ async function startUpload() {
       error.value = uploadFailureMessage(result.failed);
       return;
     }
-    status.value = "preflight";
-    const completion = await api.completeUpload(batchId.value);
-    await awaitPreview(completion.id);
+    await completeCurrentUpload();
   } catch (caught) {
     status.value = "error";
-    error.value = caught instanceof Error ? caught.message : "上传失败";
+    const detail = caught instanceof Error ? caught.message : undefined;
+    error.value = batchId.value ? uploadAttemptErrorText(detail) : uploadStartErrorText(detail);
   }
 }
 
@@ -300,11 +357,10 @@ async function skipFailedFiles() {
       await api.failUploadFile(item.remoteId, clientFailureCode(item.error));
       item.state = "skipped";
     }
-    const completion = await api.completeUpload(batchId.value);
-    await awaitPreview(completion.id);
-  } catch (caught) {
+    await completeCurrentUpload();
+  } catch {
     status.value = "error";
-    error.value = caught instanceof Error ? caught.message : "跳过失败文件后无法开始预检";
+    error.value = "系统暂时无法继续检查其他文件。请刷新页面后重试；已上传成功的文件不需要重新选择。";
   }
 }
 
@@ -318,8 +374,8 @@ async function retryImport() {
     status.value = "processing";
     emit("workflowChange");
     void awaitPreview(currentPreview.id);
-  } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "重试入库失败";
+  } catch {
+    error.value = "资料暂时无法重新保存。请稍后再试；已上传成功的文件不会丢失。";
   } finally {
     resuming.value = false;
   }
@@ -329,7 +385,7 @@ async function confirmHardExclusions() {
   if (checkingSelection.value || restoringLatest.value || resuming.value) return;
   const currentPreview = preview.value;
   const batch = currentPreview?.id;
-  if (!currentPreview || !batch || !hardIncompleteSlices.value.length) { error.value = "没有可确认的缺失切片，请刷新状态"; return; }
+  if (!currentPreview || !batch || !hardIncompleteSlices.value.length) { error.value = "目前没有可确认不计算的项目，请刷新页面查看最新状态"; return; }
   resuming.value = true;
   error.value = "";
   try {
@@ -343,8 +399,8 @@ async function confirmHardExclusions() {
     status.value = "processing";
     emit("workflowChange");
     void awaitPreview(batch);
-  } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "无法确认排除并继续计算";
+  } catch {
+    error.value = "系统暂时无法保存本次选择。请稍后重试；在保存成功前，缺少资料的项目不会进入正式结果。";
   } finally {
     resuming.value = false;
   }
@@ -356,10 +412,10 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
 
 <template>
   <section class="workflow-stage-page" data-density="6">
-    <PageHeader title="资料准备" description="上传资料后，系统会在本页自动完成预检和入库；如有阻断，也直接在这里处理。" />
+    <PageHeader title="资料准备" description="上传资料后，系统会自动检查文件、保存可用资料并开始计算。遇到问题时，本页会说明影响和下一步怎么做。" />
 
     <section id="upload-source" class="surface-section upload-picker">
-      <div class="section-heading"><h2>选择来源文件</h2><p>保留相对路径。CSV、有效的制表符 TXT 与结构已确认的配送 XLSX 参与计算；PDF、交易报告 XLSX 和其他文件仅列入预检。</p></div>
+      <div class="section-heading"><h2>选择来源文件</h2><p>请选择完整文件夹，系统会记住文件在文件夹中的位置。CSV、从表格软件导出的 TXT 和系统已确认列名的配送货件 XLSX 可以用于计算；PDF 只登记文件名，交易报告 XLSX 和其他文件只保留文件信息。</p></div>
       <div
         class="upload-drop-zone"
         :class="{ 'is-active': dragActive, 'is-disabled': selectionLocked }"
@@ -371,27 +427,27 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
         @drop.prevent="collectDrop"
       >
         <div aria-hidden="true" class="upload-drop-icon">＋</div>
-        <div><strong>拖入文件夹、ZIP 或文件</strong><p>若当前浏览器的原生选择器一次只允许选择一个文件夹，可重复追加；也可一次拖入多个文件夹。直接选择的 PDF 只登记文件名；ZIP 内含 PDF 时会拒绝该 ZIP。</p></div>
+        <div><strong>拖入文件夹、ZIP 或文件</strong><p>如果浏览器一次只能选择一个文件夹，可以多选几次继续添加；也可以一次拖入多个文件夹。直接选择的 PDF 只登记文件名；ZIP 中有 PDF 时，整个 ZIP 都不会上传。</p></div>
         <div class="upload-source-actions">
           <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加文件夹" : "选择文件夹" }}<input type="file" multiple webkitdirectory directory :disabled="selectionLocked" @change="collect" /></label>
           <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加 ZIP 或文件" : "选择 ZIP 或文件" }}<input type="file" multiple accept=".zip,.csv,.txt,.pdf,.xlsx,.xls" :disabled="selectionLocked" @change="collect" /></label>
         </div>
       </div>
       <div v-if="files.length" class="selection-summary"><span>{{ files.length }} 个文件</span><strong>{{ formatBytes(totalBytes) }}</strong><span>上限 20,000 个文件 / 2GB</span></div>
-      <p v-if="restoringLatest" class="action-help" role="status">正在检查最近批次，完成前暂不可选择或开始上传。</p>
+      <p v-if="restoringLatest" class="action-help" role="status">正在查看上次上传的进度，完成前暂时不能选择文件或开始上传。</p>
       <p v-if="selectionNotice" class="action-help" role="status">{{ selectionNotice }}</p>
-      <div v-if="uploadItems.length" class="file-manifest" role="region" aria-label="待上传文件" tabindex="0"><div v-for="item in uploadItems.slice(0, 200)" :key="item.key"><span>{{ item.path }}</span><b>{{ /\.pdf$/i.test(item.path) ? "仅登记文件名" : formatBytes(item.size) }}</b><span class="status-chip" :data-state="item.state">{{ /\.pdf$/i.test(item.path) && item.state === "complete" ? "未解析" : uploadStateNames[item.state] }}</span><small v-if="item.error">{{ item.error }}</small></div><p v-if="uploadItems.length > 200">另有 {{ uploadItems.length - 200 }} 个文件，服务端仍会校验完整清单。</p></div>
+      <div v-if="uploadItems.length" class="file-manifest" role="region" aria-label="待上传文件" tabindex="0"><div v-for="item in uploadItems.slice(0, 200)" :key="item.key"><span>{{ item.path }}</span><b>{{ /\.pdf$/i.test(item.path) ? "仅登记文件名" : formatBytes(item.size) }}</b><span class="status-chip" :data-state="item.state">{{ /\.pdf$/i.test(item.path) && item.state === "complete" ? "未读取正文" : uploadStateNames[item.state] }}</span><small v-if="item.error">{{ uploadErrorText(item.error) }}</small></div><p v-if="uploadItems.length > 200">另有 {{ uploadItems.length - 200 }} 个文件，服务器也会检查完整清单。</p></div>
       <p v-if="error && !preview" class="form-error" role="alert">{{ error }}</p>
       <div v-if="status !== 'idle' && !preview" class="warning-panel" :data-tone="uploadConclusion.tone" role="status"><strong>{{ uploadConclusion.title }}</strong><p>{{ uploadConclusion.detail }}</p></div>
-      <div v-if="status === 'uploading'" class="upload-progress" role="status" aria-live="polite"><div><span>分片上传 {{ progress }}%</span><b>可在中断后按服务端 offset 续传</b></div><progress :value="Number(progress)" max="100"></progress></div>
-      <div class="form-actions"><button v-if="files.length && !batchId && ['idle','error'].includes(status)" class="primary-button" type="button" :disabled="!canStartUpload" @click="startUpload">{{ status === "error" ? "重试开始上传" : "开始上传" }}</button><button v-if="canContinue" class="primary-button" type="button" @click="startUpload">继续上传</button><button v-if="canContinue" class="secondary-button" type="button" @click="skipFailedFiles">跳过失败并继续</button><button v-if="batchId && ['uploading','preflight','error'].includes(status)" class="secondary-button" type="button" @click="cancel">安全取消</button></div>
+      <div v-if="status === 'uploading'" class="upload-progress" role="status" aria-live="polite"><div><span>正在上传 {{ progress }}%</span><b>网络中断后，可从上次成功的位置继续</b></div><progress :value="Number(progress)" max="100"></progress></div>
+      <div class="form-actions"><button v-if="files.length && !batchId && ['idle','error'].includes(status)" class="primary-button" type="button" :disabled="!canStartUpload" @click="startUpload">{{ status === "error" ? "重试开始上传" : "开始上传" }}</button><button v-if="canContinue" class="primary-button" type="button" @click="startUpload">继续上传</button><button v-if="canContinue" class="secondary-button" type="button" @click="skipFailedFiles">跳过失败并继续</button><button v-if="canRetryCompletion" class="primary-button" type="button" @click="completeCurrentUpload">重新检查已上传文件</button><button v-if="batchId && ['uploading','preflight','error'].includes(status)" class="secondary-button" type="button" @click="cancel">安全取消</button></div>
     </section>
 
     <section v-if="preview" class="surface-section workflow-commit-panel">
-      <div class="section-heading"><h2>当前批次</h2><p>预检、入库和后续自动处理都在这里原位更新，无需切换子步骤。</p></div>
+      <div class="section-heading"><h2>本次资料</h2><p>文件检查、保存和计算进度都会在这里自动更新，不需要切换页面。</p></div>
       <div class="commit-summary">
-        <div><span>可识别文件</span><strong>{{ recognizedFileCount }}</strong></div>
-        <div><span>过滤文件</span><strong>{{ preview.ignored.length }}</strong></div>
+        <div><span>可用于计算</span><strong>{{ recognizedFileCount }}</strong></div>
+        <div><span>未参与计算</span><strong>{{ preview.ignored.length }}</strong></div>
         <div><span>问题数量</span><strong>{{ preflightIssueCount }}</strong></div>
         <div><span>当前状态</span><strong>{{ previewStatusLabel }}</strong></div>
       </div>
@@ -399,22 +455,22 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
 
       <details v-if="preflightFiles.length || preview.issues.length" class="preflight-detail">
         <summary>查看文件与问题明细</summary>
-        <div v-if="preflightFiles.length" class="table-scroll" tabindex="0"><table><thead><tr><th>相对路径</th><th>分类</th><th>状态</th><th>说明</th></tr></thead><tbody><tr v-for="file in preflightFiles" :key="file.path"><td>{{ file.path }}</td><td>{{ file.classification }}</td><td><span class="status-chip" :data-state="file.status">{{ file.status }}</span></td><td>{{ file.detail }}</td></tr></tbody></table></div>
-        <div v-if="preview.issues.length" class="issue-list"><article v-for="issue in preview.issues" :key="issue.id" :data-severity="issue.severity"><header><strong>{{ issue.message }}</strong><span>{{ issue.exactCount ? `${issue.count} 条` : `${issue.count} 条样例` }}</span></header><p>{{ issue.action }}</p><code>{{ issue.kind }}</code></article></div>
+        <div v-if="preflightFiles.length" class="table-scroll" tabindex="0"><table><thead><tr><th>文件在所选文件夹中的位置</th><th>文件内容</th><th>处理结果</th><th>说明</th></tr></thead><tbody><tr v-for="file in preflightFiles" :key="file.path"><td>{{ file.path }}</td><td>{{ file.classification }}</td><td><span class="status-chip" :data-state="file.status">{{ file.status }}</span></td><td>{{ file.detail }}</td></tr></tbody></table></div>
+        <div v-if="preview.issues.length" class="issue-list"><article v-for="issue in preview.issues" :key="issue.id" :data-severity="issue.severity"><header><strong>{{ issue.message }}</strong><span>{{ issue.exactCount ? `${issue.count} 条` : `${issue.count} 条示例` }}</span></header><p>{{ issue.action }}</p></article></div>
       </details>
 
-      <div class="section-heading"><h2>站点 × 月份资料完整性</h2><p>{{ commitCoverageRows.length ? "仅列出缺少资料的站点月份，完整项已自动收起。" : "系统只提示需要处理的缺失项。" }}</p></div>
-      <div v-if="commitCoverageRows.length" class="table-scroll commit-coverage-table" tabindex="0" role="region" aria-label="站点月份资料完整性"><table><thead><tr><th>站点</th><th>月份</th><th>缺失内容</th></tr></thead><tbody><tr v-for="slice in commitCoverageRows" :key="slice.datasetVersionId || `${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chip"><b aria-hidden="true">!</b>缺少{{ slice.missingContent }}</span></td></tr></tbody></table></div>
-      <div v-else-if="hasCompleteness" class="warning-panel" data-tone="success" role="status"><strong>资料已齐全</strong><p>当前站点与月份均同时包含交易报告和配送货件，可以继续核算。</p></div>
+      <div class="section-heading"><h2>缺少资料的站点和月份</h2><p>{{ commitCoverageRows.length ? "这里只列出需要补资料的站点和月份；资料齐全的项目已经自动收起。" : "系统只会显示需要处理的缺失项目。" }}</p></div>
+      <div v-if="commitCoverageRows.length" class="table-scroll commit-coverage-table" tabindex="0" role="region" aria-label="缺少资料的站点和月份"><table><thead><tr><th>站点</th><th>月份</th><th>缺少什么</th></tr></thead><tbody><tr v-for="slice in commitCoverageRows" :key="slice.datasetVersionId || `${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chip"><b aria-hidden="true">!</b>缺少{{ slice.missingContent }}</span></td></tr></tbody></table></div>
+      <div v-else-if="hasCompleteness" class="warning-panel" data-tone="success" role="status"><strong>资料已可核算</strong><p>配送货件或纯 FMB 交易资料已覆盖当前站点和月份，可以继续核算。</p></div>
       <div v-else class="inline-empty">正在汇总站点和月份，处理完成后会在本页原位更新。</div>
 
       <section v-if="requiresHardExclusionConfirmation" class="quality-blocker" aria-labelledby="hard-exclusion-title">
-        <h3 id="hard-exclusion-title">需要确认排除缺失切片</h3>
-        <p>上表中的站点月份不能按 0 计算。确认后只排除这些缺失切片，其余完整数据继续自动计算和发布。</p>
-        <label class="form-field"><span>排除原因（选填）</span><textarea v-model="exclusionReason" rows="3" maxlength="1000" placeholder="可补充说明本次排除原因"></textarea></label>
+        <h3 id="hard-exclusion-title">确认不计算缺少资料的项目</h3>
+        <p>上表中的站点和月份不能当作 0 计算。确认后，系统不会计算这些缺少资料的项目；其他资料齐全的项目会继续计算并生成正式结果。</p>
+        <label class="form-field"><span>为什么不计算（选填）</span><textarea v-model="exclusionReason" rows="3" maxlength="1000" placeholder="例如：该站点本月没有经营，确认不需要计算"></textarea></label>
       </section>
       <p v-if="error" class="form-error" role="alert">{{ error }}</p>
-      <div class="stage-next-action"><span class="action-help">{{ requiresHardExclusionConfirmation ? '补充文件，或确认排除后继续处理。' : preview.status === 'PUBLISHED' ? '资料处理完成，可以进入计算复核。' : '系统会继续自动处理，当前状态会在本页更新。' }}</span><button v-if="retryableCommitFailure" class="primary-button" type="button" :disabled="checkingSelection || restoringLatest || resuming" @click="retryImport">{{ resuming ? "正在重试" : "重试入库" }}</button><template v-else-if="requiresHardExclusionConfirmation"><a class="secondary-button" href="#upload-source">补充文件</a><button class="primary-button" type="button" :disabled="resuming || checkingSelection || restoringLatest" @click="confirmHardExclusions">{{ resuming ? "正在继续" : "确认排除并继续" }}</button></template><a v-else-if="preview.status === 'FAILED'" class="secondary-button" href="#upload-source">补充文件</a><RouterLink v-else-if="preview.status === 'PUBLISHED'" class="primary-button" :to="`/shops/${shopId}/workflow/calculate`">进入计算复核</RouterLink></div>
+      <div class="stage-next-action"><span class="action-help">{{ requiresHardExclusionConfirmation ? '补充文件，或确认不计算这些项目后继续。' : preview.status === 'PUBLISHED' ? '资料处理完成，可以进入计算复核。' : '系统会继续自动处理，当前状态会在本页更新。' }}</span><button v-if="retryableCommitFailure" class="primary-button" type="button" :disabled="checkingSelection || restoringLatest || resuming" @click="retryImport">{{ resuming ? "正在重试" : "重新保存资料" }}</button><template v-else-if="requiresHardExclusionConfirmation"><a class="secondary-button" href="#upload-source">补充文件</a><button class="primary-button" type="button" :disabled="resuming || checkingSelection || restoringLatest" @click="confirmHardExclusions">{{ resuming ? "正在继续" : "确认不计算并继续" }}</button></template><a v-else-if="preview.status === 'FAILED'" class="secondary-button" href="#upload-source">补充文件</a><RouterLink v-else-if="preview.status === 'PUBLISHED'" class="primary-button" :to="`/shops/${shopId}/workflow/calculate`">进入计算复核</RouterLink></div>
     </section>
   </section>
 </template>

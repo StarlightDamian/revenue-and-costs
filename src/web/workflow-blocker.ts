@@ -32,15 +32,15 @@ function knownBatchFailure(
 ): Pick<WorkflowBlockerPresentation, "title" | "message" | "action"> {
   if (workflow.processingHealth?.terminalRecoveryBlocked === true) {
     return {
-      title: "后台任务恢复受阻",
-      message: "后台任务已超时，原处理仍在退出或失败终态尚未恢复成功。当前流程已明确标记为阻断，不会无提示地继续处理中；如持续出现，请提供诊断 ID 联系管理员。",
+      title: "后台处理暂时无法恢复",
+      message: "这项后台处理已超时，系统已经暂停，不会一直显示处理中。如多次重试仍出现此问题，请把处理编号发给管理员。",
       action: workflowRoute(workflow.shop.id, code),
     };
   }
   if (workflow.processingHealth?.workerAvailable === false) {
     return {
       title: "后台处理服务暂不可用",
-      message: "后台处理服务暂不可用，请稍后重试或联系管理员，并提供诊断 ID。系统已经停止等待，不会无提示地持续处理中。",
+      message: "系统暂时无法继续处理，请稍后重试。如多次重试仍失败，请把处理编号发给管理员。",
       action: workflowRoute(workflow.shop.id, code),
     };
   }
@@ -63,39 +63,36 @@ function knownBatchFailure(
   if (failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED") {
     return {
       title: "资料缺失，等待处理",
-      message: "缺失资料不能按 0 计算。请补充文件，或在当前页面确认排除缺失切片后继续。",
+      message: "缺失资料不能当作 0 计算。请补充文件，或确认不计算这些缺少资料的站点和月份后继续。",
       action: workflowRoute(workflow.shop.id, "COMMIT"),
     };
   }
   if (failureCode === "CALCULATION_DATE_ATTRIBUTION_MODE_MIXED") {
     return {
-      title: "数据日期口径不一致",
-      message: "同一正式结果不能混用不同日期口径。请按报表字面日期口径完整重传当前数据范围。",
+      title: "资料的日期计算方式不一致",
+      message: "同一份正式结果中的日期必须按同一种方法计算。请按报表上显示的日期，重新上传当前范围内的全部资料。",
       action: workflowRoute(workflow.shop.id, "CALCULATE"),
     };
   }
   if (["IMPORT_DATABASE_CAPACITY_UNAVAILABLE", "IMPORT_DATABASE_CAPACITY_INSUFFICIENT"].includes(failureCode)) {
     return {
-      title: "数据入库暂时不可用",
+      title: "资料暂时无法保存",
       message: failureCode === "IMPORT_DATABASE_CAPACITY_INSUFFICIENT"
-        ? "数据库可用空间不足，系统已停止入库。释放空间后可在资料准备页重试，无需重新上传。"
-        : "数据库容量检查暂时不可用，系统已停止入库。配置恢复后可在资料准备页重试，无需重新上传。",
+        ? "服务器可用空间不足，系统已暂停保存资料。管理员释放空间后，可在资料准备页重试，无需重新上传。"
+        : "系统暂时无法确认服务器是否有足够空间，因此没有继续保存资料。恢复后可在资料准备页重试，无需重新上传。",
       action: workflowRoute(workflow.shop.id, "COMMIT"),
     };
   }
   if (failureCode === "AUTO_PUBLISH_FAILED") {
     return {
       title: "正式结果发布失败",
-      message: "计算已经完成，但自动发布未成功。上一份正式结果仍然有效，请在计算复核页查看并受控重试。",
+      message: "计算已经完成，但新的正式结果没有保存成功。上一份正式结果仍然有效，请到计算复核页查看并重试。",
       action: workflowRoute(workflow.shop.id, "PUBLISH"),
     };
   }
-  const blockingStep = workflow.steps.find((step) => step.code === code);
   return {
-    title: `${blockingStep?.label ?? "当前流程"}被阻断`,
-    message: failureCode
-      ? `系统已停止当前处理，错误代码为 ${failureCode}。请在当前阶段查看处理方式；如需协助，请提供诊断 ID。`
-      : "系统已停止当前处理。请在当前阶段查看阻断详情；如需协助，请提供诊断 ID。",
+    title: "当前处理已暂停",
+    message: "请在当前页面查看处理方法。如仍无法继续，请把处理编号发给管理员。",
     action: workflowRoute(workflow.shop.id, code),
   };
 }
@@ -125,7 +122,7 @@ export function workflowBlockerPresentation(
       title: latestExport.status === "REVOKED" ? "报告下载授权已失效" : "报告生成失败",
       message: latestExport.status === "REVOKED"
         ? "当前报告的下载授权已经失效。请在报告交付页重新检查权限并创建新报告。"
-        : "报告未能生成，系统已停止等待。请在报告交付页查看任务状态并受控重试。",
+        : "报告没有生成成功。请到报告交付页查看状态并重新生成。",
       diagnosticId: workflow.diagnosticId,
       action: workflowRoute(workflow.shop.id, "EXPORT"),
     };

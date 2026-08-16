@@ -13,7 +13,7 @@ export function structuredLog(
   fields: Readonly<Record<string, unknown>> = {},
 ): void {
   try {
-    const line = JSON.stringify({ level, time: Date.now(), event, service, ...fields }, (_key, value) => jsonValue(value));
+    const line = JSON.stringify({ ...fields, level, time: Date.now(), event, service }, (_key, value) => jsonValue(value));
     (level === "error" ? process.stderr : process.stdout).write(`${line}\n`);
   } catch {
     // Diagnostics must never become a business-flow failure.

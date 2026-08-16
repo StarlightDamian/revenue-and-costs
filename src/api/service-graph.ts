@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { Pool } from "pg";
 import { PostgresDatabase } from "../db/database.js";
-import { authorizePlatform, authorizeShop, CoreTransactionSideEffects, requireAllowed, type Actor, type ShopCapability } from "../modules/authorization/index.js";
+import { authorizePlatform, authorizeShop, CoreTransactionSideEffects, readEffectiveShopAccess, requireAllowed, type Actor, type ShopCapability } from "../modules/authorization/index.js";
 import {
   AuthService,
   IdentityAdminService,
@@ -110,27 +110,7 @@ export function createServiceGraph(config: AppConfig, pool: Pool) {
     authenticateAuthRoute({ auth, publicOrigin: config.publicOrigin }, request, requireCsrf);
 
   const authorizeShopCapability = async (actor: Actor, shopId: string, capability: ShopCapability, reason?: string): Promise<void> => {
-    const result = await database.query<{
-      id: string;
-      enterprise_id: string;
-      status: "ACTIVE" | "EXPIRED_READONLY" | "TRASHED" | "PURGED";
-      membership_id: string | null;
-      membership_status: "ACTIVE" | "REVOKED" | "EXPIRED" | null;
-      export_allowed: boolean | null;
-      authorization_epoch: string | null;
-    }>(
-      `SELECT s.id, s.enterprise_id,
-              CASE WHEN s.status = 'ACTIVE'
-                         AND s.close_date <= timezone('Asia/Shanghai', clock_timestamp())::date
-                   THEN 'EXPIRED_READONLY' ELSE s.status END AS status,
-              sm.id AS membership_id, sm.status AS membership_status,
-              sm.export_allowed, sm.authorization_epoch::text AS authorization_epoch
-         FROM shop s
-         LEFT JOIN shop_membership sm ON sm.shop_id = s.id AND sm.account_id = $2
-        WHERE s.id = $1`,
-      [shopId, actor.accountId],
-    );
-    const row = result.rows[0];
+    const row = await readEffectiveShopAccess(database, shopId, actor.accountId);
     if (!row) throw new AppError("RESOURCE_NOT_FOUND", "资源不存在或无权访问", 404);
     requireAllowed(authorizeShop(
       actor,

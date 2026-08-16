@@ -8,5 +8,5 @@ export function compactDiagnosticId(value: string): string {
 }
 
 export function diagnosticClipboardText(value: string): string {
-  return `诊断ID: ${value}`;
+  return `处理编号：${value}`;
 }

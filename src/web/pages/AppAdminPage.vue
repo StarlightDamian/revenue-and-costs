@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import type { AdminApp } from "../api/types";
 import AsyncState from "../components/AsyncState.vue";
 import PageHeader from "../components/PageHeader.vue";
@@ -12,12 +13,13 @@ async function update(app: AdminApp, action: string, allowedRoles?: Array<"ACCOU
   selectedId.value = app.id; actionError.value = "";
   if (!reason.value.trim()) { actionError.value = "应用和价格变更必须填写原因"; return; }
   try { await api.updateAdminApp(app, { action, reason: reason.value.trim(), ...(action === "NEW_PRICE" ? { annualPriceYuan: price.value } : {}), ...(allowedRoles ? { allowedRoles } : {}) }); price.value = ""; reason.value = ""; await reload(); }
-  catch (caught) { actionError.value = caught instanceof Error ? caught.message : "操作失败"; }
+  catch (caught) { actionError.value = userFacingError(caught); }
 }
 async function toggleUserCreation(app: AdminApp) {
   const allowedRoles: Array<"ACCOUNTANT"> = app.allowedRoles.includes("ACCOUNTANT") ? [] : ["ACCOUNTANT"];
   await update(app, "SET_ROLES", allowedRoles);
 }
+const appStatusName = (status: AdminApp["status"]) => status === "PUBLISHED" ? "已上架" : "已下架";
 </script>
 
 <template>
@@ -50,7 +52,7 @@ async function toggleUserCreation(app: AdminApp) {
                     class="compact-input"
                     aria-label="应用名称"
                   >
-                </td><td>{{ app.status }}</td><td>
+                </td><td>{{ appStatusName(app.status) }}</td><td>
                   <input
                     v-model.trim="app.sortOrder"
                     class="compact-input"
@@ -105,7 +107,7 @@ async function toggleUserCreation(app: AdminApp) {
           </table>
         </div>
         <div class="governance-links">
-          <span>字段映射</span><span>站点别名、时区与重要性</span><span>人工汇率</span><span>失败任务</span><span>审计事件</span><p>这些治理能力由同一管理员 API 提供，任何变更均创建新版本或审计事件。</p>
+          <span>确认表格每一列的含义</span><span>站点名称、时间和重要程度</span><span>人工汇率</span><span>失败任务</span><span>操作记录</span><p>管理员对这些内容的每次修改都会保留记录，方便以后核对。</p>
         </div>
       </section>
     </AsyncState>

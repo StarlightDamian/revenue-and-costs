@@ -38,9 +38,13 @@ describe("set-based import materialization", () => {
     expect(statements.some((sql) => sql.includes("replayed_current_slices"))).toBe(true);
     expect(statements.some((sql) => sql.includes("DATASET_SLICE_RETIRED_BY_SOURCE_REPLAY"))).toBe(true);
     expect(statements.some((sql) => sql.includes("retiredBySourceReplay"))).toBe(true);
-    expect(statements.some((sql) => sql.includes("transaction_only_fmb"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("one_sided_complete_reason"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("kinds @> ARRAY['SHIPMENT']::text[] OR ("))).toBe(true);
+    expect(statements.some((sql) => sql.includes("THEN 'SHIPMENT_ONLY'"))).toBe(true);
+    expect(statements.some((sql) => sql.includes("THEN 'TRANSACTION_ONLY_FMB'"))).toBe(true);
     const reconciliation = statements.find((sql) => sql.includes("INSERT INTO reconciliation_result"));
     expect(reconciliation).toContain("fulfillment_mode IS DISTINCT FROM 'MERCHANT'");
+    expect(reconciliation).toContain("version.kinds @> ARRAY['SHIPMENT','TRANSACTION']::text[]");
   });
 
   it("persists all file counters and issue groups with two set-based queries", async () => {

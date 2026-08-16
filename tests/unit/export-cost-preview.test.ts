@@ -24,6 +24,13 @@ describe("cost accounting export preview", () => {
           authorization_epoch: null,
         }], rowCount: 1 };
       }
+      if (sql.includes("FROM account")) {
+        return { rows: [{
+          profit_rate: "0.10000000",
+          minimum_sales_cost_rate: "0.15000000",
+          continent_prefixes: ["EU"],
+        }], rowCount: 1 };
+      }
       if (sql.includes("FROM shop_current_published_snapshot current")) {
         return { rows: [{
           published_snapshot_id: "snapshot-1",
@@ -45,11 +52,7 @@ describe("cost accounting export preview", () => {
       "D:/tmp/exports",
     );
 
-    const preview = await service.previewCostAccounting(actor, "shop-1", {
-      profitRate: "0.10000000",
-      minimumSalesCostRate: "0.15000000",
-      continentPrefixes: ["EU"],
-    });
+    const preview = await service.previewCostAccounting(actor, "shop-1");
 
     expect(preview).toMatchObject({
       snapshotId: "snapshot-1",
@@ -72,6 +75,40 @@ describe("cost accounting export preview", () => {
       procurementCny: "150.00000000",
       profitCny: "50.00000000",
       minimumAdjusted: true,
+    });
+  });
+
+  it("keeps invalid stored defaults behind the export API's stable validation error", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM shop s LEFT JOIN shop_membership")) {
+        return { rows: [{
+          id: "shop-1",
+          enterprise_id: "enterprise-1",
+          status: "ACTIVE",
+          membership_id: null,
+          membership_status: null,
+          export_allowed: null,
+          authorization_epoch: null,
+        }], rowCount: 1 };
+      }
+      if (sql.includes("FROM account")) {
+        return { rows: [{
+          profit_rate: "1.00000001",
+          minimum_sales_cost_rate: null,
+          continent_prefixes: ["EU"],
+        }], rowCount: 1 };
+      }
+      throw new Error(`UNEXPECTED_QUERY:${sql}`);
+    });
+    const service = new PostgresExportService(
+      { query } as unknown as Pool,
+      {} as never,
+      "D:/tmp/exports",
+    );
+
+    await expect(service.previewCostAccounting(actor, "shop-1")).rejects.toMatchObject({
+      code: "INVALID_ACCOUNTING_RATE",
+      statusCode: 400,
     });
   });
 });

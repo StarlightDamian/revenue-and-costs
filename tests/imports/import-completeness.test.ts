@@ -23,6 +23,7 @@ describe("import completeness projection", () => {
   it("reports every missing source independently and leaves complete slices empty", async () => {
     const database = { query: vi.fn(async () => ({ rows: [
       row({ slice_id: "complete", status: "ACTIVE" }),
+      row({ slice_id: "shipment-only-active", status: "ACTIVE", transaction_count: "0" }),
       row({ slice_id: "missing-transaction", transaction_count: "0" }),
       row({ slice_id: "missing-shipment", shipment_count: "0" }),
       row({ slice_id: "missing-both", shipment_count: "0", transaction_count: "0" }),
@@ -31,6 +32,7 @@ describe("import completeness projection", () => {
 
     await expect(service.getCompleteness("shop-1")).resolves.toEqual([
       expect.objectContaining({ sliceId: "complete", missingReports: [] }),
+      expect.objectContaining({ sliceId: "shipment-only-active", state: "COMPLETE", missingReports: [] }),
       expect.objectContaining({ sliceId: "missing-transaction", missingReports: ["TRANSACTION"] }),
       expect.objectContaining({ sliceId: "missing-shipment", missingReports: ["SHIPMENT"] }),
       expect.objectContaining({ sliceId: "missing-both", missingReports: ["TRANSACTION", "SHIPMENT"] }),

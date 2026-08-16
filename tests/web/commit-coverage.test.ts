@@ -20,4 +20,32 @@ describe("资料准备站点月份投影", () => {
       { marketplace: "US", month: "2025-10", state: "COMPLETE", missingReports: [] },
     ])).toEqual([]);
   });
+
+  it("结果页持续披露已排除、已带提醒纳入和待确认的项目，不显示内部代码", () => {
+    const rows = projectCommitCoverage([
+      { marketplace: "US", month: "2025-10", state: "COMPLETE", missingReports: [] },
+      { marketplace: "BE", month: "2025-10", state: "EXCLUDED", note: "HARD_INCOMPLETE" },
+      { marketplace: "AE", month: "2025-11", state: "PUBLISHED_WARNING", note: "SOFT_RECONCILIATION_WARNING" },
+      { marketplace: "SA", month: "2025-09", state: "CONFLICT", note: "SOFT_RECONCILIATION_WARNING" },
+    ], { includeNonMissing: true });
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        marketplace: "SA",
+        summary: "两份资料的数量不一致",
+        explanation: "这部分资料暂时不能发布。请先核对两份资料的数量，确认后再继续。",
+      }),
+      expect.objectContaining({
+        marketplace: "BE",
+        summary: "资料不完整，已确认不计算",
+        explanation: "这部分资料没有计入本次结果。补齐资料后，可以重新上传并计算。",
+      }),
+      expect.objectContaining({
+        marketplace: "AE",
+        summary: "两份资料的数量不一致",
+        explanation: "这部分资料已计入结果，但两份资料的数量不一致，请继续核对。",
+      }),
+    ]);
+    expect(JSON.stringify(rows)).not.toMatch(/HARD_INCOMPLETE|SOFT_RECONCILIATION_WARNING/u);
+  });
 });

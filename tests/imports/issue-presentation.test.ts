@@ -4,25 +4,37 @@ import { describeImportIssue } from "../../src/modules/imports/postgres-service.
 describe("import issue presentation", () => {
   it("explains aggregated required financial anchors in Chinese", () => {
     expect(describeImportIssue("IMPORT_FINANCIAL_VALUE_REQUIRED", 472, "total")).toEqual({
-      message: "必需金额为空（字段：total），相关行已过滤",
-      action: "请补充该行的总金额或必需数量后重新上传。 共 472 条。",
+      message: "有一行没有填写计算所需的金额或数量（总金额列）",
+      action: "请补充空白单元格后重新上传。这一行目前没有用于计算。 共 472 条。",
     });
+    expect(JSON.stringify(describeImportIssue("IMPORT_FINANCIAL_VALUE_REQUIRED", 472, "total"))).not.toContain("total");
+
+    expect(describeImportIssue("IMPORT_FINANCIAL_VALUE_INVALID", 1, "selling_fees").message)
+      .toContain("销售佣金列");
+    expect(describeImportIssue("IMPORT_FINANCIAL_VALUE_INVALID", 1, "private_internal_key").message)
+      .toContain("某个金额列");
   });
 
-  it("keeps unknown stable codes diagnosable without rendering row-level noise", () => {
+  it("does not show an unknown internal code to end users", () => {
     expect(describeImportIssue("IMPORT_NEW_SAFE_CODE", 1, null)).toEqual({
-      message: "检测到 IMPORT_NEW_SAFE_CODE",
-      action: "请根据问题代码检查源文件。",
+      message: "系统发现一个暂时无法自动说明的问题",
+      action: "这个文件暂时不会用于计算。请检查文件内容；如果仍不知道怎么处理，请联系管理员。",
     });
   });
 
   it("explains the single-site requirement when a marketplace still cannot be inferred", () => {
     expect(describeImportIssue("IMPORT_UNKNOWN_MARKETPLACE", 12, "marketplace").action)
-      .toBe("请补充可识别的 Amazon 销售渠道；交易报告还需确保同一文件只有一个可识别站点。 共 12 条。");
+      .toBe("请填写明确的 Amazon 站点名称。如果是交易报告，同一个文件内只保留一个站点，然后重新上传。这一行目前没有用于计算。 共 12 条。");
   });
 
-  it("labels legacy capped row issues as diagnostic samples instead of exact totals", () => {
+  it("labels legacy capped row issues as examples instead of exact totals", () => {
     expect(describeImportIssue("IMPORT_FINANCIAL_VALUE_REQUIRED", 100, "total", false).action)
-      .toContain("已记录 100 条诊断样例");
+      .toContain("已记录 100 条示例");
+  });
+
+  it("explains an unknown table without mapping jargon", () => {
+    const issue = describeImportIssue("AWAITING_MAPPING", 1, null);
+    expect(issue.message).toContain("每一列代表什么");
+    expect(`${issue.message}${issue.action}`).not.toMatch(/字段映射|未知结构|入库|诊断/u);
   });
 });

@@ -2,7 +2,7 @@ import { statfs } from "node:fs/promises";
 import type * as FsPromises from "node:fs/promises";
 import type { Pool, PoolClient } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { commitImportBatch, isPersistedImportCommitFailure } from "../../src/modules/imports/postgres-commit.js";
+import { assertSourceReplayClosureCurrent, commitImportBatch, isPersistedImportCommitFailure } from "../../src/modules/imports/postgres-commit.js";
 import type { EncryptedObjectStore } from "../../src/modules/storage/encrypted-object-store.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => ({
@@ -96,5 +96,27 @@ describe("PostgreSQL import capacity admission", () => {
     expect(isPersistedImportCommitFailure(databaseError)).toBe(true);
     expect(queries.find(({ sql }) => sql.includes("UPDATE import_batch SET status='FAILED'"))?.parameters?.[1])
       .toBe("IMPORT_QUERY_INVALID");
+  });
+
+  it("locks the slice pointers and fails a replay when its frozen current closure changed", async () => {
+    const queries: string[] = [];
+    const query = vi.fn(async (statement: unknown) => {
+      const sql = typeof statement === "string" ? statement : "COPY_STREAM";
+      queries.push(sql);
+      if (sql.includes("event.metadata->>'sourceClosureHash'")) {
+        return { rows: [{ shop_id: "00000000-0000-4000-8000-000000000003", source_closure_hash: "0".repeat(64) }] };
+      }
+      if (sql.includes("SELECT id FROM dataset_slice WHERE shop_id")) return { rows: [] };
+      if (sql.includes("SELECT version.id::text dataset_version_id")) return { rows: [] };
+      return { rows: [], rowCount: 1 };
+    });
+    const client = { query } as unknown as PoolClient;
+
+    await expect(assertSourceReplayClosureCurrent(
+      client,
+      "00000000-0000-4000-8000-000000000001",
+    )).rejects.toThrow("SOURCE_REPLAY_CURRENT_CLOSURE_CHANGED");
+
+    expect(queries.some((sql) => sql.includes("SELECT id FROM dataset_slice WHERE shop_id=$1 ORDER BY id FOR UPDATE"))).toBe(true);
   });
 });

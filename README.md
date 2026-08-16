@@ -62,13 +62,14 @@ API 每个请求输出一条 JSON 终态事件，可按页面错误响应中的 
 ## 质量门禁
 
 ```powershell
-pnpm verify          # 无数据库单元/合约测试 + lint + typecheck + build
+pnpm verify          # 无数据库单元/合约测试 + lint + build（build 内含 typecheck）
 pnpm test:postgres   # 在 TEST_DATABASE_URL 基库中每套件创建并销毁随机 schema
+pnpm test:report-acceptance # 在同一测试基库的独立随机 schema 中自建夹具并清理
 pnpm test:ui-contract
-pnpm verify:release  # 上述三项的发布总门禁
+pnpm verify:release  # 上述测试、报告验收和 UI 合约的发布总门禁
 ```
 
-`pnpm test` 不含数据库套件，也不使用 skip 把缺失环境伪装为通过。常规 PostgreSQL 集成测试只读取 `TEST_DATABASE_URL`，并通过随机 schema + `search_path` 隔离并发套件。会发布快照的报告验收只能显式使用专用 `REPORT_ACCEPTANCE_DATABASE_URL` 运行 `pnpm test:report-acceptance`；恢复演练只能使用独立的 `OPERATIONS_TEST_SOURCE_DATABASE_URL` 和 `OPERATIONS_TEST_RESTORE_DATABASE_URL` 运行 `pnpm test:recovery`。2GB 和 PITR 验收产物写入 `.work/acceptance`，不得指向业务样例目录。
+`pnpm test` 不含数据库套件，也不使用 skip 把缺失环境伪装为通过。常规 PostgreSQL 集成测试和报告验收只读取 `TEST_DATABASE_URL`，每套件在基库中创建独立随机 schema、自建确定性夹具并在结束后清理。恢复演练只能使用独立的 `OPERATIONS_TEST_SOURCE_DATABASE_URL` 和 `OPERATIONS_TEST_RESTORE_DATABASE_URL` 运行 `pnpm test:recovery`。2GB 和 PITR 验收产物写入 `.work/acceptance`，不得指向业务样例目录。
 
 ## 生产停止条件
 

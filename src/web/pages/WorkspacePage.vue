@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { api } from "../api/client";
+import { userFacingError } from "../api/http";
 import { currentEnterprise, enterpriseState, loadEnterprises } from "../enterprise";
 import PageHeader from "../components/PageHeader.vue";
 
@@ -16,7 +17,7 @@ async function load() {
   try {
     await loadEnterprises(true);
     shops.value = await api.listShops(currentEnterprise.value?.id);
-  } catch (caught) { error.value = caught instanceof Error ? caught.message : "工作台加载失败"; }
+  } catch (caught) { error.value = userFacingError(caught, "暂时无法读取工作台，请检查网络后重试"); }
   finally { loading.value = false; }
 }
 

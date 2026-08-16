@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api/client";
-import { isApiErrorCode } from "../api/http";
+import { isApiErrorCode, userFacingError } from "../api/http";
 import { acceptSession } from "../session";
 import { avatarById } from "../avatars";
 import ThemeSwitcher from "../components/ThemeSwitcher.vue";
@@ -65,7 +65,7 @@ async function sendOtp() {
     sandboxCode.value = result.sandboxCode ?? "";
     beginCountdown();
   } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "验证码发送失败";
+    error.value = userFacingError(caught, "暂时无法发送验证码，请检查网络后重试");
   } finally { busy.value = false; }
 }
 
@@ -93,7 +93,7 @@ async function submitAuth() {
       error.value = "该手机号尚未注册，已切换到注册。姓名可以不填，请重新获取验证码。";
       return;
     }
-    error.value = caught instanceof Error ? caught.message : "登录失败";
+    error.value = userFacingError(caught, "暂时无法登录，请检查网络后重试");
   } finally { busy.value = false; }
 }
 
@@ -122,8 +122,8 @@ onBeforeUnmount(() => window.clearInterval(timer));
           <div><strong>59 个动物头像</strong><span>用熟悉的角色进入成本测算</span></div>
         </div>
         <div class="login-principles">
-          <div><strong>按版本复核</strong><span>数据、映射、日期口径、公式与汇率共同固定</span></div>
-          <div><strong>自动发布</strong><span>资料准备完成后自动计算并发布，失败时保留可追溯恢复入口</span></div>
+          <div><strong>结果能核对</strong><span>每次计算都会记住使用了哪些资料、规则和汇率</span></div>
+          <div><strong>自动出结果</strong><span>资料准备完成后自动计算；失败时会说明原因和下一步</span></div>
         </div>
       </section>
       <section class="login-card" aria-labelledby="login-title">

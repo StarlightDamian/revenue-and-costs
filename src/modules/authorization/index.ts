@@ -196,3 +196,5 @@ export interface TransactionSideEffects {
 }
 
 export { CoreTransactionSideEffects } from './events.js';
+export { readEffectiveShopAccess } from './shop-access.js';
+export type { EffectiveShopAccessRow } from './shop-access.js';

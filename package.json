@@ -42,10 +42,10 @@
     "typecheck": "tsc --noEmit && vue-tsc --noEmit",
     "build:web": "vite build",
     "build:server": "tsup src/api/index.ts src/worker/index.ts --format esm --sourcemap --out-dir dist/server --clean",
-    "build:cli": "tsup scripts/migrate.ts scripts/db-status.ts scripts/bootstrap-admin.ts scripts/bootstrap-mappings.ts scripts/assert-production-initial-state.ts scripts/sync-fx.ts --format esm --sourcemap --out-dir dist/cli --clean",
+    "build:cli": "tsup scripts/migrate.ts scripts/db-status.ts scripts/bootstrap-admin.ts scripts/bootstrap-mappings.ts scripts/assert-production-initial-state.ts scripts/sync-fx.ts scripts/replay-shop-sources.ts scripts/resume-source-replay.ts --format esm --sourcemap --out-dir dist/cli --clean",
     "build": "pnpm typecheck && pnpm build:web && pnpm build:server && pnpm build:cli",
-    "verify": "pnpm test && pnpm lint && pnpm typecheck && pnpm build",
-    "verify:release": "pnpm verify && pnpm test:postgres && pnpm test:ui-contract"
+    "verify": "pnpm test && pnpm lint && pnpm build",
+    "verify:release": "pnpm verify && pnpm test:postgres && pnpm test:report-acceptance && pnpm test:ui-contract"
   },
   "dependencies": {
     "@aws-crypto/client-node": "5.0.2",

@@ -29,6 +29,7 @@ import { PostgresReportService } from "../modules/publishing/postgres-service.js
 import { syncChinaMoney, type ChinaMoneySource, type FxSyncKind } from "../modules/fx/index.js";
 import { Temporal } from "@js-temporal/polyfill";
 import { safeErrorDiagnostic } from "../shared/diagnostics.js";
+import { structuredLog } from "../shared/structured-logger.js";
 import { withJobExecutionLocks } from "./job-execution-lock.js";
 import { replicateStoredObject, storedObjectReplicaPath } from "../modules/operations/replication.js";
 
@@ -126,12 +127,7 @@ export async function markCalculationRequestFailed(
 }
 
 function jobLog(level: "info" | "error", event: string, fields: Record<string, unknown>): void {
-  try {
-    const line = `${JSON.stringify({ level, time: Date.now(), event, service: "worker", ...fields })}\n`;
-    (level === "error" ? process.stderr : process.stdout).write(line);
-  } catch {
-    // Diagnostics must never change the queue disposition or business state.
-  }
+  structuredLog(level, "worker", event, fields);
 }
 
 export async function runRetryableJob(
@@ -885,12 +881,12 @@ export async function registerHandlers(boss: PgBoss, deps: { pool: Pool; objectS
     await boss.work<FxSyncJob>("fx.sync", workOptions, async (jobs) => {
       for (const job of jobs) {
         const range = chinaMoneyRange(job.data, runtime.historyStart);
-        process.stdout.write(`${JSON.stringify({ level: "info", time: Date.now(), event: "fx_sync_started", service: "worker", jobId: job.id, kind: job.data.kind, ...range })}\n`);
+        jobLog("info", "fx_sync_started", { jobId: job.id, kind: job.data.kind, ...range });
         try {
           const runId = await syncChinaMoney(deps.pool, runtime.source, job.data.kind, range);
-          process.stdout.write(`${JSON.stringify({ level: "info", time: Date.now(), event: "fx_sync_succeeded", service: "worker", jobId: job.id, runId, kind: job.data.kind, ...range })}\n`);
+          jobLog("info", "fx_sync_succeeded", { jobId: job.id, runId, kind: job.data.kind, ...range });
         } catch (error) {
-          process.stderr.write(`${JSON.stringify({ level: "error", time: Date.now(), event: "fx_sync_failed", service: "worker", jobId: job.id, kind: job.data.kind, ...range, ...safeErrorDiagnostic(error) })}\n`);
+          jobLog("error", "fx_sync_failed", { jobId: job.id, kind: job.data.kind, ...range, ...safeErrorDiagnostic(error) });
           throw error;
         }
       }

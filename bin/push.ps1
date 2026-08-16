@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workRoot = Join-Path $projectRoot '.work\push'
+$deployRoot = Join-Path $projectRoot '.work\deploy'
 New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
 $mutex = [System.Threading.Mutex]::new($false, 'Local\RevenueCostsCodePush')
 if (-not $mutex.WaitOne(0)) { throw 'DEPLOY_ALREADY_RUNNING' }
@@ -16,9 +17,11 @@ $stagedApp = Join-Path $runRoot 'app'
 $dependencySource = Join-Path $runRoot 'dependency-source'
 $appArchive = Join-Path $runRoot "release-$releaseId.tar.gz"
 $dependencyArchive = Join-Path $runRoot "dependencies-$releaseId.tar.gz"
+$releaseReceipt = Join-Path $runRoot "release-$releaseId.receipt.json"
 $knownHosts = Join-Path $runRoot 'known_hosts'
 $hostKeyCandidate = Join-Path $runRoot 'host-key-candidate'
 $askPass = Join-Path $runRoot 'askpass.cmd'
+$remoteScript = Join-Path $PSScriptRoot 'push-remote.sh'
 
 function Read-EnvFile([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "DEPLOY_CONFIG_MISSING:$Path" }
@@ -54,6 +57,34 @@ function Invoke-Native([string]$FilePath, [string[]]$ArgumentList) {
 
 function Get-Sha256([string]$Path) {
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-GitReleaseCommit {
+  $status = @(& git.exe status --porcelain=v1 --untracked-files=all)
+  if ($LASTEXITCODE -ne 0) { throw 'DEPLOY_GIT_STATUS_FAILED' }
+  if ($status.Count -ne 0) { throw 'DEPLOY_GIT_WORKTREE_DIRTY' }
+
+  $branch = [string](& git.exe branch --show-current)
+  if ($LASTEXITCODE -ne 0) { throw 'DEPLOY_GIT_BRANCH_READ_FAILED' }
+  if ($branch.Trim() -cne 'main') { throw 'DEPLOY_GIT_BRANCH_NOT_MAIN' }
+
+  $commit = [string](& git.exe rev-parse HEAD)
+  if ($LASTEXITCODE -ne 0 -or $commit.Trim() -notmatch '^[a-f0-9]{40}$') {
+    throw 'DEPLOY_GIT_COMMIT_INVALID'
+  }
+  $commit = $commit.Trim()
+
+  $remoteLines = @(& git.exe ls-remote --exit-code origin refs/heads/main)
+  if ($LASTEXITCODE -ne 0 -or $remoteLines.Count -ne 1 -or
+      [string]$remoteLines[0] -notmatch '^([a-f0-9]{40})\s+refs/heads/main$') {
+    throw 'DEPLOY_GIT_REMOTE_MAIN_UNAVAILABLE'
+  }
+  if ($Matches[1] -cne $commit) { throw 'DEPLOY_GIT_REMOTE_MAIN_MISMATCH' }
+  return $commit
+}
+
+function Assert-GitReleaseCommit([string]$ExpectedCommit) {
+  if ((Get-GitReleaseCommit) -cne $ExpectedCommit) { throw 'DEPLOY_GIT_COMMIT_CHANGED' }
 }
 
 function Assert-DependencyManifestMatch([string]$ExpectedPath, [string]$ActualPath) {
@@ -115,9 +146,11 @@ function Assert-Archive([string]$Archive, [ValidateSet('base', 'supplement', 'ap
   }
 }
 
-foreach ($command in @('node.exe', 'pnpm.cmd', 'tar.exe', 'ssh.exe', 'scp.exe', 'ssh-keyscan.exe', 'ssh-keygen.exe')) {
+foreach ($command in @('git.exe', 'node.exe', 'pnpm.cmd', 'tar.exe', 'ssh.exe', 'scp.exe', 'ssh-keyscan.exe', 'ssh-keygen.exe')) {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "COMMAND_NOT_FOUND:$command" }
 }
+if ([System.IO.File]::ReadAllBytes($remoteScript) -contains 13) { throw 'REMOTE_SCRIPT_REQUIRES_LF' }
+$gitCommit = Get-GitReleaseCommit
 
 $config = Read-EnvFile (Join-Path $projectRoot '.env.local')
 $hostName = Require-Value $config 'DEPLOY_HOST'
@@ -178,6 +211,7 @@ Assert-Archive $supplementArchive 'supplement'
 New-Item -ItemType Directory -Path $stagedApp, $dependencySource -Force | Out-Null
 Write-Host '[1/5] Run local release gate: pnpm verify:release'
 Invoke-Native 'pnpm.cmd' @('verify:release')
+Assert-GitReleaseCommit $gitCommit
 
 Write-Host '[2/5] Build allowlisted app and pinned Linux offline-store archives'
 foreach ($name in @('dist', 'migrations')) {
@@ -211,12 +245,26 @@ Assert-Archive $appArchive 'app'
 Assert-Archive $dependencyArchive 'dependencies'
 $appSha = Get-Sha256 $appArchive
 $dependencySha = Get-Sha256 $dependencyArchive
+$receipt = [ordered]@{
+  format = 'revenue-costs-release-receipt-v1'
+  releaseId = $releaseId
+  gitCommit = $gitCommit
+  appSha256 = $appSha
+  dependencySha256 = $dependencySha
+  deploymentAcceptance = 'pending'
+}
+[System.IO.File]::WriteAllText(
+  $releaseReceipt,
+  ($receipt | ConvertTo-Json -Compress) + "`n",
+  [System.Text.UTF8Encoding]::new($false)
+)
 
 Write-Host '[3/5] Release inputs validated'
 Write-Host "  release: $releaseId"
 Write-Host "  target:  $sshUser@$hostName`:$sshPort $remoteRoot/releases/$releaseId/app"
 Write-Host "  app:     $appSha"
 Write-Host "  deps:    $dependencySha"
+Write-Host "  git:     $gitCommit"
 Write-Host '  data:    excludes workspace env/data/tests/node_modules/dumps; allows only reviewed append-only migrations after backup'
 if ($DryRun) {
   Write-Host '[DRY-RUN] Verify, packaging, hashing, and denylist scan passed. Remote SSH/SCP calls: 0.'
@@ -260,11 +308,37 @@ try {
   Invoke-Native 'ssh.exe' ($sshOptions + @($target, "umask 077; mkdir -p '$incoming'"))
   Invoke-Native 'scp.exe' ($scpOptions + @($appArchive, "$target`:$incoming/release-$releaseId.tar.gz.partial"))
   Invoke-Native 'scp.exe' ($scpOptions + @($dependencyArchive, "$target`:$incoming/dependencies-$releaseId.tar.gz.partial"))
-  Invoke-Native 'scp.exe' ($scpOptions + @((Join-Path $PSScriptRoot 'push-remote.sh'), "$target`:$incoming/push-$releaseId.sh.partial"))
+  Invoke-Native 'scp.exe' ($scpOptions + @($remoteScript, "$target`:$incoming/push-$releaseId.sh.partial"))
 
   Write-Host '[5/5] Remote backup, atomic switch, health checks, and automatic code rollback'
-  $remoteCommand = "chmod 700 '$incoming/push-$releaseId.sh.partial' && bash '$incoming/push-$releaseId.sh.partial' '$releaseId' '$incoming/release-$releaseId.tar.gz.partial' '$appSha' '$incoming/dependencies-$releaseId.tar.gz.partial' '$dependencySha' '$remoteRoot' '$configRoot' '$nodeRoot' '$apiService' '$workerService' '$databaseName' '$apiPort' '$publicUrl'"
+  Assert-GitReleaseCommit $gitCommit
+  $remoteCommand = "chmod 700 '$incoming/push-$releaseId.sh.partial' && bash '$incoming/push-$releaseId.sh.partial' '$releaseId' '$incoming/release-$releaseId.tar.gz.partial' '$appSha' '$incoming/dependencies-$releaseId.tar.gz.partial' '$dependencySha' '$remoteRoot' '$configRoot' '$nodeRoot' '$apiService' '$workerService' '$databaseName' '$apiPort' '$publicUrl' '$gitCommit' '$activeRelease'"
   Invoke-Native 'ssh.exe' ($sshOptions + @($target, $remoteCommand))
+
+  $receipt.deploymentAcceptance = 'passed'
+  [System.IO.File]::WriteAllText(
+    $releaseReceipt,
+    ($receipt | ConvertTo-Json -Compress) + "`n",
+    [System.Text.UTF8Encoding]::new($false)
+  )
+
+  New-Item -ItemType Directory -Path $deployRoot -Force | Out-Null
+  $pinnedArchive = Join-Path $deployRoot "release-$releaseId.tar.gz"
+  $pinnedArchivePartial = "$pinnedArchive.partial"
+  $pinnedReceipt = Join-Path $deployRoot "release-$releaseId.receipt.json"
+  $pinnedReceiptPartial = "$pinnedReceipt.partial"
+  if ((Test-Path -LiteralPath $pinnedArchive) -or (Test-Path -LiteralPath $pinnedReceipt)) {
+    throw 'DEPLOY_LOCAL_RECEIPT_TARGET_EXISTS'
+  }
+  try {
+    Copy-Item -LiteralPath $appArchive -Destination $pinnedArchivePartial
+    if ((Get-Sha256 $pinnedArchivePartial) -cne $appSha) { throw 'DEPLOY_LOCAL_ARCHIVE_PIN_MISMATCH' }
+    Copy-Item -LiteralPath $releaseReceipt -Destination $pinnedReceiptPartial
+    Move-Item -LiteralPath $pinnedArchivePartial -Destination $pinnedArchive
+    Move-Item -LiteralPath $pinnedReceiptPartial -Destination $pinnedReceipt
+  } finally {
+    Remove-Item -LiteralPath $pinnedArchivePartial, $pinnedReceiptPartial -Force -ErrorAction SilentlyContinue
+  }
   Write-Host "Release complete: $remoteRoot/releases/$releaseId/app"
 } finally {
   Remove-Item Env:REVENUE_COSTS_DEPLOY_PASSWORD -ErrorAction SilentlyContinue

@@ -1,0 +1,3 @@
+export const MAX_UPLOAD_BATCH_FILES = 20_000;
+export const MAX_UPLOAD_BATCH_BYTES = 2 * 1024 * 1024 * 1024;
+export const UPLOAD_FILE_IO_CONCURRENCY = 16;
