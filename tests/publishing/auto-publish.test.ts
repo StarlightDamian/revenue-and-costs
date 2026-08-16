@@ -56,12 +56,12 @@ describe("calculation rule versioning", () => {
     })).resolves.toMatchObject({ runId: "run-1" });
 
     const insert = calls.find(({ sql }) => sql.includes("INSERT INTO calculation_run("));
-    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v5", "local-v7"]);
-    expect(insert?.parameters?.[6]).toBe("transaction-fee-v2");
+    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v6", "local-v8"]);
+    expect(insert?.parameters?.[6]).toBe("transaction-fee-v3");
     expect(JSON.parse(String(insert?.parameters?.[7]))).toMatchObject({
-      formulaVersion: "revenue-cost-v5",
-      codeVersion: "local-v7",
-      feeClassificationVersion: "transaction-fee-v2",
+      formulaVersion: "revenue-cost-v6",
+      codeVersion: "local-v8",
+      feeClassificationVersion: "transaction-fee-v3",
       feeClassificationPolicySha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       fxDateRuleVersion: "next-business-day-v2",
       fxOverrideIds: [

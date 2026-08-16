@@ -121,6 +121,7 @@ describe("import row normalization", () => {
   });
   it("maps known and Non-Amazon marketplaces", () => {
     expect(marketplaceProfile("amazon.co.jp").currency).toBe("JPY");
+    expect(marketplaceProfile("sim1.stores.amazon.com")).toMatchObject({ code: "US", sourceTimezone: "America/Los_Angeles", currency: "USD" });
     expect(marketplaceProfile("amazon.ie")).toMatchObject({ code: "IE", sourceTimezone: "Europe/Dublin", currency: "EUR" });
     expect(marketplaceProfile("amazon.com.br")).toMatchObject({ code: "BR", sourceTimezone: "America/Sao_Paulo", currency: "BRL" });
     expect(marketplaceProfile("amazon.com.au")).toMatchObject({ code: "AU", sourceTimezone: "Australia/Sydney", currency: "AUD" });
@@ -137,6 +138,11 @@ describe("import row normalization", () => {
   it("normalizes confirmed Dutch and Swedish Order values", () => {
     expect(normalizeTransactionType("Bestelling")).toBe("ORDER");
     expect(normalizeTransactionType("Beställning")).toBe("ORDER");
+  });
+  it("keeps FBA inventory corrections and reversals distinct from the base storage fee type", () => {
+    expect(normalizeTransactionType("FBA Inventory Fee")).toBe("FBA_INVENTORY_FEE");
+    expect(normalizeTransactionType("FBA Inventory Fee - Reversal")).toBe("FBA_INVENTORY_FEE_REVERSAL");
+    expect(normalizeTransactionType("FBA Inventory Fee - Correction")).toBe("FBA_INVENTORY_FEE_CORRECTION");
   });
   it.each([
     ["Transfer", "TRANSFER"],
@@ -170,6 +176,7 @@ describe("import row normalization", () => {
   });
   it("rejects unknown or missing marketplaces without inventing timezone and currency", () => {
     expect(() => marketplaceProfile("marketplace.example")).toThrow("IMPORT_UNKNOWN_MARKETPLACE");
+    expect(() => marketplaceProfile("sim2.stores.amazon.com")).toThrow("IMPORT_UNKNOWN_MARKETPLACE");
     expect(() => marketplaceProfile(" ")).toThrow("IMPORT_UNKNOWN_MARKETPLACE");
   });
   it("infers blank transaction marketplaces only from one unique Amazon site in the same file", () => {

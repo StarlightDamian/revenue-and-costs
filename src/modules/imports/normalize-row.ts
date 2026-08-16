@@ -6,6 +6,7 @@ export interface MarketplaceProfile { code: string; sourceTimezone: string; curr
 
 const MARKETPLACES: Readonly<Record<string, Omit<MarketplaceProfile, "nonAmazon"> >> = {
   "amazon.com": { code: "US", sourceTimezone: "America/Los_Angeles", currency: "USD" },
+  "sim1.stores.amazon.com": { code: "US", sourceTimezone: "America/Los_Angeles", currency: "USD" },
   "amazon.ca": { code: "CA", sourceTimezone: "America/Toronto", currency: "CAD" },
   "amazon.com.mx": { code: "MX", sourceTimezone: "America/Mexico_City", currency: "MXN" },
   "amazon.com.br": { code: "BR", sourceTimezone: "America/Sao_Paulo", currency: "BRL" },

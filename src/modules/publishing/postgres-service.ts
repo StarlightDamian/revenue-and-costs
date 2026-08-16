@@ -8,8 +8,8 @@ import { publishSnapshot, type CalculationRunForPublishing, type PublishStore, t
 
 function shaHex(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
-const CALCULATION_FORMULA_VERSION = "revenue-cost-v5";
-const CALCULATION_CODE_VERSION = "local-v7";
+const CALCULATION_FORMULA_VERSION = "revenue-cost-v6";
+const CALCULATION_CODE_VERSION = "local-v8";
 const FX_DATE_RULE_VERSION = "next-business-day-v2";
 
 type ResolvedCalculationRunSlice = {
