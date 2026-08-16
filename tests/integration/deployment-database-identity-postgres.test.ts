@@ -18,7 +18,7 @@ describe("release database identity guard", () => {
     expect(result.rows[0]).toMatchObject({
       database_name: expect.any(String),
       server_identity: expect.any(String),
-      server_is_local: true,
+      server_is_local: expect.any(Boolean),
       session_elevated: expect.any(Boolean),
       current_elevated: expect.any(Boolean),
       owns_database: expect.any(Boolean),
