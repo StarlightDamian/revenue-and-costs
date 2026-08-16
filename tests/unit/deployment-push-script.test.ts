@@ -121,6 +121,43 @@ describe("one-click code release guardrails", () => {
     expect(acceptancePassed).toBeGreaterThan(remote.indexOf("authenticated_me_once ||"));
   });
 
+  it("publishes the passed receipt only at an interruption-safe success boundary", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const preCommitMetadataCleanup = 'rm -f "$target/.release-migrations"';
+    const rollbackEvidenceCleanup = 'if ! rm -f "$target/.previous-migrations"; then';
+    const ignoreSignals = "trap '' HUP INT TERM";
+    const receiptPreparation = 'receipt_partial="$target/.release-receipt.json.partial"';
+    const receiptPublish = 'mv -f "$receipt_partial" "$target/.release-receipt.json"';
+    const successMark = "success=1";
+    const releaseTraps = "trap - EXIT HUP INT TERM";
+    const acceptanceEnd = remote.indexOf('echo "RELEASE_OK:$target/app"');
+
+    for (const marker of [
+      preCommitMetadataCleanup,
+      rollbackEvidenceCleanup,
+      ignoreSignals,
+      receiptPreparation,
+      receiptPublish,
+      successMark,
+    ]) {
+      expect(remote).toContain(marker);
+    }
+    expect(remote.indexOf(preCommitMetadataCleanup)).toBeLessThan(remote.indexOf(ignoreSignals));
+    expect(remote.indexOf(ignoreSignals)).toBeLessThan(remote.indexOf(receiptPreparation));
+    expect(remote.indexOf(receiptPublish)).toBeLessThan(remote.indexOf(successMark));
+    expect(
+      remote.slice(remote.indexOf(receiptPublish) + receiptPublish.length, remote.indexOf(successMark)).trim(),
+    ).toBe("");
+    const releaseTrapsIndex = remote.lastIndexOf(releaseTraps, acceptanceEnd);
+    expect(remote.indexOf(successMark)).toBeLessThan(releaseTrapsIndex);
+    expect(releaseTrapsIndex).toBeLessThan(remote.indexOf(rollbackEvidenceCleanup));
+    expect(remote.slice(releaseTrapsIndex, acceptanceEnd)).toContain("RELEASE_METADATA_CLEANUP_WARNING");
+
+    const uninterruptibleCommit = remote.slice(remote.indexOf(ignoreSignals), remote.indexOf(successMark));
+    expect(uninterruptibleCommit).not.toContain("trap - EXIT");
+    expect(uninterruptibleCommit).not.toContain("trap '' EXIT");
+  });
+
   it("allows only append-only migrations after draining work and taking a recoverable backup", async () => {
     const remote = await readFile("bin/push-remote.sh", "utf8");
 
@@ -158,9 +195,9 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain("http://127.0.0.1:$api_port/health/ready");
     expect(remote).toContain("$public_url/health/ready");
     expect(remote).toContain('--resolve "$public_host:443:127.0.0.1"');
-    const releaseMetadataCleanup = 'rm -f "$target/.previous-migrations"';
+    const releaseMetadataCleanup = 'if ! rm -f "$target/.previous-migrations"; then';
     expect(remote.indexOf(releaseMetadataCleanup)).toBeGreaterThan(remote.indexOf("PUBLIC_INDEX_MISMATCH"));
-    expect(remote.indexOf(releaseMetadataCleanup)).toBeLessThan(remote.indexOf("success=1"));
+    expect(remote.indexOf(releaseMetadataCleanup)).toBeGreaterThan(remote.indexOf("success=1"));
     expect(remote).not.toMatch(/bootstrap-admin|assert-production-initial-state/);
     expect(remote).toContain("ACTIVE_CALCULATIONS_REQUIRE_DRAIN");
     expect(remote).toContain("ACTIVE_IMPORTS_REQUIRE_DRAIN");

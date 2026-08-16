@@ -528,16 +528,23 @@ if grep -Eiq '53300|remaining connection slots|pool[- ]?timeout|timeout exceeded
 fi
 rm -f "$runtime_log"
 
+rm -f "$target/.release-migrations" "$target/.release-migration-prefix" \
+  "$target/.pending-migrations" "$target/.database-migrations"
+
+# Once the passed receipt becomes visible the release must not be rolled back.
+# Ignore termination until the receipt and cleanup success flag agree; command
+# failures still exit through the existing EXIT cleanup trap.
+trap '' HUP INT TERM
 receipt_partial="$target/.release-receipt.json.partial"
 printf '{"format":"revenue-costs-release-receipt-v1","releaseId":"%s","gitCommit":"%s","appSha256":"%s","dependencySha256":"%s","migrationCount":%s,"deploymentAcceptance":"passed"}\n' \
   "$release_id" "$git_commit" "$app_sha" "$dependency_sha" "$release_migration_count" > "$receipt_partial"
 chown root:revenue-costs "$receipt_partial"; chmod 0640 "$receipt_partial"
 mv -f "$receipt_partial" "$target/.release-receipt.json"
-
-rm -f "$target/.previous-migrations" "$target/.release-migrations" "$target/.release-migration-prefix" \
-  "$target/.pending-migrations" "$target/.database-migrations"
 success=1
 trap - EXIT HUP INT TERM
+if ! rm -f "$target/.previous-migrations"; then
+  echo "RELEASE_METADATA_CLEANUP_WARNING:$target/.previous-migrations" >&2
+fi
 echo "RELEASE_OK:$target/app"
 echo "DATABASE_BACKUP:$backup_path"
 echo "RELEASE_RECEIPT:$target/.release-receipt.json"
