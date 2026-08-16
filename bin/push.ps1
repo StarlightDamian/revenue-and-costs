@@ -278,7 +278,7 @@ $sshPassword = Require-Value $credentials 'DEPLOY_SSH_PASSWORD'
 
 try {
   Write-Host '[4/5] Pin the exact host key and upload .partial artifacts'
-  $scanOutput = @(& ssh-keyscan.exe -p $sshPort $hostName 2>$null)
+  $scanOutput = @(& ssh-keyscan.exe -p $sshPort -t ed25519 $hostName 2>$null)
   if ($LASTEXITCODE -ne 0 -or $scanOutput.Count -eq 0) { throw 'SSH_HOST_KEY_SCAN_FAILED' }
   $matchingKeys = @()
   foreach ($keyLine in $scanOutput) {
@@ -300,7 +300,8 @@ try {
   $env:DISPLAY = 'codex-deploy:0'
   $strictOptions = @('-o', "UserKnownHostsFile=$knownHosts", '-o', 'GlobalKnownHostsFile=NUL',
     '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'BatchMode=no',
-    '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1')
+    '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1',
+    '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2')
   $sshOptions = @('-p', $sshPort) + $strictOptions
   $scpOptions = @('-P', $sshPort) + $strictOptions
   $target = "$sshUser@$hostName"
