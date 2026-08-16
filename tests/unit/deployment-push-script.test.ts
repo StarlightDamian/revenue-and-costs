@@ -175,6 +175,7 @@ describe("one-click code release guardrails", () => {
     expect(remote).toContain("DATABASE_IDENTITY_EXPECTED_SERVER");
     expect(remote).toContain("pg_postmaster_start_time()");
     expect(remote).toContain("server_is_local");
+    expect(remote).toContain("row?.server_is_local === true");
     expect(remote).toContain("session_has_limited_owner_membership");
     expect(remote).toContain("session_membership_count === 0");
     expect(remote).toContain("unset DATABASE_URL PGOPTIONS");
