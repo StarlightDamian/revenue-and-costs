@@ -111,6 +111,28 @@ describe("财务口径 Golden", () => {
     expect(output.results.some((result) => result.factId === "jp-transfer" || result.factId === "nl-transfer")).toBe(false);
   });
 
+  it("把库存费冲回与修正保留在其他扣费而不冲减仓储费原币", () => {
+    const base = transaction("storage-base", "FBA Inventory Fee", "FBA storage fee", { other: "-120.00" });
+    const reversal = transaction("storage-reversal", "FBA Inventory Fee - Reversal", "FBA storage fee", { other: "110.00" });
+    const correction = transaction("storage-correction", "FBA Inventory Fee - Correction", "FBA storage fee", { other: "-107.00" });
+    const output = calculateFinancials({
+      shipments: [],
+      transactions: [[base, fx], [reversal, fx], [correction, fx]],
+    });
+
+    expect(output.results.filter((result) => result.component === "FBA_STORAGE_FEE").map((result) => ({
+      factId: result.factId,
+      amountOriginal: result.amountOriginal,
+    }))).toEqual([{ factId: "storage-base", amountOriginal: "-120.00000000" }]);
+    expect(output.results.filter((result) => result.component === "OTHER_DEDUCTION").map((result) => ({
+      factId: result.factId,
+      amountOriginal: result.amountOriginal,
+    }))).toEqual([
+      { factId: "storage-reversal", amountOriginal: "110.00000000" },
+      { factId: "storage-correction", amountOriginal: "-107.00000000" },
+    ]);
+  });
+
   it("精确区分广告扣费和广告退款", () => {
     const advertising = transaction("jp-advertising", "注文外料金", "広告費用", { otherTransactionFees: "-100" });
     const refund = transaction("jp-advertising-refund", "注文外料金", "広告費の返金", { otherTransactionFees: "15" });

@@ -100,7 +100,7 @@ describe("forward migration runner", () => {
         );
         expect(feeClassificationContract.rows).toEqual([{
           column_default: "'transaction-fee-v1'::text",
-          definition: expect.stringContaining("transaction-fee-v2"),
+          definition: expect.stringContaining("transaction-fee-v3"),
         }]);
         const feeRunContract = await first.query<{ column_default: string }>(
           `SELECT column_default FROM information_schema.columns

@@ -422,7 +422,7 @@ describe("one-sided slice materialization", () => {
     expect(publishedSlice.rows).toEqual([{ disposition: "INCLUDED" }]);
   });
 
-  it("persists the v2 mutually-exclusive fee classification in PostgreSQL", async () => {
+  it("persists the v3 mutually-exclusive fee classification in PostgreSQL", async () => {
     const result = await materialize([
       { fulfillmentMode: "BLANK", sellingFees: "-1" },
       { fulfillmentMode: "BLANK", fbaFees: "-2" },
@@ -431,16 +431,20 @@ describe("one-sided slice materialization", () => {
       { fulfillmentMode: "BLANK", type: "TRANSFER", other: "-5" },
       { fulfillmentMode: "BLANK", type: "DEBT", other: "-6" },
       { fulfillmentMode: "BLANK", other: "-7" },
+      { fulfillmentMode: "BLANK", type: "FBA_INVENTORY_FEE_REVERSAL", other: "8" },
+      { fulfillmentMode: "BLANK", type: "FBA_INVENTORY_FEE_CORRECTION", other: "-9" },
     ]);
 
     expect(result.feeComponents).toEqual([
-      { source_column: "selling_fees", category: "PLATFORM_FEE", classification_version: "transaction-fee-v2" },
-      { source_column: "fba_fees", category: "FBA_FULFILLMENT_FEE", classification_version: "transaction-fee-v2" },
-      { source_column: "other_transaction_fees", category: "ADVERTISING_FEE", classification_version: "transaction-fee-v2" },
-      { source_column: "other_amount", category: "FBA_STORAGE_FEE", classification_version: "transaction-fee-v2" },
-      { source_column: "other_amount", category: "EXCLUDED_TRANSFER_DEBT", classification_version: "transaction-fee-v2" },
-      { source_column: "other_amount", category: "EXCLUDED_TRANSFER_DEBT", classification_version: "transaction-fee-v2" },
-      { source_column: "other_amount", category: "OTHER_DEDUCTION", classification_version: "transaction-fee-v2" },
+      { source_column: "selling_fees", category: "PLATFORM_FEE", classification_version: "transaction-fee-v3" },
+      { source_column: "fba_fees", category: "FBA_FULFILLMENT_FEE", classification_version: "transaction-fee-v3" },
+      { source_column: "other_transaction_fees", category: "ADVERTISING_FEE", classification_version: "transaction-fee-v3" },
+      { source_column: "other_amount", category: "FBA_STORAGE_FEE", classification_version: "transaction-fee-v3" },
+      { source_column: "other_amount", category: "EXCLUDED_TRANSFER_DEBT", classification_version: "transaction-fee-v3" },
+      { source_column: "other_amount", category: "EXCLUDED_TRANSFER_DEBT", classification_version: "transaction-fee-v3" },
+      { source_column: "other_amount", category: "OTHER_DEDUCTION", classification_version: "transaction-fee-v3" },
+      { source_column: "other_amount", category: "OTHER_DEDUCTION", classification_version: "transaction-fee-v3" },
+      { source_column: "other_amount", category: "OTHER_DEDUCTION", classification_version: "transaction-fee-v3" },
     ]);
   });
 });

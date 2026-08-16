@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 
-export const FEE_CLASSIFICATION_VERSION = "transaction-fee-v2";
+export const FEE_CLASSIFICATION_VERSION = "transaction-fee-v3";
 
 const POLICY = {
   refundTypes: ["refund", "erstattung", "remboursement", "rimborso", "reembolso", "zwrot", "återbetalning", "iade", "返金"],
   orderTypes: ["order", "bestellung", "bestelling", "beställning", "commande", "ordine", "pedido", "zamówienie", "sipariş", "注文"],
   transferTypes: ["transfer", "transferir", "trasferir", "übertrag", "übertragung", "transfert", "transférer", "trasferimento", "przelew", "överföring", "overboeking", "transferencia", "aktarım", "振替", "振込み"],
   debtTypes: ["debt", "schuld", "verbindlichkeit", "dette", "debito", "dług", "skuld", "deuda", "saldo descubierto", "saldo negativo", "solde négatif", "borç", "債務", "マイナス残高"],
+  inventoryFeeReversalTypes: ["fba inventory fee reversal"],
+  inventoryFeeCorrectionTypes: ["fba inventory fee correction"],
   inventoryTokens: ["inventory", "lager", "stock", "stockage", "almac", "inventario", "stoccagg", "保管", "在庫"],
   amazonFulfillmentTokens: ["fba", "amazon"],
   advertisingChargeDescriptions: ["cost of advertising", "gastos de publicidad", "costo de la publicidad", "prix de la publicité", "costo della pubblicità", "koszt reklamy", "広告費用"],
@@ -36,11 +38,15 @@ const refundTypes = new Set<string>(POLICY.refundTypes);
 const orderTypes = new Set<string>(POLICY.orderTypes);
 const transferTypes = new Set<string>(POLICY.transferTypes);
 const debtTypes = new Set<string>(POLICY.debtTypes);
+const inventoryFeeReversalTypes = new Set<string>(POLICY.inventoryFeeReversalTypes);
+const inventoryFeeCorrectionTypes = new Set<string>(POLICY.inventoryFeeCorrectionTypes);
 
 export function canonicalTransactionType(value: string): string {
   const valueWords = words(value);
   if (refundTypes.has(valueWords)) return "REFUND";
   if (orderTypes.has(valueWords)) return "ORDER";
+  if (inventoryFeeReversalTypes.has(valueWords)) return "FBA_INVENTORY_FEE_REVERSAL";
+  if (inventoryFeeCorrectionTypes.has(valueWords)) return "FBA_INVENTORY_FEE_CORRECTION";
   if (POLICY.inventoryTokens.some((token) => valueWords.includes(token))
       && POLICY.amazonFulfillmentTokens.some((token) => valueWords.includes(token))) return "FBA_INVENTORY_FEE";
   if (transferTypes.has(valueWords)) return "TRANSFER";
