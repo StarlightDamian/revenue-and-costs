@@ -50,9 +50,10 @@ describe("object replica verification", () => {
 
   it("derives replica paths only from canonical stored-object identifiers", () => {
     const objectId = "11111111-1111-4111-8111-111111111111";
-    expect(storedObjectReplicaPath("D:\\offsite", objectId)).toBe(
-      join("D:\\offsite", "11", `${objectId}.esdk`),
+    const replicaRoot = join(tmpdir(), "offsite");
+    expect(storedObjectReplicaPath(replicaRoot, objectId)).toBe(
+      join(replicaRoot, "11", `${objectId}.esdk`),
     );
-    expect(() => storedObjectReplicaPath("D:\\offsite", "..\\escape")).toThrow("INVALID_OBJECT_ID");
+    expect(() => storedObjectReplicaPath(replicaRoot, "../escape")).toThrow("INVALID_OBJECT_ID");
   });
 });

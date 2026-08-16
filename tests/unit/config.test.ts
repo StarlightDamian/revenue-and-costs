@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { resolve } from "node:path";
 import { loadConfig } from "../../src/shared/config";
 
 const original = { ...process.env };
@@ -50,7 +51,7 @@ describe("production configuration", () => {
       SESSION_HMAC_KEY: "x".repeat(32),
       FILE_KEK_BASE64: Buffer.alloc(32, 1).toString("base64"),
     };
-    expect(loadConfig().databaseCapacityPath).toBe(`${process.cwd()}\\.work\\database-volume`);
+    expect(loadConfig().databaseCapacityPath).toBe(resolve(".work/database-volume"));
   });
 
   it("uses the documented fixed OTP for a local sandbox and accepts an E.164 registration administrator", () => {
