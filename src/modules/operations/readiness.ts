@@ -14,6 +14,7 @@ export interface ReadinessCheck { name: string; status: "ok" | "degraded" | "blo
 
 const BACKUP_FRESHNESS_MS = 26 * 60 * 60 * 1000;
 const RESTORE_DRILL_FRESHNESS_MS = 93 * 24 * 60 * 60 * 1000;
+const READINESS_STORAGE_FREE_SPACE_FLOOR_BYTES = 1n * 1024n * 1024n * 1024n;
 
 function referenceDigest(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -79,7 +80,11 @@ export async function operationalReadiness(config: AppConfig, pool: Pool): Promi
     await access(config.storageRoot, constants.R_OK | constants.W_OK);
     const disk = await statfs(config.storageRoot, { bigint: true });
     const free = disk.bavail * disk.bsize;
-    checks.push({ name: "storage", status: free >= 10n * 1024n * 1024n * 1024n ? "ok" : "blocked", detail: `${free} free bytes` });
+    checks.push({
+      name: "storage",
+      status: free >= READINESS_STORAGE_FREE_SPACE_FLOOR_BYTES ? "ok" : "blocked",
+      detail: `${free} free bytes; ${READINESS_STORAGE_FREE_SPACE_FLOOR_BYTES} required`,
+    });
   } catch { checks.push({ name: "storage", status: "blocked", detail: "not readable and writable" }); }
   if (config.mode === "production") {
     const acceptedMissingExternalStatus = config.temporaryDegradedProduction ? "degraded" : "blocked";
