@@ -1,9 +1,15 @@
 import { tmpdir } from 'node:os';
 import type { Pool } from 'pg';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readMigrationManifest } from '../../src/db/migrate.js';
 import { operationalReadiness } from '../../src/modules/operations/readiness.js';
 import type { AppConfig } from '../../src/shared/config.js';
+
+const { statfsMock } = vi.hoisted(() => ({ statfsMock: vi.fn() }));
+vi.mock('node:fs/promises', async (importOriginal) => ({
+  ...await importOriginal<Record<string, unknown>>(),
+  statfs: statfsMock,
+}));
 
 const currentMigrationManifest = await readMigrationManifest();
 
@@ -52,6 +58,37 @@ function poolWithEvidence(
 }
 
 describe('production recovery readiness', () => {
+  beforeEach(() => {
+    const oneGiB = 1n * 1024n * 1024n * 1024n;
+    statfsMock.mockReset();
+    statfsMock.mockResolvedValue({ bavail: oneGiB * 2n, bsize: 1n });
+  });
+
+  it('applies an inclusive 1 GiB runtime storage floor to operational readiness', async () => {
+    const oneGiB = 1n * 1024n * 1024n * 1024n;
+    const evidence = {
+      backup_fresh: true,
+      recovery_fresh: true,
+      stored_object_count: '0',
+      unreplicated_object_count: '0',
+    };
+    statfsMock.mockResolvedValueOnce({ bavail: oneGiB - 1n, bsize: 1n });
+    const blocked = await operationalReadiness(productionConfig, poolWithEvidence(evidence));
+    expect(blocked).toContainEqual({
+      name: 'storage',
+      status: 'blocked',
+      detail: `${oneGiB - 1n} free bytes; ${oneGiB} required`,
+    });
+
+    statfsMock.mockResolvedValueOnce({ bavail: oneGiB, bsize: 1n });
+    const accepted = await operationalReadiness(productionConfig, poolWithEvidence(evidence));
+    expect(accepted).toContainEqual({
+      name: 'storage',
+      status: 'ok',
+      detail: `${oneGiB} free bytes; ${oneGiB} required`,
+    });
+  });
+
   it('reports explicitly accepted pilot gaps as degraded while preserving core readiness checks', async () => {
     const checks = await operationalReadiness(
       {
