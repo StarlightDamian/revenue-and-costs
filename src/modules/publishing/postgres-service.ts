@@ -390,7 +390,7 @@ export class PostgresReportService {
                 tf.marketplace_withheld_tax::text "marketplaceWithheldTax",tf.selling_fees::text "sellingFees",
                 tf.fba_fees::text "fbaFees",tf.other_transaction_fees::text "otherTransactionFees",tf.other_amount::text "otherAmount"
            FROM transaction_fact tf JOIN calculation_run_slice rs ON rs.dataset_version_id=tf.dataset_version_id
-          WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED' AND tf.id>$2::bigint
+          WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING') AND tf.id>$2::bigint
             AND ($4::text[] IS NULL OR tf.normalized_marketplace=ANY($4::text[]))
             AND ($5::text[] IS NULL OR tf.currency=ANY($5::text[]))
             AND ($6::date IS NULL OR tf.marketplace_local_date >= $6::date)
@@ -405,7 +405,7 @@ export class PostgresReportService {
                 sf.shipping_tax::text "shippingTax",sf.gift_wrap_price::text "giftWrapPrice",sf.gift_wrap_tax::text "giftWrapTax",
                 sf.product_promotion_discount::text "productPromotionDiscount",sf.shipment_promotion_discount::text "shipmentPromotionDiscount"
            FROM shipment_fact sf JOIN calculation_run_slice rs ON rs.dataset_version_id=sf.dataset_version_id
-          WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED' AND sf.id>$2::bigint
+          WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING') AND sf.id>$2::bigint
             AND ($4::text[] IS NULL OR sf.normalized_marketplace=ANY($4::text[]))
             AND ($5::text[] IS NULL OR sf.currency=ANY($5::text[]))
             AND ($6::date IS NULL OR sf.marketplace_local_date >= $6::date)
@@ -458,7 +458,7 @@ export class PostgresReportService {
               array_agg(DISTINCT ${alias}.normalized_marketplace ORDER BY ${alias}.normalized_marketplace) marketplaces,
               array_agg(DISTINCT ${alias}.currency ORDER BY ${alias}.currency) currencies
          FROM ${factTable} ${alias} JOIN calculation_run_slice rs ON rs.dataset_version_id=${alias}.dataset_version_id
-        WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'`, [run.id],
+        WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')`, [run.id],
     );
     const parameters = [run.id, filter.marketplaces ?? null, filter.currencies ?? null, filter.start ?? null, filter.end ?? null];
     const totalRows = kind === "TRANSACTION"
@@ -474,7 +474,7 @@ export class PostgresReportService {
                 sum(round(tf.fba_fees,2))::text "fbaFees",sum(round(tf.other_transaction_fees,2))::text "otherTransactionFees",
                 sum(round(tf.other_amount,2))::text "otherAmount",'0'::text "cnyTotal"
            FROM transaction_fact tf JOIN calculation_run_slice rs ON rs.dataset_version_id=tf.dataset_version_id
-          WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
+          WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
             AND ($2::text[] IS NULL OR tf.normalized_marketplace=ANY($2::text[]))
             AND ($3::text[] IS NULL OR tf.currency=ANY($3::text[]))
             AND ($4::date IS NULL OR tf.marketplace_local_date >= $4::date)
@@ -494,7 +494,7 @@ export class PostgresReportService {
                   fx.cny_rate
              FROM shipment_fact sf JOIN calculation_run_slice rs ON rs.dataset_version_id=sf.dataset_version_id
              LEFT JOIN fixed_fx fx ON fx.requested_date=sf.fx_date AND fx.currency=sf.currency
-            WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
+            WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
               AND ($2::text[] IS NULL OR sf.normalized_marketplace=ANY($2::text[]))
               AND ($3::text[] IS NULL OR sf.currency=ANY($3::text[]))
               AND ($4::date IS NULL OR sf.marketplace_local_date >= $4::date)
@@ -538,7 +538,7 @@ export class PostgresReportService {
          SELECT ${alias}.fx_date requested_date,${alias}.currency,
                 ${kind === "TRANSACTION" ? "false" : `bool_or(${SHIPMENT_AMOUNT_KEYS.map((key) => `round(${alias}.${key.replace(/[A-Z]/gu, (letter) => `_${letter.toLowerCase()}`)},2)`).join("+")}<>0)`} requires_rate
            FROM ${factTable} ${alias} JOIN calculation_run_slice rs ON rs.dataset_version_id=${alias}.dataset_version_id
-          WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
+          WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
             AND ($3::text[] IS NULL OR ${alias}.normalized_marketplace=ANY($3::text[]))
             AND ($4::text[] IS NULL OR ${alias}.currency=ANY($4::text[]))
             AND ($5::date IS NULL OR ${alias}.marketplace_local_date >= $5::date)
