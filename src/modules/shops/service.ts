@@ -208,8 +208,11 @@ export class ShopService {
           declared_bytes: string; received_bytes: string; file_count: number;
           processed_file_count: string; warning_count: string; blocking_count: string;
           published_snapshot_matches_batch: boolean;
+          accounting_period_start: string | null; accounting_period_end: string | null;
         }>(
           `SELECT ib.id,ib.status,ib.current_stage,ib.failure_code,
+                  to_char(ib.accounting_period_start,'YYYY-MM') accounting_period_start,
+                  to_char(ib.accounting_period_end,'YYYY-MM') accounting_period_end,
                   ub.declared_bytes::text,ub.received_bytes::text,ub.file_count,
                   (SELECT count(*) FROM import_file f WHERE f.import_batch_id=ib.id AND f.parse_status<>'PENDING')::text AS processed_file_count,
                   (SELECT count(*) FROM import_issue issue
@@ -246,6 +249,9 @@ export class ShopService {
             warningCount: Number(row.warning_count),
             blockingCount: Number(row.blocking_count),
             publishedSnapshotMatchesBatch: row.published_snapshot_matches_batch,
+            ...(row.accounting_period_start && row.accounting_period_end
+              ? { periodStart: row.accounting_period_start, periodEnd: row.accounting_period_end }
+              : {}),
           };
           const calculations = await this.reader.query<{ id: string; status: string; failure_code: string | null }>(
             `SELECT id,status,failure_code FROM calculation_run
@@ -446,7 +452,9 @@ export class ShopService {
         diagnosticId,
         ...workflow,
         processingHealth: { workerAvailable, terminalRecoveryBlocked },
-        ...(shop.access !== 'CUSTOMER' && batch ? { latestBatch: { id: batch.id, status: batch.status, stage: batch.stage, failureCode: batch.failureCode, ...(calculation?.id ? { calculationRunId: calculation.id } : {}) } } : {}),
+        ...(shop.access !== 'CUSTOMER' && batch ? { latestBatch: { id: batch.id, status: batch.status, stage: batch.stage, failureCode: batch.failureCode,
+          ...(batch.periodStart && batch.periodEnd ? { periodStart: batch.periodStart, periodEnd: batch.periodEnd } : {}),
+          ...(calculation?.id ? { calculationRunId: calculation.id } : {}) } } : {}),
         ...(shop.publishedSnapshot ? { publishedSnapshot: shop.publishedSnapshot } : {}),
         download: {
           available: downloadAvailable,

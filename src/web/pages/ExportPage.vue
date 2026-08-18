@@ -54,9 +54,6 @@ watch(minimumSalesCostRate, () => {
 }, { flush: "sync" });
 
 const canCreateExport = computed(() => workflow.value?.download.available === true);
-const publishedLabel = computed(() => workflow.value?.publishedSnapshot?.publishedAt
-  ? new Date(workflow.value.publishedSnapshot.publishedAt).toLocaleString("zh-CN", { hour12: false })
-  : "尚无正式结果");
 
 function currentAssumptions(): AccountingPreferences {
   return {
@@ -238,14 +235,16 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
     <PageHeader title="报告交付" description="先预览本次测算参数，再为当前正式结果生成报告。下载时系统还会检查您是否有权限。" />
     <template v-if="canCreateExport">
       <section class="surface-section export-assumption-panel">
-        <div class="section-heading"><h2>本次成本测算</h2><p>已带入“做账习惯”的默认值；此处修改只影响本次新导出。</p></div>
-        <div class="form-grid accounting-rate-grid">
-          <label class="form-field"><span>利润率（可选）</span><span class="suffix-input"><input v-model="profitRate" inputmode="decimal" autocomplete="off" placeholder="留空沿用平台结余" /><b>%</b></span></label>
-          <label class="form-field"><span>最低销售成本率（可选）</span><span class="suffix-input"><input v-model="minimumSalesCostRate" inputmode="decimal" autocomplete="off" placeholder="留空不启用下限" /><b>%</b></span></label>
+        <div class="export-assumption-toolbar">
+          <div class="section-heading"><h2>本次成本测算</h2><p>已带入“做账习惯”的默认值；此处修改只影响本次新导出。</p></div>
+          <div class="form-grid accounting-rate-grid export-rate-fields">
+            <label class="form-field export-rate-field"><span>利润率（可选）</span><span class="suffix-input"><input v-model="profitRate" inputmode="decimal" autocomplete="off" placeholder="留空沿用平台结余" /><b>%</b></span></label>
+            <label class="form-field export-rate-field"><span>最低销售成本率（可选）</span><span class="suffix-input"><input v-model="minimumSalesCostRate" inputmode="decimal" autocomplete="off" placeholder="留空不启用下限" /><b>%</b></span></label>
+          </div>
+          <button class="secondary-button export-preview-button" type="button" :disabled="previewBusy" @click="refreshPreview">{{ previewBusy ? "正在预览" : "预览调整结果" }}</button>
         </div>
         <p v-if="preferencesStatus === 'loading'" class="sandbox-notice" role="status">正在读取默认测算参数，完成后才能生成报告。</p>
         <div v-else-if="preferencesStatus === 'error'" class="warning-panel" role="alert"><span>{{ preferencesError }}</span><button class="secondary-button compact" type="button" @click="loadAccountingPreferences">重试读取默认参数</button></div>
-        <div class="form-actions"><button class="secondary-button" type="button" :disabled="previewBusy" @click="refreshPreview">{{ previewBusy ? "正在预览" : "预览调整结果" }}</button></div>
         <div v-if="preview" class="cost-preview">
           <dl class="summary-list">
             <div><dt>{{ preview.year }} 年收入总额</dt><dd>¥{{ formatMoney(preview.total.incomeTotalCny) }}</dd></div>
@@ -262,15 +261,13 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); });
             </table>
           </div>
         </div>
-      </section>
-      <section class="surface-section export-current-panel">
-        <div class="export-current-copy">
-          <span>当前正式版本</span>
-          <h2>{{ publishedLabel }}</h2>
-          <p v-if="workflow?.download.usesPreviousPublishedVersion">新一轮数据仍在处理中。当前流程发布完成前，下载保持禁用。</p>
-          <p v-else>生成报告时，系统会记住当前正式结果和本次测算参数。之后再修改设置，也不会改变已经生成的报告。</p>
+        <div class="export-generation-row">
+          <div class="export-generation-copy">
+            <strong>生成本次报告</strong>
+            <p>系统会记住本次正式结果和测算参数；之后修改设置，不会改变已经生成的报告。</p>
+          </div>
+          <button class="primary-button export-main-button" type="button" :disabled="busy || previewBusy || preferencesStatus !== 'ready'" @click="createExport">{{ busy ? "正在准备" : "生成并下载" }}</button>
         </div>
-        <button class="primary-button export-main-button" type="button" :disabled="busy || previewBusy || preferencesStatus !== 'ready'" @click="createExport">{{ busy ? "正在准备" : "生成并下载" }}</button>
         <p v-if="routeError" class="form-error" role="alert">{{ routeError }}</p><p v-if="actionError" class="form-error" role="alert">{{ actionError }}</p>
         <ol class="sheet-list" aria-label="报告包含的表格"><li>计算说明（默认隐藏）</li><li>月度明细账单</li><li>季度明细账单</li><li>年度明细账单</li><li>成本核算表-人民币</li></ol>
       </section>

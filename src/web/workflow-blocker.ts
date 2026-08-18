@@ -74,6 +74,13 @@ function knownBatchFailure(
       action: workflowRoute(workflow.shop.id, "CALCULATE"),
     };
   }
+  if (failureCode === "NO_ACTIVE_DATASET_IN_ACCOUNTING_PERIOD") {
+    return {
+      title: "所选月份没有可核算资料",
+      message: "本次核算范围内没有已识别的交易报告或配送货件。请回到资料准备页核对月份范围并补充对应资料。",
+      action: workflowRoute(workflow.shop.id, "COMMIT"),
+    };
+  }
   if (["IMPORT_DATABASE_CAPACITY_UNAVAILABLE", "IMPORT_DATABASE_CAPACITY_INSUFFICIENT"].includes(failureCode)) {
     return {
       title: "资料暂时无法保存",

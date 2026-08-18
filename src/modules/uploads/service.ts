@@ -10,6 +10,7 @@ import { withTransaction } from "../../db/pool";
 import { enqueueOutbox } from "../../db/outbox";
 import { AppError } from "../../shared/errors";
 import { safeErrorDiagnostic } from "../../shared/diagnostics.js";
+import { accountingPeriodStartDate, parseAccountingPeriodScope, type AccountingPeriodInput } from "../../shared/accounting-period.js";
 import { structuredLog } from "../../shared/structured-logger.js";
 import {
   MAX_UPLOAD_BATCH_BYTES,
@@ -311,7 +312,6 @@ export class UploadService {
     batchId: string,
     files: readonly NormalizedUploadFile[],
   ): Promise<RegisteredUploadFile[]> {
-    if (files.length === 0) return [];
     const existing = await tx.query<{
       id: string;
       relative_path: string;
@@ -419,8 +419,8 @@ export class UploadService {
     });
   }
 
-  async createBatch(shopId: string, accountId: string, idempotencyKey: string): Promise<string> {
-    return (await this.createBatchWithFiles(shopId, accountId, idempotencyKey, [])).id;
+  async createBatch(shopId: string, accountId: string, idempotencyKey: string, period: AccountingPeriodInput = {}): Promise<string> {
+    return (await this.createBatchWithFiles(shopId, accountId, idempotencyKey, [], period)).id;
   }
 
   async createBatchWithFiles(
@@ -428,21 +428,30 @@ export class UploadService {
     accountId: string,
     idempotencyKey: string,
     inputs: readonly UploadFileRegistration[],
+    period: AccountingPeriodInput = {},
   ): Promise<{ id: string; files: RegisteredUploadFile[] }> {
     const normalized = normalizeUploadFiles(inputs);
+    const accountingPeriod = parseAccountingPeriodScope(period);
     const createdTempPaths: string[] = [];
     let created = false;
     try {
       const result = await withTransaction(this.pool, async (tx) => {
         await tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [JSON.stringify([shopId, idempotencyKey])]);
-        const existing = await tx.query<{ upload_batch_id: string }>(
-          "SELECT upload_batch_id FROM import_batch WHERE shop_id=$1 AND idempotency_key=$2",
+        const existing = await tx.query<{ upload_batch_id: string; accounting_period_start: string | null; accounting_period_end: string | null }>(
+          `SELECT upload_batch_id,to_char(accounting_period_start,'YYYY-MM') accounting_period_start,
+                  to_char(accounting_period_end,'YYYY-MM') accounting_period_end
+             FROM import_batch WHERE shop_id=$1 AND idempotency_key=$2`,
           [shopId, idempotencyKey],
         );
         if (existing.rows[0]) {
+          const row = existing.rows[0];
+          if ((row.accounting_period_start ?? undefined) !== accountingPeriod?.periodStart
+            || (row.accounting_period_end ?? undefined) !== accountingPeriod?.periodEnd) {
+            throw new AppError("UPLOAD_IDEMPOTENCY_SCOPE_MISMATCH", "同一上传请求不能更改本次核算日期范围", 409);
+          }
           return {
-            id: existing.rows[0].upload_batch_id,
-            files: await this.existingBatchRegistration(tx, existing.rows[0].upload_batch_id, normalized.files),
+            id: row.upload_batch_id,
+            files: await this.existingBatchRegistration(tx, row.upload_batch_id, normalized.files),
           };
         }
 
@@ -475,9 +484,12 @@ export class UploadService {
           [batchId, shopId, accountId],
         );
         await tx.query(
-          `INSERT INTO import_batch (shop_id,upload_batch_id,status,current_stage,idempotency_key,created_by)
-           VALUES ($1,$2,'UPLOADING','UPLOAD',$3,$4)`,
-          [shopId, batchId, idempotencyKey, accountId],
+          `INSERT INTO import_batch (shop_id,upload_batch_id,status,current_stage,idempotency_key,created_by,
+             accounting_period_start,accounting_period_end)
+           VALUES ($1,$2,'UPLOADING','UPLOAD',$3,$4,$5::date,$6::date)`,
+          [shopId, batchId, idempotencyKey, accountId,
+            accountingPeriod ? accountingPeriodStartDate(accountingPeriod.periodStart) : null,
+            accountingPeriod ? accountingPeriodStartDate(accountingPeriod.periodEnd) : null],
         );
         await tx.query(
           "UPDATE shop SET last_operated_by_account_id=$2,updated_at=clock_timestamp() WHERE id=$1",

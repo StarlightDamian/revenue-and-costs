@@ -14,6 +14,8 @@ export interface WorkflowBatchState {
   readonly warningCount: number;
   readonly blockingCount: number;
   readonly publishedSnapshotMatchesBatch: boolean;
+  readonly periodStart?: string;
+  readonly periodEnd?: string;
 }
 
 export interface WorkflowCalculationState {

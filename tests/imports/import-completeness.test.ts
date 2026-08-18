@@ -38,4 +38,21 @@ describe("import completeness projection", () => {
       expect.objectContaining({ sliceId: "missing-both", missingReports: ["TRANSACTION", "SHIPMENT"] }),
     ]);
   });
+
+  it("filters completeness to the inclusive batch accounting period", async () => {
+    let capturedSql = "";
+    const query = vi.fn(async (sql: string) => {
+      capturedSql = sql;
+      return { rows: [] };
+    });
+    const service = new PostgresImportService({ transaction: vi.fn() } as never, { query } as never);
+
+    await service.getCompleteness("shop-1", { periodStart: "2026-04", periodEnd: "2026-06" });
+
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("ds.local_month >= $2::date"),
+      ["shop-1", "2026-04-01", "2026-06-01"],
+    );
+    expect(capturedSql).toContain("ORDER BY ds.normalized_marketplace,ds.local_month");
+  });
 });

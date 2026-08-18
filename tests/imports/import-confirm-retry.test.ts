@@ -51,12 +51,12 @@ describe("import confirmation recovery", () => {
   });
 
   it("resumes calculation only after every hard-incomplete slice has an acknowledgement", async () => {
-    const statements: string[] = [];
+    const statements: Array<{ sql: string; parameters?: readonly unknown[] }> = [];
     const client = {
-      query: vi.fn(async (sql: string) => {
-        statements.push(sql);
+      query: vi.fn(async (sql: string, parameters?: readonly unknown[]) => {
+        statements.push({ sql, ...(parameters ? { parameters } : {}) });
         if (sql.includes("SELECT status")) {
-          return { rows: [{ status: "FAILED", failure_code: "HARD_INCOMPLETE_CONFIRMATION_REQUIRED" }], rowCount: 1 };
+          return { rows: [{ status: "FAILED", failure_code: "HARD_INCOMPLETE_CONFIRMATION_REQUIRED", accounting_period_start: "2026-04", accounting_period_end: "2026-06" }], rowCount: 1 };
         }
         if (sql.includes("count(*)::text")) return { rows: [{ count: "0" }], rowCount: 1 };
         return { rows: [], rowCount: 1 };
@@ -70,8 +70,10 @@ describe("import confirmation recovery", () => {
       idempotencyKey: "hard-exclusions-confirmed",
     })).resolves.toEqual({ id: "batch-1", status: "COMMITTED_WITH_EXCLUSIONS" });
 
-    expect(statements.some((sql) => sql.includes("'calculation.requested'"))).toBe(true);
-    expect(statements.some((sql) => sql.includes("'import.commit'"))).toBe(false);
+    expect(statements.some(({ sql }) => sql.includes("'calculation.requested'"))).toBe(true);
+    expect(statements.some(({ sql }) => sql.includes("'import.commit'"))).toBe(false);
+    const pending = statements.find(({ sql }) => sql.includes("count(*)::text"));
+    expect(pending?.parameters).toEqual(["shop-1", "2026-04-01", "2026-06-01"]);
   });
 });
 

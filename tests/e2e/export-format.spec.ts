@@ -85,6 +85,8 @@ test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分�
   await expect(onboarding).toHaveCount(0);
   expect(onboardingRequests).toBe(0);
   const sheetList = page.getByRole("list", { name: "报告包含的表格" });
+  await expect(page.getByText("当前正式版本", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".export-generation-row").getByRole("button", { name: "生成并下载" })).toBeVisible();
   await expect(sheetList.getByRole("listitem")).toHaveCount(5);
   await expect(sheetList).toContainText("成本核算表-人民币");
   await expect(sheetList).not.toContainText("完整性检查");
@@ -98,6 +100,7 @@ test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分�
   await expect(rows.nth(1)).toContainText("旧版导出");
   await expect(rows.nth(1)).toContainText("旧版格式");
   await expect(rows.nth(1).getByRole("button", { name: "下载旧版", exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
   const evidenceDirectory = resolve(".work/evidence/export-format-v2");
   await mkdir(evidenceDirectory, { recursive: true });

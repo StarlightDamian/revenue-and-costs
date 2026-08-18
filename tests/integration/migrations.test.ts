@@ -74,6 +74,33 @@ describe("forward migration runner", () => {
               OR (table_name='export_request' AND column_name IN ('profit_rate','minimum_sales_cost_rate')))`
       );
       expect(accountingColumns.rows[0]?.count).toBe("4");
+      const accountingPeriodContract = await first.query<{ columns: string; period_check: string; run_disposition_check: string; snapshot_disposition_check: string }>(
+        `SELECT
+           (SELECT count(*)::text FROM information_schema.columns
+             WHERE table_schema=current_schema() AND table_name='import_batch'
+               AND column_name IN ('accounting_period_start','accounting_period_end')) columns,
+           (SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con
+             JOIN pg_class relation ON relation.oid=con.conrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema() AND relation.relname='import_batch'
+              AND con.conname='import_batch_accounting_period_scope_check') period_check,
+           (SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con
+             JOIN pg_class relation ON relation.oid=con.conrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema() AND relation.relname='calculation_run_slice'
+              AND con.conname='calculation_run_slice_disposition_check') run_disposition_check,
+           (SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con
+             JOIN pg_class relation ON relation.oid=con.conrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema() AND relation.relname='published_snapshot_slice'
+              AND con.conname='published_snapshot_slice_disposition_check') snapshot_disposition_check`,
+      );
+      expect(accountingPeriodContract.rows[0]).toMatchObject({
+        columns: "2",
+        period_check: expect.stringContaining("date_trunc"),
+        run_disposition_check: expect.stringContaining("OUT_OF_SCOPE"),
+        snapshot_disposition_check: expect.stringContaining("OUT_OF_SCOPE"),
+      });
       const fulfillmentContract = await first.query<{ is_nullable: string; definition: string }>(
         `SELECT column_info.is_nullable,pg_get_constraintdef(con.oid) definition
            FROM information_schema.columns column_info

@@ -59,7 +59,6 @@ async function publish() {
 <template>
   <section :class="props.embedded ? 'review-result-panel' : 'workflow-stage-page'" data-density="7">
     <PageHeader v-if="!props.embedded" title="计算复核" description="核对试算结果，确认无误后保存为正式结果。" :status="modeLabel" :tone="modeTone" />
-    <div v-else class="section-heading"><h2>核算结果</h2><p><span class="status-chip" :data-state="report?.mode === 'PUBLISHED' ? 'COMPLETE' : 'STALE'">{{ modeLabel }}</span> 核对九项指标、缺失资料和费用来源后，在本页发布正式结果。</p></div>
     <div class="filter-bar"><label><span>开始日期</span><input v-model="start" type="date" /></label><label><span>结束日期</span><input v-model="end" type="date" /></label><label><span>站点</span><input v-model.trim="marketplace" placeholder="全部站点" /></label><button class="secondary-button compact" type="button" @click="reload">应用筛选</button></div>
     <p v-if="actionError" class="form-error" role="alert">{{ actionError }}</p>
     <AsyncState :status="status" :error="error" empty-title="暂无可查看结果" empty-message="负责人需要先完成资料准备和计算；客户只能看到正式结果。" @retry="reload">
@@ -70,7 +69,7 @@ async function publish() {
         <p class="scope-notice">平台结余尚未扣除采购成本、人工和税费等，不等同于净利润。</p>
         <section class="surface-section">
           <div class="section-heading"><h2>需要注意的站点和月份</h2><p>已确认不计算的资料不会计入总额；已计入结果的数量差异也会一直显示，方便以后核对。</p></div>
-          <div v-if="completenessDisclosures.length" class="table-scroll commit-coverage-table" tabindex="0"><table><thead><tr><th>站点</th><th>月份</th><th>资料情况</th><th>状态</th><th>这代表什么</th></tr></thead><tbody><tr v-for="slice in completenessDisclosures" :key="`${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chip"><b aria-hidden="true">!</b>{{ slice.summary }}</span></td><td><span class="status-chip" :data-state="slice.state">{{ stateNames[slice.state] }}</span></td><td>{{ slice.explanation }}</td></tr></tbody></table></div>
+          <div v-if="completenessDisclosures.length" class="table-scroll commit-coverage-table review-completeness-table" tabindex="0"><table><thead><tr><th>站点</th><th>月份</th><th>资料情况</th><th>状态</th><th>这代表什么</th></tr></thead><tbody><tr v-for="slice in completenessDisclosures" :key="`${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chip"><b aria-hidden="true">!</b>{{ slice.summary }}</span></td><td><span class="status-chip" :data-state="slice.state">{{ stateNames[slice.state] }}</span></td><td>{{ slice.explanation }}</td></tr></tbody></table></div>
           <div v-else-if="report?.completeness.length" class="warning-panel" data-tone="success" role="status"><strong>资料已可核算</strong><p>配送货件或纯 FMB 交易资料已覆盖当前站点和月份，可以继续发布。</p></div>
           <div v-else class="inline-empty">当前结果没有可展示的站点和月份。</div>
         </section>

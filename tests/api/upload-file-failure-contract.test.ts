@@ -38,6 +38,8 @@ describe("upload file failure HTTP contract", () => {
       headers: { "idempotency-key": "bulk-registration-key" },
       payload: {
         shopId: "20000000-0000-4000-8000-000000000002",
+        periodStart: "2026-04",
+        periodEnd: "2026-06",
         fileCount: 2,
         files: [
           { relativePath: "part-1.csv", declaredSize: "12", contentType: "text/csv" },
@@ -56,6 +58,7 @@ describe("upload file failure HTTP contract", () => {
         { relativePath: "part-1.csv", declaredSize: 12n, contentType: "text/csv" },
         { relativePath: "docs/summary.pdf", declaredSize: 0n, contentType: "application/pdf", metadataOnly: true },
       ],
+      { periodStart: "2026-04", periodEnd: "2026-06" },
     );
     expect(response.json()).toEqual({
       id: "30000000-0000-4000-8000-000000000003",
@@ -108,10 +111,37 @@ describe("upload file failure HTTP contract", () => {
         files: [{ relativePath: "part-1.csv", declaredSize: "12" }],
       },
     });
+    const incompletePeriod = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches",
+      headers: { "idempotency-key": "bulk-registration-key" },
+      payload: {
+        shopId: "20000000-0000-4000-8000-000000000002",
+        periodStart: "2026-04",
+        fileCount: 1,
+        files: [{ relativePath: "part-1.csv", declaredSize: "12" }],
+      },
+    });
+    const crossYearPeriod = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches",
+      headers: { "idempotency-key": "bulk-registration-key" },
+      payload: {
+        shopId: "20000000-0000-4000-8000-000000000002",
+        periodStart: "2025-12",
+        periodEnd: "2026-01",
+        fileCount: 1,
+        files: [{ relativePath: "part-1.csv", declaredSize: "12" }],
+      },
+    });
 
     expect(mismatch.statusCode).toBe(400);
     expect(pathTooLong.statusCode).toBe(400);
     expect(fileCountTooLarge.statusCode).toBe(400);
+    expect(incompletePeriod.statusCode).toBe(400);
+    expect(incompletePeriod.json()).toMatchObject({ code: "ACCOUNTING_PERIOD_SCOPE_INCOMPLETE" });
+    expect(crossYearPeriod.statusCode).toBe(400);
+    expect(crossYearPeriod.json()).toMatchObject({ code: "ACCOUNTING_PERIOD_SCOPE_CROSS_YEAR" });
     expect(authorize).not.toHaveBeenCalled();
     expect(createBatchWithFiles).not.toHaveBeenCalled();
     await app.close();

@@ -37,6 +37,10 @@ function normalizedRelativePath(value: string): string {
   return value.replaceAll("\\", "/").normalize("NFC");
 }
 
+function compareRelativePath(left: DroppedFile, right: DroppedFile): number {
+  return left.relativePath < right.relativePath ? -1 : left.relativePath > right.relativePath ? 1 : 0;
+}
+
 export function mergeFileSelections(
   existing: readonly DroppedFile[],
   incoming: readonly DroppedFile[],
@@ -70,6 +74,7 @@ export function mergeFileSelections(
       replaced += 1;
     }
   }
+  files.sort(compareRelativePath);
   return { files, added, replaced };
 }
 
@@ -129,6 +134,6 @@ export async function collectDroppedFiles(transfer: DataTransfer): Promise<Dropp
   const fallback = roots.length === 0 ? Array.from(transfer.files) : looseFiles;
   return [
     ...nested,
-    ...fallback.map((file) => ({ file, relativePath: file.webkitRelativePath || file.name })),
-  ].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    ...fallback.map((file) => ({ file, relativePath: normalizedRelativePath(file.webkitRelativePath || file.name) })),
+  ].sort(compareRelativePath);
 }

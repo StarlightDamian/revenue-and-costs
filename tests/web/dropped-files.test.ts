@@ -127,12 +127,12 @@ describe("collectDroppedFiles", () => {
     expect(peak).toBeLessThanOrEqual(16);
     expect(result).toHaveLength(40);
     expect(result.map((item) => item.relativePath))
-      .toEqual([...result.map((item) => item.relativePath)].sort((left, right) => left.localeCompare(right)));
+      .toEqual([...result.map((item) => item.relativePath)].sort());
   });
 });
 
 describe("mergeFileSelections", () => {
-  it("appends later selections while preserving prior relative paths", () => {
+  it("globally sorts later selections by normalized relative path", () => {
     const us = new File(["us"], "transaction.csv");
     const de = new File(["de"], "shipment.csv");
 
@@ -141,8 +141,8 @@ describe("mergeFileSelections", () => {
       [{ file: de, relativePath: "DE/shipment.csv" }],
     )).toEqual({
       files: [
-        { file: us, relativePath: "US/transaction.csv" },
         { file: de, relativePath: "DE/shipment.csv" },
+        { file: us, relativePath: "US/transaction.csv" },
       ],
       added: 1,
       replaced: 0,

@@ -90,7 +90,7 @@ export interface ShopWorkflow {
   diagnosticId: string;
   currentStep: WorkflowStepCode;
   steps: WorkflowStepSummary[];
-  latestBatch?: { id: string; status: string; stage: string; failureCode: string | null; calculationRunId?: string };
+  latestBatch?: { id: string; status: string; stage: string; failureCode: string | null; calculationRunId?: string; periodStart?: string; periodEnd?: string };
   processingHealth?: { workerAvailable: boolean; terminalRecoveryBlocked?: boolean };
   publishedSnapshot?: NonNullable<Shop["publishedSnapshot"]>;
   download: {
@@ -166,6 +166,8 @@ export interface FxConversionRow {
 
 export interface ImportPreview {
   id: string;
+  periodStart?: string;
+  periodEnd?: string;
   uploadBatchId?: string;
   uploadReady?: boolean;
   status: "QUEUED" | "RUNNING" | "AWAITING_MAPPING" | "READY" | "PROCESSING" | "PUBLISHED" | "FAILED" | "CANCELLED";
@@ -208,7 +210,7 @@ export type SliceState =
 export interface CompletenessSlice {
   sliceId?: string;
   datasetVersionId?: string;
-  disposition?: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED";
+  disposition?: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED" | "OUT_OF_SCOPE";
   marketplace: string;
   month: string;
   state: SliceState;
@@ -240,6 +242,7 @@ export interface ReportResult {
   formulaVersion: string;
   fxVersion: string;
   metrics: ReportMetric[];
+  publishSlices?: Array<{ sliceId: string; datasetVersionId: string; disposition: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED" | "OUT_OF_SCOPE" }>;
   completeness: CompletenessSlice[];
   fees: Array<{ category: string; marketplace: string; month: string; sourceRows: string; amountCny: MoneyString }>;
   notices: string[];

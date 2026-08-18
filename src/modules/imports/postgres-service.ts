@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { TransactionRunner, SqlClient } from "../authorization/index.js";
+import { accountingPeriodStartDate, parseAccountingPeriodScope, type AccountingPeriodInput } from "../../shared/accounting-period.js";
 import { INTERMEDIATE_REPORT_COLUMNS } from "../../shared/intermediate-report.js";
 
 const RETRYABLE_COMMIT_FAILURES = new Set([
@@ -46,8 +47,10 @@ export async function confirmImportBatch(
   batchId: string,
   input: ConfirmImportBatchInput,
 ) {
-  const batch = await client.query<{ status: string; failure_code: string | null }>(
-    "SELECT status,failure_code FROM import_batch WHERE id=$1 AND shop_id=$2 FOR UPDATE",
+  const batch = await client.query<{ status: string; failure_code: string | null; accounting_period_start: string | null; accounting_period_end: string | null }>(
+    `SELECT status,failure_code,to_char(accounting_period_start,'YYYY-MM') accounting_period_start,
+            to_char(accounting_period_end,'YYYY-MM') accounting_period_end
+       FROM import_batch WHERE id=$1 AND shop_id=$2 FOR UPDATE`,
     [batchId, shopId],
   );
   const status = batch.rows[0]?.status;
@@ -64,13 +67,17 @@ export async function confirmImportBatch(
          FROM dataset_slice slice
          JOIN dataset_version version ON version.id=slice.current_version_id
         WHERE slice.shop_id=$1 AND version.status='INCOMPLETE'
+          AND ($2::date IS NULL OR slice.local_month >= $2::date)
+          AND ($3::date IS NULL OR slice.local_month <= $3::date)
           AND NOT EXISTS (
             SELECT 1 FROM quality_acknowledgement acknowledgement
              WHERE acknowledgement.dataset_version_id=version.id
                AND acknowledgement.calculation_run_id IS NULL
                AND acknowledgement.issue_kind='HARD_INCOMPLETE'
           )`,
-      [shopId],
+      [shopId,
+        batch.rows[0]?.accounting_period_start ? accountingPeriodStartDate(batch.rows[0].accounting_period_start) : null,
+        batch.rows[0]?.accounting_period_end ? accountingPeriodStartDate(batch.rows[0].accounting_period_end) : null],
     );
     if (BigInt(pending.rows[0]?.count ?? "0") > 0n) throw new Error("HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
     await client.query(
@@ -123,9 +130,11 @@ export class PostgresImportService {
   async getBatch(shopId: string, batchId: string) {
     const batch = await this.database.query<{
       id: string; status: string; current_stage: string; failure_code: string | null;
-      upload_batch_id: string; upload_ready: boolean;
+      upload_batch_id: string; upload_ready: boolean; accounting_period_start: string | null; accounting_period_end: string | null;
     }>(
       `SELECT batch.id,batch.status,batch.current_stage,batch.failure_code,batch.upload_batch_id,
+              to_char(batch.accounting_period_start,'YYYY-MM') accounting_period_start,
+              to_char(batch.accounting_period_end,'YYYY-MM') accounting_period_end,
               NOT EXISTS (SELECT 1 FROM upload_file file
                 WHERE file.batch_id=batch.upload_batch_id AND file.status IN ('PENDING','UPLOADING')) AS upload_ready
          FROM import_batch batch WHERE batch.id=$1 AND batch.shop_id=$2`,
@@ -172,6 +181,9 @@ export class PostgresImportService {
       progress: publicStatus === "PUBLISHED" || publicStatus === "READY" ? "100" : publicStatus === "PROCESSING" ? "75" : "0",
       stage: row.current_stage,
       failureCode: row.failure_code,
+      ...(row.accounting_period_start && row.accounting_period_end
+        ? { periodStart: row.accounting_period_start, periodEnd: row.accounting_period_end }
+        : {}),
       files: files.rows.map((file) => ({ id: file.id, relativePath: file.relative_path, bytes: file.size_bytes, classification: file.classification,
         status: file.parse_status === "AWAITING_MAPPING" && row.status === "AWAITING_COMMIT_CONFIRMATION" ? "EXCLUDED_UNKNOWN_STRUCTURE" : file.parse_status })),
       ignored: files.rows.filter((file) => ["LIST_ONLY", "TEMPORARY"].includes(file.classification) || file.parse_status === "AWAITING_MAPPING")
@@ -197,7 +209,8 @@ export class PostgresImportService {
     };
   }
 
-  async getCompleteness(shopId: string) {
+  async getCompleteness(shopId: string, period: AccountingPeriodInput = {}) {
+    const accountingPeriod = parseAccountingPeriodScope(period);
     const result = await this.database.query<{
       slice_id: string; dataset_version_id: string | null; normalized_marketplace: string; local_month: string;
       status: string | null; shipment_count: string; transaction_count: string; warning: boolean | null;
@@ -214,8 +227,12 @@ export class PostgresImportService {
          LEFT JOIN dataset_source_binding b ON b.dataset_version_id=dv.id
          LEFT JOIN reconciliation_result rr ON rr.dataset_version_id=dv.id
         WHERE ds.shop_id=$1
-        GROUP BY ds.id,dv.id,rr.id ORDER BY ds.local_month,ds.normalized_marketplace`,
-      [shopId],
+          AND ($2::date IS NULL OR ds.local_month >= $2::date)
+          AND ($3::date IS NULL OR ds.local_month <= $3::date)
+        GROUP BY ds.id,dv.id,rr.id ORDER BY ds.normalized_marketplace,ds.local_month`,
+      [shopId,
+        accountingPeriod ? accountingPeriodStartDate(accountingPeriod.periodStart) : null,
+        accountingPeriod ? accountingPeriodStartDate(accountingPeriod.periodEnd) : null],
     );
     return result.rows.map((row) => {
       const missingReports: Array<"TRANSACTION" | "SHIPMENT"> = [];

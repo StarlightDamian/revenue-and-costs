@@ -7,6 +7,7 @@ import type { Actor } from "../../modules/authorization";
 import type { EncryptedObjectStore } from "../../modules/storage/encrypted-object-store";
 import { MAX_CHUNK_BYTES, MAX_UPLOAD_FILES, type UploadService } from "../../modules/uploads/service";
 import { CLIENT_UPLOAD_FAILURE_CODES, type ClientUploadFailureCode } from "../../modules/uploads/partial-failure.js";
+import { parseAccountingPeriodScope } from "../../shared/accounting-period.js";
 import { UuidSchema } from "../../shared/contracts.js";
 import { AppError } from "../../shared/errors.js";
 import { requireIdempotencyKey } from "../idempotency.js";
@@ -27,6 +28,8 @@ const UploadRegistrationFile = Type.Object({
 }, { additionalProperties: false });
 const CreateBatchBody = Type.Object({
   shopId: UuidSchema,
+  periodStart: Type.Optional(Type.String({ pattern: "^(?:19|20|21)[0-9]{2}-(?:0[1-9]|1[0-2])$" })),
+  periodEnd: Type.Optional(Type.String({ pattern: "^(?:19|20|21)[0-9]{2}-(?:0[1-9]|1[0-2])$" })),
   fileCount: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_UPLOAD_FILES })),
   files: Type.Optional(Type.Array(UploadRegistrationFile, { minItems: 1, maxItems: MAX_UPLOAD_FILES })),
 }, { additionalProperties: false });
@@ -55,11 +58,15 @@ export async function registerUploadRoutes(app: FastifyInstance, deps: UploadRou
     bodyLimit: 64 * 1024 * 1024,
     schema: { body: CreateBatchBody },
   }, async (request) => {
-    const body = request.body as { shopId: string; fileCount?: number; files?: Array<{ relativePath: string; declaredSize: string; contentType?: string; metadataOnly?: boolean }> };
+    const body = request.body as { shopId: string; periodStart?: string; periodEnd?: string; fileCount?: number; files?: Array<{ relativePath: string; declaredSize: string; contentType?: string; metadataOnly?: boolean }> };
     if ((body.files === undefined) !== (body.fileCount === undefined)
       || (body.files !== undefined && body.fileCount !== body.files.length)) {
       throw new AppError("UPLOAD_FILE_COUNT_MISMATCH", "文件数量与请求声明不一致", 400);
     }
+    const accountingPeriod = parseAccountingPeriodScope({
+      ...(body.periodStart ? { periodStart: body.periodStart } : {}),
+      ...(body.periodEnd ? { periodEnd: body.periodEnd } : {}),
+    });
     const actor = await deps.authorize(request, body.shopId, "upload");
     const key = requireIdempotencyKey(request);
     if (body.files) {
@@ -68,9 +75,9 @@ export async function registerUploadRoutes(app: FastifyInstance, deps: UploadRou
         declaredSize: BigInt(file.declaredSize),
         ...(file.contentType ? { contentType: file.contentType } : {}),
         ...(file.metadataOnly ? { metadataOnly: true } : {}),
-      })));
+      })), accountingPeriod);
     }
-    return { id: await deps.service.createBatch(body.shopId, actor.accountId, key) };
+    return { id: await deps.service.createBatch(body.shopId, actor.accountId, key, accountingPeriod) };
   });
   app.post("/api/v1/uploads/batches/:batchId/files", { schema: { params: BatchParams, body: UploadRegistrationFile } }, async (request, reply) => {
     const body = request.body as { relativePath: string; declaredSize: string; contentType?: string; metadataOnly?: boolean };

@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/api/app.js';
+import { REPORT_EXPORT_FORMAT } from '../../src/modules/exports/export-report.js';
 import type { AppConfig } from '../../src/shared/config.js';
 import { createPostgresTestSchema, type PostgresTestSchema } from './postgres-harness.js';
 
@@ -270,12 +271,12 @@ describe.sequential('企业、做账员、企业钱包与公司运行时集成',
           (id,shop_id,requested_by,published_snapshot_id,membership_authorization_version,status,business_key,
            expires_at,format_version,continent_prefixes,stage,progress_percent,started_at,finished_at,heartbeat_at)
          VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()+interval '1 day',
-                'revenue-and-costs-export-v8',ARRAY['EU']::text[],$8,
+                $9,ARRAY['EU']::text[],$8,
                 CASE WHEN $6='SUCCEEDED' THEN 100 WHEN $6='RUNNING' THEN 1 ELSE 0 END,
                 CASE WHEN $6<>'QUEUED' THEN clock_timestamp() END,
                 CASE WHEN $6='SUCCEEDED' THEN clock_timestamp() END,
                 CASE WHEN $6<>'QUEUED' THEN clock_timestamp() END)`,
-        [id, companyId, outsiderAccountId, randomUUID(), membershipAuthorizationVersion, status, `membership-activation:${id}`, stage],
+        [id, companyId, outsiderAccountId, randomUUID(), membershipAuthorizationVersion, status, `membership-activation:${id}`, stage, REPORT_EXPORT_FORMAT],
       );
       return id;
     };

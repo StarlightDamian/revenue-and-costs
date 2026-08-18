@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import type { SqlClient, TransactionRunner } from "../authorization/index.js";
+import { accountingPeriodContains, parseAccountingPeriodScope, type AccountingPeriodScope } from "../../shared/accounting-period.js";
 import { FEE_CLASSIFICATION_POLICY_SHA256, FEE_CLASSIFICATION_VERSION } from "../calculation/fee-classification.js";
 import type { ReportFilter } from "./publish.js";
 import { INTERMEDIATE_REPORT_COLUMNS, SHIPMENT_AMOUNT_KEYS, type IntermediateFilter, type IntermediateReportKind } from "../../shared/intermediate-report.js";
@@ -9,13 +10,13 @@ import { publishSnapshot, type CalculationRunForPublishing, type PublishStore, t
 function shaHex(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
 const CALCULATION_FORMULA_VERSION = "revenue-cost-v6";
-const CALCULATION_CODE_VERSION = "local-v8";
+const CALCULATION_CODE_VERSION = "local-v9";
 const FX_DATE_RULE_VERSION = "next-business-day-v2";
 
 type ResolvedCalculationRunSlice = {
   readonly sliceId: string;
   readonly versionId: string;
-  readonly disposition: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED";
+  readonly disposition: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED" | "OUT_OF_SCOPE";
   readonly mappings: readonly string[];
   readonly hardReasonCodes: readonly string[];
   readonly hardAcknowledgementId: string | null;
@@ -80,7 +81,8 @@ class TransactionAdapter implements PublishTransaction {
     }>("SELECT * FROM calculation_run WHERE id=$1", [runId]);
     const run = runResult.rows[0]; if (!run) return undefined;
     const slices = await this.client.query<{
-      dataset_slice_id: string; dataset_version_id: string; mapping_version_ids: string[]; hard_reason_codes: string[];
+      dataset_slice_id: string; dataset_version_id: string; disposition: CalculationRunForPublishing["slices"][number]["disposition"];
+      mapping_version_ids: string[]; hard_reason_codes: string[];
       hard_exclusion_acknowledgement_id: string | null; soft_warning_acknowledgement_id: string | null; soft_warning: boolean;
     }>(
       `SELECT rs.*,COALESCE(rr.warning,false) soft_warning FROM calculation_run_slice rs
@@ -97,7 +99,7 @@ class TransactionAdapter implements PublishTransaction {
       ...(rawOverrideIds !== undefined ? { fxOverrideIds: rawOverrideIds as string[] } : {}),
       mappingVersionIds: [...new Set(slices.rows.flatMap((row) => row.mapping_version_ids))],
       slices: slices.rows.map((row) => ({ sliceId: row.dataset_slice_id, datasetVersionId: row.dataset_version_id,
-        hardReasons: row.hard_reason_codes, softWarning: row.soft_warning,
+        disposition: row.disposition, hardReasons: row.hard_reason_codes, softWarning: row.soft_warning,
         ...(row.hard_exclusion_acknowledgement_id ? { hardExclusionAcknowledgementId: row.hard_exclusion_acknowledgement_id } : {}),
         ...(row.soft_warning_acknowledgement_id ? { softWarningAcknowledgementId: row.soft_warning_acknowledgement_id } : {}) })) };
   }
@@ -180,9 +182,25 @@ export class PostgresReportService {
   }) {
     return this.transactions.transaction(async (client) => {
       await client.query("SELECT id FROM shop WHERE id=$1 FOR UPDATE", [shopId]);
-      const slices = await client.query<{ slice_id: string; version_id: string; status: string; mappings: string[]; warning: boolean; hard_ack: string | null; soft_ack: string | null; normalized_marketplace: string; policy_id: string | null; iana_timezone: string | null; date_attribution_mode: string | null }>(
+      let accountingPeriod: AccountingPeriodScope | undefined;
+      if (input.sourceImportBatchId) {
+        const sourceBatch = await client.query<{ period_start: string | null; period_end: string | null }>(
+          `SELECT to_char(accounting_period_start,'YYYY-MM') period_start,
+                  to_char(accounting_period_end,'YYYY-MM') period_end
+             FROM import_batch WHERE id=$1 AND shop_id=$2`,
+          [input.sourceImportBatchId, shopId],
+        );
+        const row = sourceBatch.rows[0];
+        if (!row) throw new Error("SOURCE_IMPORT_BATCH_NOT_FOUND");
+        accountingPeriod = parseAccountingPeriodScope({
+          ...(row.period_start ? { periodStart: row.period_start } : {}),
+          ...(row.period_end ? { periodEnd: row.period_end } : {}),
+        });
+      }
+      const slices = await client.query<{ slice_id: string; version_id: string; local_month: string; status: string; mappings: string[]; warning: boolean; hard_ack: string | null; soft_ack: string | null; normalized_marketplace: string; policy_id: string | null; iana_timezone: string | null; date_attribution_mode: string | null }>(
         `SELECT ds.id slice_id,dv.id version_id,dv.status,array_remove(array_agg(DISTINCT b.mapping_version_id),NULL) mappings,
-                ds.normalized_marketplace,policy.id policy_id,policy.iana_timezone,policy.date_attribution_mode,
+                to_char(ds.local_month,'YYYY-MM') local_month,ds.normalized_marketplace,
+                policy.id policy_id,policy.iana_timezone,policy.date_attribution_mode,
                 COALESCE(bool_or(rr.warning),false) warning,
                 (SELECT qa.id FROM quality_acknowledgement qa WHERE qa.dataset_version_id=dv.id
                   AND qa.calculation_run_id IS NULL AND qa.issue_kind='HARD_INCOMPLETE'
@@ -203,13 +221,15 @@ export class PostgresReportService {
           WHERE ds.shop_id=$1 GROUP BY ds.id,dv.id,policy.id,policy.iana_timezone,policy.date_attribution_mode ORDER BY ds.id`, [shopId],
       );
       if (!slices.rows.length) throw new Error("NO_ACTIVE_DATASET");
-      if (slices.rows.some((row) => !row.policy_id || !row.iana_timezone || !row.date_attribution_mode)) {
+      const inScopeSlices = slices.rows.filter((row) => accountingPeriodContains(accountingPeriod, row.local_month));
+      if (!inScopeSlices.length) throw new Error("NO_ACTIVE_DATASET_IN_ACCOUNTING_PERIOD");
+      if (inScopeSlices.some((row) => !row.policy_id || !row.iana_timezone || !row.date_attribution_mode)) {
         throw new Error("CALCULATION_MARKETPLACE_POLICY_NOT_INITIALIZED");
       }
-      if (new Set(slices.rows.map((row) => row.date_attribution_mode)).size !== 1) {
+      if (new Set(inScopeSlices.map((row) => row.date_attribution_mode)).size !== 1) {
         throw new Error("CALCULATION_DATE_ATTRIBUTION_MODE_MIXED");
       }
-      if (input.autoPublish && slices.rows.some((row) => row.status === "INCOMPLETE" && !row.hard_ack)) {
+      if (input.autoPublish && inScopeSlices.some((row) => row.status === "INCOMPLETE" && !row.hard_ack)) {
         throw new Error("HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
       }
       const meta = await client.query<{ price_id: string; fx_sync_run_id: string | null }>(
@@ -223,7 +243,7 @@ export class PostgresReportService {
       const currentOverrides = await client.query<{ id: string }>(
         `SELECT id FROM fx_current_override ORDER BY id`,
       );
-      const policySet=slices.rows.map((row)=>({sliceId:row.slice_id,normalizedMarketplace:row.normalized_marketplace,
+      const policySet=inScopeSlices.map((row)=>({sliceId:row.slice_id,normalizedMarketplace:row.normalized_marketplace,
         marketplacePolicyVersionId:row.policy_id!,ianaTimezone:row.iana_timezone!,dateAttributionMode:row.date_attribution_mode!}));
       const timezonePolicyVersion=`date-attribution-policy-set:${shaHex(JSON.stringify(policySet))}`;
       const legacyPolicyId=policySet[0]!.marketplacePolicyVersionId;
@@ -238,6 +258,7 @@ export class PostgresReportService {
         feeClassificationPolicySha256:FEE_CLASSIFICATION_POLICY_SHA256,
         fxSyncRunId:metadata.fx_sync_run_id??"NO_FX_SNAPSHOT",
         fxOverrideIds:currentOverrides.rows.map((row)=>row.id).sort(),
+        ...(accountingPeriod ? { accountingPeriod } : {}),
         ...(input.sourceImportBatchId ? { sourceImportBatchId: input.sourceImportBatchId } : {}),
         ...(input.autoPublish ? { autoPublish: true } : {})};
       const manifest=JSON.stringify(manifestObject);
@@ -290,6 +311,18 @@ export class PostgresReportService {
       };
       const resolvedSlices: ResolvedCalculationRunSlice[] = [];
       for(const row of slices.rows){
+        if (!accountingPeriodContains(accountingPeriod, row.local_month)) {
+          resolvedSlices.push({
+            sliceId: row.slice_id,
+            versionId: row.version_id,
+            disposition: "OUT_OF_SCOPE",
+            mappings: row.mappings,
+            hardReasonCodes: [],
+            hardAcknowledgementId: null,
+            softAcknowledgementId: null,
+          });
+          continue;
+        }
         const hard=row.status==='INCOMPLETE';
         const hardAck = await bindAcknowledgement(row.hard_ack, "HARD_INCOMPLETE");
         const softAck = !hard
@@ -681,12 +714,14 @@ export class PostgresReportService {
     );
     const manifest=run.input_manifest;
     const visibleCompleteness = completeness.rows.filter((row) =>
-      (!filter.start || row.local_month >= filter.start.slice(0, 7))
+      row.disposition !== "OUT_OF_SCOPE"
+      && (!filter.start || row.local_month >= filter.start.slice(0, 7))
       && (!filter.end || row.local_month <= filter.end.slice(0, 7))
       && (!filter.marketplace || row.normalized_marketplace.toLowerCase() === filter.marketplace.toLowerCase()));
     const unacknowledgedWarnings = visibleCompleteness.filter((row) => row.warning && row.disposition === "INCLUDED").length;
     const hasFilter=Boolean(filter.start||filter.end||filter.marketplace);
     const effectivePublished = published || Boolean(run.snapshot_id);
+    const canPublish=run.status==='READY'&&!effectivePublished&&!hasFilter&&unacknowledgedWarnings===0;
     return {shopId,mode:effectivePublished?'PUBLISHED':run.status==='READY'?'DRAFT':'STALE',runId:run.id,...(run.snapshot_id?{snapshotId:run.snapshot_id}:{}),
       calculatedAt:(run.finished_at??run.created_at).toISOString(),...(run.published_at?{publishedAt:run.published_at.toISOString()}:{}),
       dataVersion:"manifest",mappingVersion:"manifest",timezoneVersion:String(manifest.timezonePolicyVersion??"iana"),policyVersion:String(manifest.marketplacePolicyVersionId??"unknown"),formulaVersion:String(manifest.formulaVersion??"v1"),fxVersion:"calculation_fx_usage",
@@ -695,6 +730,7 @@ export class PostgresReportService {
         const income=value.income??"0.00000000";
         return {key,amountCny:amount,...(new Decimal(income).isZero()?{}:{ratioOfIncome:new Decimal(amount).div(income).toDecimalPlaces(8,Decimal.ROUND_HALF_UP).toFixed(8)})};
       }),
+      ...(canPublish ? { publishSlices:completeness.rows.map((row)=>({sliceId:row.slice_id,datasetVersionId:row.dataset_version_id,disposition:row.disposition})) } : {}),
       completeness:visibleCompleteness.map((row)=>({sliceId:row.slice_id,datasetVersionId:row.dataset_version_id,disposition:row.disposition,marketplace:row.normalized_marketplace,month:row.local_month,state:row.disposition==='HARD_EXCLUDED'?'EXCLUDED':row.disposition==='INCLUDED_WITH_WARNING'?'PUBLISHED_WARNING':row.warning?'CONFLICT':'COMPLETE',
         ...(row.transaction_quantity?{transactionQuantity:row.transaction_quantity}:{}),...(row.shipment_quantity?{shipmentQuantity:row.shipment_quantity}:{}),
         ...(row.unmatched_absolute?{unmatchedAbsolute:row.unmatched_absolute}:{}),...(row.unmatched_ratio?{unmatchedRatio:row.unmatched_ratio}:{}),
@@ -707,6 +743,6 @@ export class PostgresReportService {
       notices:[...(BigInt(fallback.rows[0]?.count??"0")>0n?[`${fallback.rows[0]?.count} 笔金额使用了报表日期之后最近一个开市日的汇率，结果已经按该汇率计算。`]:[]),
         ...(unacknowledgedWarnings>0?[`${unacknowledgedWarnings} 个站点和月份的两份资料数量不一致，确认后才能发布正式结果。`]:[]),
         ...(hasFilter&&!effectivePublished?["当前只显示筛选后的部分结果，不能直接发布。请清除筛选后再发布完整结果。"]:[])],
-      canPublish:run.status==='READY'&&!effectivePublished&&!hasFilter&&unacknowledgedWarnings===0};
+      canPublish};
   }
 }

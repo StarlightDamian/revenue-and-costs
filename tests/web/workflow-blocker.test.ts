@@ -50,6 +50,25 @@ describe("workflow blocker presentation", () => {
     expect(blocker?.action).toEqual({ label: "查看计算复核", to: "/shops/shop-1/workflow/calculate" });
   });
 
+  it("routes an empty selected accounting period back to preparation", () => {
+    const input = workflow({
+      latestBatch: {
+        id: "batch-period-empty",
+        status: "FAILED",
+        stage: "CALCULATION_REQUEST_BLOCKED",
+        failureCode: "NO_ACTIVE_DATASET_IN_ACCOUNTING_PERIOD",
+        periodStart: "2026-04",
+        periodEnd: "2026-06",
+      },
+    });
+
+    expect(workflowBlockerPresentation(input, false)).toMatchObject({
+      title: "所选月份没有可核算资料",
+      message: expect.stringContaining("核对月份范围"),
+      action: { label: "查看资料准备", to: "/shops/shop-1/workflow/commit" },
+    });
+  });
+
   it("falls back to the blocking workflow step when no failure code is available", () => {
     const input = workflow({
       currentStep: "PREFLIGHT",

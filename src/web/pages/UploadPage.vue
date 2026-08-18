@@ -28,7 +28,10 @@ const resuming = ref(false);
 const dragActive = ref(false);
 const checkingSelection = ref(false);
 const restoringLatest = ref(true);
+const periodStart = ref("");
+const periodEnd = ref("");
 const selectionNotice = ref("");
+const selectedUploadPaths = ref<string[]>([]);
 const selectedPaths = new WeakMap<File, string>();
 let pollingGeneration = 0;
 let stateEpoch = 0;
@@ -36,15 +39,30 @@ const totalBytes = computed(() => uploadItems.value.reduce((sum, item) => sum + 
 const accepted = computed(() => files.value.length > 0
   && files.value.length <= MAX_UPLOAD_BATCH_FILES
   && totalBytes.value <= MAX_UPLOAD_BATCH_BYTES);
+const periodError = computed(() => {
+  if (!periodStart.value || !periodEnd.value) return "请选择完整的本次核算起止月份";
+  if (periodStart.value > periodEnd.value) return "开始月份不能晚于结束月份";
+  if (periodStart.value.slice(0, 4) !== periodEnd.value.slice(0, 4)) return "起止月份必须位于同一自然年";
+  return "";
+});
 const selectionLocked = computed(() => restoringLatest.value
   || checkingSelection.value
   || resuming.value
   || ["uploading", "preflight", "processing"].includes(status.value)
   || (Boolean(batchId.value) && !preview.value && status.value !== "cancelled"));
+const canEditUploadSelection = computed(() => !selectionLocked.value
+  && !batchId.value
+  && ["idle", "error"].includes(status.value));
+const selectedUploadCount = computed(() => selectedUploadPaths.value.length);
+const allUploadItemsSelected = computed(() => uploadItems.value.length > 0
+  && selectedUploadCount.value === uploadItems.value.length);
+const someUploadItemsSelected = computed(() => selectedUploadCount.value > 0
+  && !allUploadItemsSelected.value);
 const canStartUpload = computed(() => !restoringLatest.value
   && !checkingSelection.value
   && !resuming.value
   && accepted.value
+  && !periodError.value
   && !batchId.value
   && ["idle", "error"].includes(status.value));
 const uploadConclusion = computed(() => uploadBatchConclusion(uploadItems.value));
@@ -73,6 +91,26 @@ const classificationNames: Record<string, string> = {
   TEMPORARY: "临时文件，不参与计算",
   UNKNOWN: "无法识别",
 };
+type RecognizedFileKind = "TRANSACTION" | "SHIPMENT";
+type PreflightFileTone = "complete" | "failed" | "neutral" | "pending" | "skipped" | "uploading" | "warning";
+interface PreflightFileRow {
+  path: string;
+  classification: string;
+  classificationKind?: RecognizedFileKind;
+  status: string;
+  tone: PreflightFileTone;
+  detail: string;
+}
+const recognizedFileKind = (value?: string): RecognizedFileKind | undefined =>
+  value === "TRANSACTION" || value === "SHIPMENT" ? value : undefined;
+const preflightFileTone = (status: string, ignored: boolean): PreflightFileTone => {
+  if (/FAILED|ERROR/u.test(status)) return "failed";
+  if (status === "AWAITING_MAPPING") return "warning";
+  if (ignored || ["LIST_ONLY", "EXCLUDED", "EXCLUDED_UNKNOWN_STRUCTURE"].includes(status)) return "skipped";
+  if (status === "PARSED") return "complete";
+  if (status === "PENDING") return "pending";
+  return "neutral";
+};
 const fileStatusNames: Record<string, string> = {
   PARSED: "可用于计算",
   LIST_ONLY: "未参与计算",
@@ -97,15 +135,23 @@ const recognizedFileCount = computed(() => (preview.value?.files ?? []).filter((
   ["SHIPMENT", "TRANSACTION"].includes(file.classification ?? "")
   && !/FAILED|ERROR|AWAITING_MAPPING/u.test(file.status)).length);
 const preflightIssueCount = computed(() => (preview.value?.issues ?? []).reduce((sum, issue) => sum + issue.count, 0));
-const preflightFiles = computed(() => {
-  const rows = (preview.value?.files ?? []).map((file) => ({
-    path: file.relativePath,
-    classification: classificationNames[file.classification ?? ""] ?? "无法识别",
-    status: ignoredPaths.value.has(file.relativePath) ? "未参与计算" : fileStatusNames[file.status] ?? (/FAILED|ERROR/u.test(file.status) ? "处理失败" : "已检查"),
-    detail: ignoredPaths.value.get(file.relativePath) ?? fileStatusNames[file.status] ?? "系统已检查这个文件",
-  }));
+const preflightFiles = computed<PreflightFileRow[]>(() => {
+  const rows: PreflightFileRow[] = (preview.value?.files ?? []).map((file) => {
+    const classificationKind = recognizedFileKind(file.classification);
+    const ignored = ignoredPaths.value.has(file.relativePath);
+    const exceptionalStatus = /FAILED|ERROR/u.test(file.status) || file.status === "AWAITING_MAPPING";
+    const statusText = fileStatusNames[file.status] ?? (/FAILED|ERROR/u.test(file.status) ? "处理失败" : "已检查");
+    return {
+      path: file.relativePath,
+      classification: classificationNames[file.classification ?? ""] ?? "无法识别",
+      ...(classificationKind ? { classificationKind } : {}),
+      status: exceptionalStatus ? statusText : ignored ? "未参与计算" : statusText,
+      tone: preflightFileTone(file.status, ignored),
+      detail: exceptionalStatus ? statusText : ignoredPaths.value.get(file.relativePath) ?? statusText,
+    };
+  });
   for (const ignored of preview.value?.ignored ?? []) {
-    if (!rows.some((row) => row.path === ignored.relativePath)) rows.push({ path: ignored.relativePath, classification: classificationNames[ignored.reason] ?? "无法识别", status: "未参与计算", detail: ignoredReason(ignored.reason) });
+    if (!rows.some((row) => row.path === ignored.relativePath)) rows.push({ path: ignored.relativePath, classification: classificationNames[ignored.reason] ?? "无法识别", status: "未参与计算", tone: "skipped", detail: ignoredReason(ignored.reason) });
   }
   for (const item of uploadItems.value) {
     if (!rows.some((row) => row.path === item.path)) {
@@ -113,6 +159,7 @@ const preflightFiles = computed(() => {
         path: item.path,
         classification: item.state === "complete" ? "等待系统识别" : "正在上传",
         status: item.state === "complete" ? "等待检查" : item.state === "skipped" ? "未参与计算" : uploadStateNames[item.state],
+        tone: item.state === "complete" ? "pending" : item.state,
         detail: item.state === "skipped" ? "这个文件上传失败后被跳过，其他文件不受影响" : item.error ? uploadErrorText(item.error) : "上传后系统会检查文件内容",
       });
     }
@@ -132,6 +179,7 @@ const preflightConclusion = computed(() => {
   if (preview.value.status === "PUBLISHED") return "资料已保存并计算完成，客户现在可以看到新的正式结果。";
   if (preview.value.failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED") return "有些站点或月份缺少资料。请补充文件；如果确定不需要计算这些项目，也可以确认不计算后继续。";
   if (preview.value.failureCode === "CALCULATION_DATE_ATTRIBUTION_MODE_MIXED") return "同一批资料使用了不同的日期计算方式，系统无法正确合并。请统一日期格式和计算方式后，重新上传这一范围的全部资料。";
+  if (preview.value.failureCode === "NO_ACTIVE_DATASET_IN_ACCOUNTING_PERIOD") return "所选月份内没有已识别的交易报告或配送货件。请核对本次核算月份，并补充该范围内的资料。";
   const fxFailure = /^(FX_DATA_GAP|FX_NO_AVAILABLE_QUOTE)(?::([A-Z]{3}):(\d{4}-\d{2}-\d{2}))?$/u.exec(preview.value.failureCode ?? "");
   if (fxFailure) {
     const subject = fxFailure[2] && fxFailure[3] ? `${fxFailure[3]} ${fxFailure[2]}/CNY` : "报表日期对应币种";
@@ -176,6 +224,7 @@ async function acceptSelection(selection: readonly DroppedFile[]) {
       source: file,
       state: "pending",
     }));
+    selectedUploadPaths.value = [];
     batchId.value = "";
     preview.value = null;
     completeness.value = [];
@@ -208,6 +257,30 @@ async function collectDrop(event: globalThis.DragEvent) {
   }
 }
 
+function toggleAllUploadItems() {
+  if (!canEditUploadSelection.value) return;
+  selectedUploadPaths.value = allUploadItemsSelected.value
+    ? []
+    : uploadItems.value.map((item) => item.path);
+}
+
+function removeSelectedUploadItems() {
+  if (!canEditUploadSelection.value || selectedUploadCount.value === 0) return;
+  const selected = new Set(selectedUploadPaths.value);
+  const removed = uploadItems.value.filter((item) => selected.has(item.path)).length;
+  files.value = files.value.filter((file) => !selected.has(relativePath(file)));
+  uploadItems.value = uploadItems.value.filter((item) => !selected.has(item.path));
+  selectedUploadPaths.value = [];
+  stateEpoch += 1;
+  pollingGeneration += 1;
+  status.value = "idle";
+  progress.value = "0";
+  error.value = "";
+  selectionNotice.value = uploadItems.value.length
+    ? `已从待上传清单移除 ${removed} 个文件；当前还剩 ${uploadItems.value.length} 个文件。`
+    : `已从待上传清单移除全部 ${removed} 个文件。`;
+}
+
 function isMetadataPdf(file: Pick<File, "name" | "type">): boolean {
   return file.type.toLowerCase() === "application/pdf" || /\.pdf$/iu.test(file.name);
 }
@@ -224,7 +297,13 @@ async function refreshPreview(importBatchId = preview.value?.id, expectedEpoch?:
   if (!importBatchId) return false;
   const next = await api.getImportPreview(shopId.value, importBatchId);
   if (expectedEpoch !== undefined && expectedEpoch !== stateEpoch) return false;
-  const nextCompleteness = await api.getCompleteness(shopId.value);
+  if (next.periodStart && next.periodEnd) {
+    periodStart.value = next.periodStart;
+    periodEnd.value = next.periodEnd;
+  }
+  const nextCompleteness = await api.getCompleteness(shopId.value, next.periodStart && next.periodEnd
+    ? { periodStart: next.periodStart, periodEnd: next.periodEnd }
+    : undefined);
   if (expectedEpoch !== undefined && expectedEpoch !== stateEpoch) return false;
   preview.value = next;
   completeness.value = nextCompleteness;
@@ -304,12 +383,16 @@ async function completeCurrentUpload() {
 async function startUpload() {
   if (restoringLatest.value || !accepted.value) return;
   stateEpoch += 1;
+  selectedUploadPaths.value = [];
   selectionNotice.value = "";
   status.value = "uploading"; error.value = ""; progress.value = "0";
   try {
     if (!batchId.value) {
       await prepareUploadChecksum();
-      const batch = await api.createUploadBatch(shopId.value, files.value.map((file) => ({ relativePath: relativePath(file), bytes: String(isMetadataPdf(file) ? 0 : file.size), contentType: file.type || "application/octet-stream", ...(isMetadataPdf(file) ? { metadataOnly: true } : {}) })));
+      const batch = await api.createUploadBatch(shopId.value, files.value.map((file) => ({ relativePath: relativePath(file), bytes: String(isMetadataPdf(file) ? 0 : file.size), contentType: file.type || "application/octet-stream", ...(isMetadataPdf(file) ? { metadataOnly: true } : {}) })), {
+        periodStart: periodStart.value,
+        periodEnd: periodEnd.value,
+      });
       batchId.value = batch.id;
       for (const item of uploadItems.value) {
         const remote = batch.files.find((candidate) => candidate.relativePath === item.path);
@@ -416,6 +499,14 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
 
     <section id="upload-source" class="surface-section upload-picker">
       <div class="section-heading"><h2>选择来源文件</h2><p>请选择完整文件夹，系统会记住文件在文件夹中的位置。CSV、从表格软件导出的 TXT 和系统已确认列名的配送货件 XLSX 可以用于计算；PDF 只登记文件名，交易报告 XLSX 和其他文件只保留文件信息。</p></div>
+      <fieldset class="accounting-period-scope" :disabled="selectionLocked || Boolean(batchId)">
+        <legend>本次核算月份（必选）</legend>
+        <label class="form-field"><span>开始月份</span><input v-model="periodStart" type="month" :max="periodEnd || undefined" /></label>
+        <span class="accounting-period-separator" aria-hidden="true">至</span>
+        <label class="form-field"><span>结束月份</span><input v-model="periodEnd" type="month" :min="periodStart || undefined" /></label>
+        <p>系统只检查并计算这个范围；范围外资料不会显示为本次缺失。成本表按自然年展示，因此起止月份必须在同一年。</p>
+      </fieldset>
+      <p v-if="periodError" class="form-error" role="alert">{{ periodError }}</p>
       <div
         class="upload-drop-zone"
         :class="{ 'is-active': dragActive, 'is-disabled': selectionLocked }"
@@ -427,7 +518,7 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
         @drop.prevent="collectDrop"
       >
         <div aria-hidden="true" class="upload-drop-icon">＋</div>
-        <div><strong>拖入文件夹、ZIP 或文件</strong><p>如果浏览器一次只能选择一个文件夹，可以多选几次继续添加；也可以一次拖入多个文件夹。直接选择的 PDF 只登记文件名；ZIP 中有 PDF 时，整个 ZIP 都不会上传。</p></div>
+        <div><strong>拖入文件夹、ZIP 或文件</strong><p>如果原生窗口一次只能选择一个文件夹，请选完后继续点击“追加文件夹”；也可以一次拖入多个文件夹，或选择它们共同的上一级文件夹。直接选择的 PDF 只登记文件名；ZIP 中有 PDF 时，整个 ZIP 都不会上传。</p></div>
         <div class="upload-source-actions">
           <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加文件夹" : "选择文件夹" }}<input type="file" multiple webkitdirectory directory :disabled="selectionLocked" @change="collect" /></label>
           <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加 ZIP 或文件" : "选择 ZIP 或文件" }}<input type="file" multiple accept=".zip,.csv,.txt,.pdf,.xlsx,.xls" :disabled="selectionLocked" @change="collect" /></label>
@@ -436,7 +527,21 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
       <div v-if="files.length" class="selection-summary"><span>{{ files.length }} 个文件</span><strong>{{ formatBytes(totalBytes) }}</strong><span>上限 20,000 个文件 / 2GB</span></div>
       <p v-if="restoringLatest" class="action-help" role="status">正在查看上次上传的进度，完成前暂时不能选择文件或开始上传。</p>
       <p v-if="selectionNotice" class="action-help" role="status">{{ selectionNotice }}</p>
-      <div v-if="uploadItems.length" class="file-manifest" role="region" aria-label="待上传文件" tabindex="0"><div v-for="item in uploadItems.slice(0, 200)" :key="item.key"><span>{{ item.path }}</span><b>{{ /\.pdf$/i.test(item.path) ? "仅登记文件名" : formatBytes(item.size) }}</b><span class="status-chip" :data-state="item.state">{{ /\.pdf$/i.test(item.path) && item.state === "complete" ? "未读取正文" : uploadStateNames[item.state] }}</span><small v-if="item.error">{{ uploadErrorText(item.error) }}</small></div><p v-if="uploadItems.length > 200">另有 {{ uploadItems.length - 200 }} 个文件，服务器也会检查完整清单。</p></div>
+      <div v-if="uploadItems.length" class="file-manifest" role="region" aria-label="待上传文件" tabindex="0">
+        <header v-if="canEditUploadSelection" class="file-manifest-actions">
+          <label class="file-manifest-select-all"><input type="checkbox" aria-label="全选待上传文件" :checked="allUploadItemsSelected" :indeterminate="someUploadItemsSelected" :aria-checked="allUploadItemsSelected ? 'true' : someUploadItemsSelected ? 'mixed' : 'false'" @change="toggleAllUploadItems" /><span>{{ allUploadItemsSelected ? "取消全选" : `全选全部 ${uploadItems.length} 个` }}</span></label>
+          <span class="file-manifest-selected-count">已选 {{ selectedUploadCount }} 个</span>
+          <button class="secondary-button compact" type="button" :disabled="selectedUploadCount === 0" @click="removeSelectedUploadItems">移除已选文件</button>
+        </header>
+        <div v-for="item in uploadItems.slice(0, 200)" :key="item.key" class="file-manifest-item">
+          <input v-if="canEditUploadSelection" v-model="selectedUploadPaths" class="file-manifest-checkbox" type="checkbox" :value="item.path" :aria-label="`选择待上传文件 ${item.path}`" />
+          <span class="status-chip" :data-state="item.state">{{ /\.pdf$/i.test(item.path) && item.state === "complete" ? "未读取正文" : uploadStateNames[item.state] }}</span>
+          <span class="file-manifest-path" :title="item.path">{{ item.path }}</span>
+          <b class="file-manifest-size">{{ /\.pdf$/i.test(item.path) ? "仅登记文件名" : formatBytes(item.size) }}</b>
+          <small v-if="item.error">{{ uploadErrorText(item.error) }}</small>
+        </div>
+        <p v-if="uploadItems.length > 200">当前显示前 200 个文件，另有 {{ uploadItems.length - 200 }} 个；全选会作用于完整清单。</p>
+      </div>
       <p v-if="error && !preview" class="form-error" role="alert">{{ error }}</p>
       <div v-if="status !== 'idle' && !preview" class="warning-panel" :data-tone="uploadConclusion.tone" role="status"><strong>{{ uploadConclusion.title }}</strong><p>{{ uploadConclusion.detail }}</p></div>
       <div v-if="status === 'uploading'" class="upload-progress" role="status" aria-live="polite"><div><span>正在上传 {{ progress }}%</span><b>网络中断后，可从上次成功的位置继续</b></div><progress :value="Number(progress)" max="100"></progress></div>
@@ -451,16 +556,17 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
         <div><span>问题数量</span><strong>{{ preflightIssueCount }}</strong></div>
         <div><span>当前状态</span><strong>{{ previewStatusLabel }}</strong></div>
       </div>
+      <p v-if="preview.periodStart && preview.periodEnd" class="accounting-period-summary">本次只核算 {{ preview.periodStart }} 至 {{ preview.periodEnd }}；范围外资料保留，但不参与本次缺失检查、计算和导出。</p>
       <div class="warning-panel" :data-tone="preview.status === 'FAILED' ? 'error' : preview.status === 'PUBLISHED' ? 'success' : undefined" role="status"><strong>处理结论</strong><p>{{ preflightConclusion }}</p></div>
 
       <details v-if="preflightFiles.length || preview.issues.length" class="preflight-detail">
         <summary>查看文件与问题明细</summary>
-        <div v-if="preflightFiles.length" class="table-scroll" tabindex="0"><table><thead><tr><th>文件在所选文件夹中的位置</th><th>文件内容</th><th>处理结果</th><th>说明</th></tr></thead><tbody><tr v-for="file in preflightFiles" :key="file.path"><td>{{ file.path }}</td><td>{{ file.classification }}</td><td><span class="status-chip" :data-state="file.status">{{ file.status }}</span></td><td>{{ file.detail }}</td></tr></tbody></table></div>
+        <div v-if="preflightFiles.length" class="table-scroll" tabindex="0" role="region" aria-label="文件检查结果"><table><thead><tr><th>文件在所选文件夹中的位置</th><th>文件内容</th><th>处理结果</th><th>说明</th></tr></thead><tbody><tr v-for="file in preflightFiles" :key="file.path"><td>{{ file.path }}</td><td><span v-if="file.classificationKind" class="file-kind-chip" :data-kind="file.classificationKind">{{ file.classification }}</span><span v-else>{{ file.classification }}</span></td><td><span class="status-chip" :data-state="file.tone">{{ file.status }}</span></td><td>{{ file.detail }}</td></tr></tbody></table></div>
         <div v-if="preview.issues.length" class="issue-list"><article v-for="issue in preview.issues" :key="issue.id" :data-severity="issue.severity"><header><strong>{{ issue.message }}</strong><span>{{ issue.exactCount ? `${issue.count} 条` : `${issue.count} 条示例` }}</span></header><p>{{ issue.action }}</p></article></div>
       </details>
 
       <div class="section-heading"><h2>缺少资料的站点和月份</h2><p>{{ commitCoverageRows.length ? "这里只列出需要补资料的站点和月份；资料齐全的项目已经自动收起。" : "系统只会显示需要处理的缺失项目。" }}</p></div>
-      <div v-if="commitCoverageRows.length" class="table-scroll commit-coverage-table" tabindex="0" role="region" aria-label="缺少资料的站点和月份"><table><thead><tr><th>站点</th><th>月份</th><th>缺少什么</th></tr></thead><tbody><tr v-for="slice in commitCoverageRows" :key="slice.datasetVersionId || `${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chip"><b aria-hidden="true">!</b>缺少{{ slice.missingContent }}</span></td></tr></tbody></table></div>
+      <div v-if="commitCoverageRows.length" class="table-scroll commit-coverage-table" tabindex="0" role="region" aria-label="缺少资料的站点和月份"><table><thead><tr><th>站点</th><th>月份</th><th>缺少什么</th></tr></thead><tbody><tr v-for="slice in commitCoverageRows" :key="slice.datasetVersionId || `${slice.marketplace}-${slice.month}`" data-missing="true"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="missing-data-chips"><span v-for="report in slice.missingReports" :key="report" class="missing-data-chip" :data-kind="report"><b aria-hidden="true">!</b>缺少{{ classificationNames[report] }}</span></span></td></tr></tbody></table></div>
       <div v-else-if="hasCompleteness" class="warning-panel" data-tone="success" role="status"><strong>资料已可核算</strong><p>配送货件或纯 FMB 交易资料已覆盖当前站点和月份，可以继续核算。</p></div>
       <div v-else class="inline-empty">正在汇总站点和月份，处理完成后会在本页原位更新。</div>
 

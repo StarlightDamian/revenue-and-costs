@@ -36,6 +36,7 @@ describe("cost accounting export preview", () => {
           published_snapshot_id: "snapshot-1",
           calculation_run_id: "run-1",
           year: "2026",
+          yearCount: "1",
         }], rowCount: 1 };
       }
       if (sql.includes("WITH component_amount AS")) {
@@ -76,6 +77,52 @@ describe("cost accounting export preview", () => {
       profitCny: "50.00000000",
       minimumAdjusted: true,
     });
+    const pointerSql = String(query.mock.calls.find(([sql]) => sql.includes("FROM shop_current_published_snapshot current"))?.[0]);
+    expect(pointerSql).toContain("published_slice.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')");
+    expect(pointerSql).toContain("count(DISTINCT date_trunc('year',slice.local_month))");
+  });
+
+  it("fails closed when the included snapshot scope spans multiple natural years", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM shop s LEFT JOIN shop_membership")) {
+        return { rows: [{
+          id: "shop-1",
+          enterprise_id: "enterprise-1",
+          status: "ACTIVE",
+          membership_id: null,
+          membership_status: null,
+          export_allowed: null,
+          authorization_epoch: null,
+        }], rowCount: 1 };
+      }
+      if (sql.includes("FROM account")) {
+        return { rows: [{
+          profit_rate: null,
+          minimum_sales_cost_rate: null,
+          continent_prefixes: ["EU"],
+        }], rowCount: 1 };
+      }
+      if (sql.includes("FROM shop_current_published_snapshot current")) {
+        return { rows: [{
+          published_snapshot_id: "snapshot-1",
+          calculation_run_id: "run-1",
+          year: "2025",
+          yearCount: "2",
+        }], rowCount: 1 };
+      }
+      throw new Error(`UNEXPECTED_QUERY:${sql}`);
+    });
+    const service = new PostgresExportService(
+      { query } as unknown as Pool,
+      {} as never,
+      "D:/tmp/exports",
+    );
+
+    await expect(service.previewCostAccounting(actor, "shop-1")).rejects.toMatchObject({
+      code: "EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR",
+      statusCode: 409,
+    });
+    expect(query.mock.calls.some(([sql]) => sql.includes("WITH component_amount AS"))).toBe(false);
   });
 
   it("keeps invalid stored defaults behind the export API's stable validation error", async () => {
