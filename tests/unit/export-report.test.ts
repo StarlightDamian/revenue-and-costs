@@ -57,7 +57,7 @@ function input(rows?: Parameters<typeof section>[0]): ReportExportInput {
   };
 }
 
-describe("five-sheet v8 export", () => {
+describe("five-sheet v9 export", () => {
   it("neutralizes control-character formula prefixes used by CSV readers", () => {
     expect(neutralizeSpreadsheetFormula("\t=HYPERLINK(\"x\")")).toBe("'\t=HYPERLINK(\"x\")");
     expect(neutralizeSpreadsheetFormula("\r@SUM(1,1)")).toBe("'\r@SUM(1,1)");
@@ -76,7 +76,7 @@ describe("five-sheet v8 export", () => {
       }),
     ]);
     const workbook = new ExcelJS.Workbook(); await workbook.xlsx.readFile(path);
-    expect(REPORT_EXPORT_FORMAT).toBe("revenue-and-costs-export-v8");
+    expect(REPORT_EXPORT_FORMAT).toBe("revenue-and-costs-export-v9");
     expect(REPORT_SHEETS).toEqual(EXPECTED_REPORT_SHEETS);
     expect(workbook.worksheets.map((sheet) => sheet.name)).toEqual(EXPECTED_REPORT_SHEETS);
     expect(workbook.getWorksheet("口径说明")?.state).toBe("hidden");
@@ -93,8 +93,17 @@ describe("five-sheet v8 export", () => {
       expect(sheet.getCell(2, columns.length + 1).value).toBeNull();
       expect(sheet.getCell("B3").value).toBe("US");
       expect(sheet.autoFilter).toBe("A2:D2");
+      expect(sheet.properties.defaultRowHeight).toBe(30);
+      expect(sheet.getRow(2).height).toBe(30);
+      expect(sheet.getRow(3).height).toBe(30);
     }
-    expect(workbook.getWorksheet("成本核算表-人民币")?.getCell("A1").value).toBe("脱敏店铺");
+    const cost = workbook.getWorksheet("成本核算表-人民币")!;
+    expect(cost.getCell("A1").value).toBe("脱敏店铺");
+    expect(cost.properties.defaultRowHeight).toBe(30);
+    for (const rowNumber of [1, 2, 3, 13, 15, 21]) {
+      expect(cost.getRow(rowNumber).height).toBe(30);
+    }
+    expect(cost.getRow(14).height).toBe(42);
     expect(workbook.getWorksheet("月度明细账单")?.getCell("C3").formula).toBe('ROUND(VALUE("0.30000000"),8)');
   });
 
@@ -214,6 +223,13 @@ describe("five-sheet v8 export", () => {
     await exportReport(financial, path);
     const workbook = new ExcelJS.Workbook(); await workbook.xlsx.readFile(path);
     const monthly = workbook.getWorksheet("月度明细账单")!;
+    for (const sheetName of ["月度明细账单", "季度明细账单", "年度明细账单"]) {
+      const sheet = workbook.getWorksheet(sheetName)!;
+      expect(sheet.properties.defaultRowHeight).toBe(30);
+      for (const rowNumber of [1, 2, 3, 4, 5]) {
+        expect(sheet.getRow(rowNumber).height).toBe(30);
+      }
+    }
     expect(monthly.getCell("A2").value).toBe("公司");
     expect(monthly.getCell("F2").value).toBe("收入");
     expect(monthly.getCell("F3").value).toBe("收入总额");
@@ -242,5 +258,8 @@ describe("five-sheet v8 export", () => {
     expect(cost.getCell("U3").fill).toMatchObject({ fgColor: { argb: "FFF8CBAD" } });
     expect(cost.getCell("U7").fill).toMatchObject({ fgColor: { argb: "FFB4C6E7" } });
     expect(cost.getCell("U8").fill).toMatchObject({ fgColor: { argb: "FFD9D2E9" } });
+    expect(cost.properties.defaultRowHeight).toBe(30);
+    expect(cost.getRow(8).height).toBe(30);
+    expect(cost.getRow(14).height).toBe(42);
   });
 });

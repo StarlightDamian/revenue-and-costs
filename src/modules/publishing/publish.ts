@@ -1,4 +1,4 @@
-export type SnapshotSliceDisposition = "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED";
+export type SnapshotSliceDisposition = "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED" | "OUT_OF_SCOPE";
 
 export interface ReportFilter {
   readonly start?: string;
@@ -9,6 +9,7 @@ export interface ReportFilter {
 export interface CalculationRunSlice {
   readonly sliceId: string;
   readonly datasetVersionId: string;
+  readonly disposition: SnapshotSliceDisposition;
   readonly hardReasons: readonly string[];
   readonly softWarning: boolean;
   readonly hardExclusionAcknowledgementId?: string;
@@ -90,8 +91,13 @@ function validateManifest(run: CalculationRunForPublishing, manifest: SnapshotMa
     if (currentVersion !== slice.datasetVersionId || runSlice.datasetVersionId !== slice.datasetVersionId) {
       throw new Error("PUBLISHED_DATASET_VERSION_STALE");
     }
+    if (slice.disposition !== runSlice.disposition) throw new Error("PUBLISH_SLICE_DISPOSITION_MISMATCH");
 
-    if (slice.disposition === "HARD_EXCLUDED") {
+    if (slice.disposition === "OUT_OF_SCOPE") {
+      if (runSlice.hardReasons.length > 0 || runSlice.hardExclusionAcknowledgementId || runSlice.softWarningAcknowledgementId) {
+        throw new Error("OUT_OF_SCOPE_SLICE_INVALID");
+      }
+    } else if (slice.disposition === "HARD_EXCLUDED") {
       if (runSlice.hardReasons.length === 0 || !runSlice.hardExclusionAcknowledgementId) {
         throw new Error("HARD_EXCLUSION_NOT_ACKNOWLEDGED");
       }

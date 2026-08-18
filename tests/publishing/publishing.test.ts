@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { publishSnapshot, type PublishStore, type PublishTransaction } from "../../src/modules/publishing";
 
-function store(options?: { failSliceInsert?: boolean; currentVersion?: string; sliceCount?: number; runFxOverrides?: string[]; currentFxOverrides?: string[] }): {
+function store(options?: { failSliceInsert?: boolean; currentVersion?: string; sliceCount?: number; runFxOverrides?: string[]; currentFxOverrides?: string[]; outOfScope?: boolean }): {
   store: PublishStore;
   state: { current: string; snapshots: string[] };
   calls: { sliceWrites: number };
@@ -11,6 +11,7 @@ function store(options?: { failSliceInsert?: boolean; currentVersion?: string; s
   const slices = Array.from({ length: options?.sliceCount ?? 1 }, (_, index) => ({
     sliceId: `slice-${index + 1}`,
     datasetVersionId: `version-${index + 1}`,
+    disposition: options?.outOfScope ? "OUT_OF_SCOPE" as const : "INCLUDED" as const,
     hardReasons: [],
     softWarning: false,
   }));
@@ -91,5 +92,17 @@ describe("显式发布", () => {
 
     expect(fixture.calls.sliceWrites).toBe(1);
     expect(fixture.state.current).toBe("snapshot-new");
+  });
+
+  it("保留范围外切片以冻结全店 current 集，但不要求质量确认", async () => {
+    const fixture = store({ outOfScope: true });
+    await expect(publishSnapshot(fixture.store, {
+      actorAccountId: "owner-1",
+      manifest: {
+        calculationRunId: "run-1",
+        shopId: "shop-1",
+        slices: [{ sliceId: "slice-1", datasetVersionId: "version-1", disposition: "OUT_OF_SCOPE" }],
+      },
+    })).resolves.toBe("snapshot-new");
   });
 });

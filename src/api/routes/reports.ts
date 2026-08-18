@@ -69,6 +69,7 @@ const PublishBody = Type.Object({
       Type.Literal("INCLUDED"),
       Type.Literal("INCLUDED_WITH_WARNING"),
       Type.Literal("HARD_EXCLUDED"),
+      Type.Literal("OUT_OF_SCOPE"),
     ]),
   }), { minItems: 1 }),
 });

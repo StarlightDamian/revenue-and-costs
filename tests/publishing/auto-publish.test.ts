@@ -56,11 +56,11 @@ describe("calculation rule versioning", () => {
     })).resolves.toMatchObject({ runId: "run-1" });
 
     const insert = calls.find(({ sql }) => sql.includes("INSERT INTO calculation_run("));
-    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v6", "local-v8"]);
+    expect(insert?.parameters?.slice(4, 6)).toEqual(["revenue-cost-v6", "local-v9"]);
     expect(insert?.parameters?.[6]).toBe("transaction-fee-v3");
     expect(JSON.parse(String(insert?.parameters?.[7]))).toMatchObject({
       formulaVersion: "revenue-cost-v6",
-      codeVersion: "local-v8",
+      codeVersion: "local-v9",
       feeClassificationVersion: "transaction-fee-v3",
       feeClassificationPolicySha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
       fxDateRuleVersion: "next-business-day-v2",
@@ -104,6 +104,59 @@ describe("calculation rule versioning", () => {
 });
 
 describe("import-triggered automatic publishing", () => {
+  it("freezes the full current set while excluding slices outside the selected accounting period", async () => {
+    const calls: Array<{ sql: string; parameters?: readonly unknown[] }> = [];
+    const client = {
+      async query(sql: string, parameters?: readonly unknown[]) {
+        calls.push({ sql, ...(parameters ? { parameters } : {}) });
+        if (sql.includes("FROM import_batch WHERE id=$1")) {
+          return { rows: [{ period_start: "2026-04", period_end: "2026-06" }] };
+        }
+        if (sql.includes("FROM dataset_slice ds")) return { rows: [
+          {
+            slice_id: "slice-in", version_id: "version-in", local_month: "2026-05", status: "COMPLETE", mappings: [], warning: false,
+            hard_ack: null, soft_ack: null, normalized_marketplace: "US", policy_id: "policy-1",
+            iana_timezone: "America/Los_Angeles", date_attribution_mode: "REPORT_LITERAL_DATE",
+          },
+          {
+            slice_id: "slice-out", version_id: "version-out", local_month: "2025-06", status: "INCOMPLETE", mappings: [], warning: true,
+            hard_ack: null, soft_ack: null, normalized_marketplace: "CA", policy_id: null,
+            iana_timezone: null, date_attribution_mode: null,
+          },
+        ] };
+        if (sql.includes("price_id") && sql.includes("fx_sync_run_id")) return { rows: [{ price_id: "price-1", fx_sync_run_id: "fx-1" }] };
+        if (sql.includes("FROM fx_current_override")) return { rows: [] };
+        if (sql.includes("INSERT INTO calculation_run(")) return { rows: [{ id: "run-1", status: "QUEUED" }] };
+        return { rows: [], rowCount: 1 };
+      },
+    };
+    const reports = new PostgresReportService(
+      { transaction: async (work: (transactionClient: typeof client) => Promise<unknown>) => work(client) } as never,
+      { query: vi.fn() } as never,
+    );
+
+    await expect(reports.requestCalculation("shop-1", {
+      actorAccountId: "actor-1",
+      idempotencyKey: "scoped-batch",
+      sourceImportBatchId: "batch-1",
+      autoPublish: true,
+    })).resolves.toMatchObject({ runId: "run-1" });
+
+    const runInsert = calls.find(({ sql }) => sql.includes("INSERT INTO calculation_run("));
+    expect(JSON.parse(String(runInsert?.parameters?.[7]))).toMatchObject({
+      accountingPeriod: { periodStart: "2026-04", periodEnd: "2026-06" },
+      slices: expect.arrayContaining([
+        expect.objectContaining({ sliceId: "slice-in" }),
+        expect.objectContaining({ sliceId: "slice-out" }),
+      ]),
+    });
+    const sliceInsert = calls.find(({ sql }) => sql.includes("INSERT INTO calculation_run_slice"));
+    expect(JSON.parse(String(sliceInsert?.parameters?.[1]))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slice_id: "slice-in", disposition: "INCLUDED" }),
+      expect.objectContaining({ slice_id: "slice-out", disposition: "OUT_OF_SCOPE", hard_ack: null, soft_ack: null }),
+    ]));
+  });
+
   it("stops before creating a calculation when a hard-incomplete slice was not confirmed", async () => {
     const queries: string[] = [];
     const client = {

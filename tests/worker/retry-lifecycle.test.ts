@@ -71,6 +71,7 @@ describe("worker retry lifecycle", () => {
   it("classifies deterministic calculation request blockers without retrying them", () => {
     expect(calculationRequestBlockCode(new Error("HARD_INCOMPLETE_CONFIRMATION_REQUIRED"))).toBe("HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
     expect(calculationRequestBlockCode(new Error("CALCULATION_DATE_ATTRIBUTION_MODE_MIXED"))).toBe("CALCULATION_DATE_ATTRIBUTION_MODE_MIXED");
+    expect(calculationRequestBlockCode(new Error("NO_ACTIVE_DATASET_IN_ACCOUNTING_PERIOD"))).toBe("NO_ACTIVE_DATASET_IN_ACCOUNTING_PERIOD");
     expect(calculationRequestBlockCode(new Error("ECONNRESET"))).toBeUndefined();
   });
 

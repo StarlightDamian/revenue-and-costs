@@ -58,6 +58,7 @@ describe("calculation retry lifecycle", () => {
 
     expect(query).toHaveBeenCalledTimes(2);
     expect(query.mock.calls.every(([sql]) => String(sql).includes("calculation_run_slice"))).toBe(true);
+    expect(query.mock.calls.every(([sql]) => String(sql).includes("disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')"))).toBe(true);
     expect(String(query.mock.calls[1]?.[0])).toContain("COALESCE(tf.fulfillment_mode,'BLANK') fulfillment_mode");
     expect(summaries).toHaveLength(40);
     expect(summaries.every(({ summary }) => Object.values(summary).every((value) => value === "0.00000000"))).toBe(true);

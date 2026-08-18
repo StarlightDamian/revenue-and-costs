@@ -123,7 +123,7 @@ describe("shop route actor contract", () => {
         slices: [{
           sliceId: "40000000-0000-4000-8000-000000000004",
           datasetVersionId: "50000000-0000-4000-8000-000000000005",
-          disposition: "INCLUDED",
+          disposition: "OUT_OF_SCOPE",
         }],
       },
     });

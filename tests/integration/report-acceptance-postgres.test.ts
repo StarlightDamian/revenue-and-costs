@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { Pool } from "pg";
 import { PostgresDatabase } from "../../src/db/database.js";
-import type { SqlClient, TransactionRunner } from "../../src/modules/authorization/index.js";
+import type { Actor, SqlClient, TransactionRunner } from "../../src/modules/authorization/index.js";
 import { calculateRun } from "../../src/modules/calculation/postgres-runner.js";
+import { PostgresExportService } from "../../src/modules/exports/postgres.js";
 import { PostgresReportService } from "../../src/modules/publishing/postgres-service.js";
 import { createPostgresTestSchema, type PostgresTestSchema } from "./postgres-harness.js";
 
@@ -20,6 +22,8 @@ const FIXTURE = {
   policyId: "90000000-0000-4000-8000-000000000012",
   fxRunId: "90000000-0000-4000-8000-000000000013",
   fxSnapshotId: "90000000-0000-4000-8000-000000000014",
+  oldSliceId: "90000000-0000-4000-8000-000000000015",
+  oldDatasetVersionId: "90000000-0000-4000-8000-000000000016",
 } as const;
 
 async function seedPublishedReport(
@@ -55,8 +59,9 @@ async function seedPublishedReport(
     [FIXTURE.uploadBatchId, FIXTURE.shopId, FIXTURE.accountId],
   );
   await pool.query(
-    `INSERT INTO import_batch(id,shop_id,upload_batch_id,status,current_stage,idempotency_key,created_by)
-     VALUES($1,$2,$3,'RESULT_PUBLISHED','PUBLISHED','report-acceptance-fixture',$4)`,
+    `INSERT INTO import_batch(id,shop_id,upload_batch_id,status,current_stage,idempotency_key,created_by,
+                              accounting_period_start,accounting_period_end)
+     VALUES($1,$2,$3,'RESULT_PUBLISHED','PUBLISHED','report-acceptance-fixture',$4,'2026-04-01','2026-06-01')`,
     [FIXTURE.importBatchId, FIXTURE.shopId, FIXTURE.uploadBatchId, FIXTURE.accountId],
   );
   await pool.query(
@@ -256,6 +261,29 @@ describe("published report acceptance database", () => {
       "SELECT manifest::text manifest_text,encode(manifest_sha256,'hex') hash FROM published_snapshot WHERE id=$1",
       [initial.snapshotId],
     )).rows[0]!;
+    await pool.query(
+      "INSERT INTO dataset_slice(id,shop_id,normalized_marketplace,local_month) VALUES($1,$2,'QA','2025-06-01')",
+      [FIXTURE.oldSliceId, FIXTURE.shopId],
+    );
+    await pool.query(
+      `INSERT INTO dataset_version(
+         id,dataset_slice_id,import_batch_id,version_no,status,manifest_sha256,activated_at,created_by,created_at
+       ) VALUES($1,$2,$3,1,'ACTIVE',digest('report-acceptance-old-version','sha256'),'2025-06-10',$4,'2025-06-10')`,
+      [FIXTURE.oldDatasetVersionId, FIXTURE.oldSliceId, FIXTURE.importBatchId, FIXTURE.accountId],
+    );
+    await pool.query("UPDATE dataset_slice SET current_version_id=$2 WHERE id=$1", [
+      FIXTURE.oldSliceId,
+      FIXTURE.oldDatasetVersionId,
+    ]);
+    await pool.query(
+      `INSERT INTO shipment_fact(
+         dataset_version_id,source_file_id,row_number,row_hash,original_datetime_text,parsed_at,source_timezone,
+         fx_date,marketplace_local_date,local_month,normalized_marketplace,original_sales_channel,currency,
+         shipped_quantity,product_price
+       ) VALUES($1,$2,2,digest('report-acceptance-old-row','sha256'),'2025-06-10','2025-06-10','UTC',
+                '2025-06-10','2025-06-10','2025-06-01','QA','synthetic.example','USD',1,999.00)`,
+      [FIXTURE.oldDatasetVersionId, FIXTURE.importFileId],
+    );
     const requested = await reports.requestCalculation(FIXTURE.shopId, {
       actorAccountId: FIXTURE.accountId,
       idempotencyKey: "report-acceptance-second-calculation",
@@ -265,7 +293,7 @@ describe("published report acceptance database", () => {
     const slices = await pool.query<{
       slice_id: string;
       dataset_version_id: string;
-      disposition: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED";
+      disposition: "INCLUDED" | "INCLUDED_WITH_WARNING" | "HARD_EXCLUDED" | "OUT_OF_SCOPE";
     }>(
       `SELECT dataset_slice_id::text slice_id,dataset_version_id::text,disposition
          FROM calculation_run_slice WHERE calculation_run_id=$1 ORDER BY dataset_slice_id`,
@@ -308,7 +336,45 @@ describe("published report acceptance database", () => {
     expect(trace.stored_hash).toBe(trace.recomputed_hash);
     expect(trace.canonical_hash).toBe(trace.recomputed_hash);
     expect(trace.policy_slices).toBe(trace.total_slices);
-    expect((await reports.getCurrent(FIXTURE.shopId)).snapshotId).toBe(published.snapshotId);
+    const current = await reports.getCurrent(FIXTURE.shopId);
+    expect(current.snapshotId).toBe(published.snapshotId);
+    expect(current.completeness).toEqual([
+      expect.objectContaining({ month: "2026-04", disposition: "INCLUDED" }),
+    ]);
+    const frozenScope = await pool.query<{ local_month: string; disposition: string }>(
+      `SELECT to_char(slice.local_month,'YYYY-MM') local_month,published_slice.disposition
+         FROM published_snapshot_slice published_slice
+         JOIN dataset_slice slice ON slice.id=published_slice.dataset_slice_id
+        WHERE published_slice.published_snapshot_id=$1
+        ORDER BY slice.local_month`,
+      [published.snapshotId],
+    );
+    expect(frozenScope.rows).toEqual([
+      { local_month: "2025-06", disposition: "OUT_OF_SCOPE" },
+      { local_month: "2026-04", disposition: "INCLUDED" },
+    ]);
+    const calculatedMonths = await pool.query<{ local_month: string }>(
+      `SELECT DISTINCT to_char(fact.local_month,'YYYY-MM') local_month
+         FROM calculation_fact_result result
+         JOIN shipment_fact fact ON result.fact_kind='SHIPMENT' AND fact.id=result.fact_id
+        WHERE result.calculation_run_id=$1
+        ORDER BY local_month`,
+      [requested.runId],
+    );
+    expect(calculatedMonths.rows).toEqual([{ local_month: "2026-04" }]);
+    const actor: Actor = {
+      accountId: FIXTURE.accountId,
+      status: "ACTIVE",
+      roles: new Set(["ACCOUNTANT"]),
+      enterpriseIds: new Set([FIXTURE.enterpriseId]),
+    };
+    const costPreview = await new PostgresExportService(
+      pool as unknown as Pool,
+      {} as never,
+      "D:/tmp/report-acceptance-exports",
+    ).previewCostAccounting(actor, FIXTURE.shopId);
+    expect(costPreview.year).toBe("2026");
+    expect(costPreview.rows[3]).toMatchObject({ period: "2026-04", incomeTotalCny: "864.15000000" });
     expect((await pool.query<{ manifest_text: string; hash: string }>(
       "SELECT manifest::text manifest_text,encode(manifest_sha256,'hex') hash FROM published_snapshot WHERE id=$1",
       [initial.snapshotId],

@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import type { Actor, ShopCapability } from "../../modules/authorization/index.js";
+import { parseAccountingPeriodScope } from "../../shared/accounting-period.js";
 import { UuidSchema } from "../../shared/contracts.js";
 import { requireIdempotencyKey } from "../idempotency.js";
 
@@ -10,7 +11,7 @@ export interface ImportRouteServices {
   confirm(shopId: string, batchId: string, input: { actorAccountId: string; idempotencyKey: string }): Promise<unknown>;
   acknowledge(shopId: string, issueId: string, input: { actorAccountId: string; reason: string; confirmations: string; idempotencyKey: string }): Promise<unknown>;
   rollback(shopId: string, versionId: string, input: { actorAccountId: string; reason: string; idempotencyKey: string }): Promise<unknown>;
-  getCompleteness(shopId: string): Promise<unknown>;
+  getCompleteness(shopId: string, period?: { periodStart?: string; periodEnd?: string }): Promise<unknown>;
 }
 
 export interface ImportRouteOptions {
@@ -19,17 +20,22 @@ export interface ImportRouteOptions {
   authorize(actor: Actor, shopId: string, capability: ShopCapability): Promise<void>;
 }
 
-const ShopQuery = Type.Object({ shopId: UuidSchema });
+const MonthSchema = Type.String({ pattern: "^(?:19|20|21)[0-9]{2}-(?:0[1-9]|1[0-2])$" });
+const ShopQuery = Type.Object({ shopId: UuidSchema, periodStart: Type.Optional(MonthSchema), periodEnd: Type.Optional(MonthSchema) });
 const ShopParams = Type.Object({ shopId: UuidSchema });
 const Params = Type.Object({ shopId: UuidSchema, id: UuidSchema });
 const ReasonBody = Type.Object({ reason: Type.String({ minLength: 1, maxLength: 1000 }), confirmations: Type.Optional(Type.String({ pattern: "^[12]$" })) });
 const AcknowledgeBody = Type.Object({ reason: Type.Optional(Type.String({ maxLength: 1000 })), confirmations: Type.Optional(Type.String({ pattern: "^[12]$" })) });
 
 export const importRoutes: FastifyPluginAsync<ImportRouteOptions> = async (app, options) => {
-  app.get<{ Querystring: { shopId: string } }>("/api/v1/imports/completeness", { schema: { querystring: ShopQuery } }, async (request) => {
+  app.get<{ Querystring: { shopId: string; periodStart?: string; periodEnd?: string } }>("/api/v1/imports/completeness", { schema: { querystring: ShopQuery } }, async (request) => {
+    const accountingPeriod = parseAccountingPeriodScope({
+      ...(request.query.periodStart ? { periodStart: request.query.periodStart } : {}),
+      ...(request.query.periodEnd ? { periodEnd: request.query.periodEnd } : {}),
+    });
     const actor = await options.authenticate(request);
     await options.authorize(actor, request.query.shopId, "DRAFT_RESULT_READ");
-    return options.services.getCompleteness(request.query.shopId);
+    return options.services.getCompleteness(request.query.shopId, accountingPeriod);
   });
   app.get<{ Params: { shopId: string } }>(
     "/api/v1/imports/shops/:shopId/batches/latest",

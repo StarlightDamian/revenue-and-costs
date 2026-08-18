@@ -231,6 +231,7 @@ const SAFE_EXPORT_FAILURE_CODES = new Set([
   "EXPORT_FEE_CONSERVATION_FAILED",
   "EXPORT_FORMAT_VERSION_UNSUPPORTED",
   "EXPORT_IMPORT_CONSERVATION_FAILED",
+  "EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR",
   "EXPORT_INCLUDED_SCOPE_MISMATCH",
   "EXPORT_NO_INCLUDED_SLICES",
   "EXPORT_OVERFLOW_DIRECTORY_REQUIRED",
@@ -625,19 +626,25 @@ export class PostgresExportService {
       published_snapshot_id: string;
       calculation_run_id: string;
       year: string;
+      yearCount: string;
     }>(
       `SELECT current.published_snapshot_id,snapshot.calculation_run_id,
-              to_char(min(slice.local_month),'YYYY') AS year
+              to_char(min(slice.local_month),'YYYY') AS year,
+              count(DISTINCT date_trunc('year',slice.local_month))::text AS "yearCount"
          FROM shop_current_published_snapshot current
          JOIN published_snapshot snapshot ON snapshot.id=current.published_snapshot_id
          JOIN published_snapshot_slice published_slice ON published_slice.published_snapshot_id=snapshot.id
          JOIN dataset_slice slice ON slice.id=published_slice.dataset_slice_id
         WHERE current.shop_id=$1
+          AND published_slice.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
         GROUP BY current.published_snapshot_id,snapshot.calculation_run_id`,
       [shopId],
     );
     const current = pointer.rows[0];
     if (!current) throw new AppError("PUBLISHED_SNAPSHOT_NOT_FOUND", "当前公司还没有可预览的正式结果", 409);
+    if (current.yearCount !== "1") {
+      throw new AppError("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR", "当前正式结果包含多个自然年，无法生成单年度成本预览", 409);
+    }
     const actual = await this.aggregateMonthlyFinancialRows(current.calculation_run_id);
     const monthly = new Map<string, {
       income: ReturnType<typeof decimal>;
@@ -1044,6 +1051,9 @@ export class PostgresExportService {
     );
     const includedScope = scope.rows.filter((row) => ["INCLUDED", "INCLUDED_WITH_WARNING"].includes(row.disposition));
     if (includedScope.length === 0) throw new Error("EXPORT_NO_INCLUDED_SLICES");
+    if (new Set(includedScope.map((row) => row.period.slice(0, 4))).size !== 1) {
+      throw new Error("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR");
+    }
     const reportPeriods = [...new Set(includedScope.map((row) => row.period))].sort();
     const marketplaceCurrency = new Map<string, string>();
     const fallbackCurrency: Readonly<Record<string, string>> = {

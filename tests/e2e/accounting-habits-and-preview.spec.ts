@@ -138,6 +138,11 @@ test("做账习惯保存默认参数，报告页带入后可预览最低销售�
 
   await page.goto(`/shops/${shopId}/workflow/export`);
   await expect(page.getByRole("heading", { name: "本次成本测算" })).toBeVisible();
+  const assumptionToolbar = page.locator(".export-assumption-toolbar");
+  await expect(assumptionToolbar.locator(":scope > *")).toHaveCount(3);
+  await expect(assumptionToolbar.getByRole("button", { name: "预览调整结果" })).toBeVisible();
+  await expect(page.getByText("当前正式版本", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".export-generation-row").getByRole("button", { name: "生成并下载" })).toBeVisible();
   await expect(page.getByLabel("利润率（可选）")).toHaveValue("5.25");
   await expect(page.getByLabel("最低销售成本率（可选）")).toHaveValue("15");
   await expect(page.getByText("最低销售成本率已触发", { exact: false })).toBeVisible();
@@ -162,5 +167,6 @@ test("做账习惯保存默认参数，报告页带入后可预览最低销售�
   await page.getByRole("button", { name: "重新读取" }).click();
   await expect(page.getByLabel("利润率（可选）")).toHaveValue("5.25");
   await expect(createExportButton).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: resolve(evidenceDirectory, `preview-${testInfo.project.name}.png`), fullPage: true });
 });

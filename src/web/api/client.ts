@@ -141,13 +141,14 @@ export const api = {
   listFxOverrides: async () => normalizeFxOverrideList(await apiRequest<unknown>("/api/v1/admin/fx-overrides")),
   createFxOverride: async (input: FxOverrideInput) => normalizeFxOverrideMutation(await apiRequest<unknown>("/api/v1/admin/fx-overrides", { method: "POST", body: json(input) })),
   reviseFxOverride: async (overrideId: string, input: FxOverrideInput) => normalizeFxOverrideMutation(await apiRequest<unknown>(`/api/v1/admin/fx-overrides/${encodeURIComponent(overrideId)}/revisions`, { method: "POST", body: json(input) })),
-  createUploadBatch: async (shopId: string, files: Array<{ relativePath: string; bytes: string; contentType: string; metadataOnly?: boolean }>) => {
+  createUploadBatch: async (shopId: string, files: Array<{ relativePath: string; bytes: string; contentType: string; metadataOnly?: boolean }>, period?: { periodStart: string; periodEnd: string }) => {
     if (files.length === 0) {
-      const batch = await createUploadBatchRequest<{ id: string }>(json({ shopId }));
+      const batch = await createUploadBatchRequest<{ id: string }>(json({ shopId, ...period }));
       return { id: batch.id, files: [] };
     }
     return createUploadBatchRequest<{ id: string; files: Array<{ id: string; relativePath: string; offset: string }> }>(json({
         shopId,
+        ...period,
         fileCount: files.length,
         files: files.map((file) => ({
           relativePath: file.relativePath,
@@ -192,7 +193,12 @@ export const api = {
     `/api/v1/imports/shops/${encodeURIComponent(shopId)}/issues/${encodeURIComponent(datasetVersionId)}/acknowledge`,
     { method: "POST", body: json({ reason, confirmations: "2" }) },
   ),
-  getCompleteness: (shopId: string) => apiRequest<CompletenessSlice[]>(`/api/v1/imports/completeness?shopId=${encodeURIComponent(shopId)}`),
+  getCompleteness: (shopId: string, period?: { periodStart?: string; periodEnd?: string }) => {
+    const query = new URLSearchParams({ shopId });
+    if (period?.periodStart) query.set("periodStart", period.periodStart);
+    if (period?.periodEnd) query.set("periodEnd", period.periodEnd);
+    return apiRequest<CompletenessSlice[]>(`/api/v1/imports/completeness?${query}`);
+  },
   getReport: async (shopId: string, query: URLSearchParams) => {
     try { return await apiRequest<ReportResult>(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/preview?${query}`); }
     catch (error) {
@@ -212,7 +218,7 @@ export const api = {
     const query = new URLSearchParams(filters); query.set("kind", kind);
     return withAppBasePath(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/intermediate/export?${query}`);
   },
-  publishReport: (shopId: string, report: ReportResult) => apiRequest<ReportResult>(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/publish`, { method: "POST", body: json({ calculationRunId: report.runId, slices: report.completeness.map((slice) => ({ sliceId: slice.sliceId, datasetVersionId: slice.datasetVersionId, disposition: slice.disposition })) }) }),
+  publishReport: (shopId: string, report: ReportResult) => apiRequest<ReportResult>(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/publish`, { method: "POST", body: json({ calculationRunId: report.runId, slices: (report.publishSlices ?? report.completeness).map((slice) => ({ sliceId: slice.sliceId, datasetVersionId: slice.datasetVersionId, disposition: slice.disposition })) }) }),
   listExports: (shopId: string) => apiRequest<ExportJob[]>(`/api/v1/exports?shopId=${encodeURIComponent(shopId)}`),
   previewCostAccounting: (shopId: string, preferences: AccountingPreferences) => {
     const query = new URLSearchParams({

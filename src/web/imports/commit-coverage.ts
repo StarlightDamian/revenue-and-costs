@@ -64,5 +64,5 @@ export function projectCommitCoverage(
       .map((kind) => kind === "TRANSACTION" ? "交易报告" : "配送货件")
       .join("、");
     return [{ ...publicSlice, missingReports, missingContent, ...disclosureFor(slice, missingContent) }];
-  }).sort((left, right) => left.month.localeCompare(right.month) || left.marketplace.localeCompare(right.marketplace));
+  }).sort((left, right) => left.marketplace.localeCompare(right.marketplace) || left.month.localeCompare(right.month));
 }

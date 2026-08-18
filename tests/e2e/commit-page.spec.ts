@@ -19,6 +19,8 @@ const me = {
 
 const preview = {
   id: batchId,
+  periodStart: "2025-09",
+  periodEnd: "2025-11",
   status: "FAILED",
   progress: "0",
   stage: "CALCULATION_BLOCKED",
@@ -27,7 +29,7 @@ const preview = {
     { id: "file-1", relativePath: "US/transaction.csv", bytes: "1024", classification: "TRANSACTION", status: "PARSED" },
     { id: "file-2", relativePath: "US/shipment.csv", bytes: "1024", classification: "SHIPMENT", status: "PARSED" },
     { id: "file-3", relativePath: "notes.pdf", bytes: "512", classification: "LIST_ONLY", status: "LIST_ONLY" },
-    { id: "file-4", relativePath: "unknown.csv", bytes: "256", classification: "UNKNOWN", status: "EXCLUDED_UNKNOWN_STRUCTURE" },
+    { id: "file-4", relativePath: "unknown.csv", bytes: "256", classification: "UNKNOWN", status: "AWAITING_MAPPING" },
   ],
   ignored: [
     { relativePath: "notes.pdf", reason: "LIST_ONLY" },
@@ -96,11 +98,15 @@ test("资料准备页用白话说明缺少的资料和处理方法", async ({ pa
   await expect(page.locator(".commit-summary > div").filter({ hasText: "未参与计算" })).toContainText("2");
   const table = page.getByRole("region", { name: "缺少资料的站点和月份" });
   await expect(table.locator("tbody tr")).toHaveCount(3);
+  await expect(table.locator("tbody tr td:first-child")).toHaveText(["AE", "BE", "SA"]);
   await expect(table.locator("tbody tr").first()).toHaveAttribute("data-missing", "true");
-  await expect(table.locator(".missing-data-chip")).toHaveCount(3);
-  await expect(table.locator(".missing-data-chip").nth(0)).toContainText("缺少交易报告、配送货件");
-  await expect(table.locator(".missing-data-chip").nth(1)).toContainText("缺少交易报告");
-  await expect(table.locator(".missing-data-chip").nth(2)).toContainText("缺少配送货件");
+  await expect(table.locator(".missing-data-chip")).toHaveCount(4);
+  await expect(table.locator(".missing-data-chip").nth(0)).toHaveText("!缺少配送货件");
+  await expect(table.locator(".missing-data-chip").nth(0)).toHaveAttribute("data-kind", "SHIPMENT");
+  await expect(table.locator(".missing-data-chip").nth(1)).toHaveText("!缺少交易报告");
+  await expect(table.locator(".missing-data-chip").nth(1)).toHaveAttribute("data-kind", "TRANSACTION");
+  await expect(table.locator(".missing-data-chip").nth(2)).toHaveText("!缺少交易报告");
+  await expect(table.locator(".missing-data-chip").nth(3)).toHaveText("!缺少配送货件");
   await expect(table).not.toContainText("US");
   await expect(page.getByRole("heading", { name: "确认不计算缺少资料的项目" })).toBeVisible();
   await expect(page.locator(".workflow-commit-panel > .commit-coverage-table table")).toHaveCount(1);
@@ -108,9 +114,33 @@ test("资料准备页用白话说明缺少的资料和处理方法", async ({ pa
   await page.locator("details.preflight-detail").click();
   await expect(page.getByRole("cell", { name: "交易报告", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "配送货件", exact: true })).toBeVisible();
-  await expect(page.locator(".workflow-stage-page")).not.toContainText(/PARSED|LIST_ONLY|UNKNOWN_STRUCTURE_EXCLUDED/u);
+  await expect(page.locator('.file-kind-chip[data-kind="TRANSACTION"]')).toHaveText("交易报告");
+  await expect(page.locator('.file-kind-chip[data-kind="SHIPMENT"]')).toHaveText("配送货件");
+  const fileResults = page.getByRole("region", { name: "文件检查结果" });
+  await expect(fileResults.locator("tbody tr").filter({ hasText: "US/transaction.csv" }).locator(".status-chip")).toHaveAttribute("data-state", "complete");
+  await expect(fileResults.locator("tbody tr").filter({ hasText: "notes.pdf" }).locator(".status-chip")).toHaveAttribute("data-state", "skipped");
+  const awaitingMapping = fileResults.locator("tbody tr").filter({ hasText: "unknown.csv" }).locator(".status-chip");
+  await expect(awaitingMapping).toHaveText("等待管理员确认表格内容");
+  await expect(awaitingMapping).toHaveAttribute("data-state", "warning");
+  await expect(page.locator(".workflow-stage-page")).not.toContainText(/PARSED|LIST_ONLY|AWAITING_MAPPING|UNKNOWN_STRUCTURE_EXCLUDED/u);
   await expect(page.locator(".workflow-stage-page")).not.toContainText(/预检|入库|阻断|相对路径|制表符|原生选择器|offset|切片|口径/u);
   await expect(page.locator(".workflow-stage-page")).toContainText("从表格软件导出的 TXT");
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  if (testInfo.project.name === "desktop-chromium") {
+    const originalViewport = page.viewportSize();
+    for (const width of [700, 901, 1181, 1200]) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect.poll(() => page.evaluate(() => {
+        const sections = Array.from(document.querySelectorAll<HTMLElement>(".workflow-stage-page, .surface-section, .accounting-period-scope"));
+        return document.documentElement.scrollWidth <= window.innerWidth
+          && sections.every((section) => {
+            const bounds = section.getBoundingClientRect();
+            return bounds.left >= -1 && bounds.right <= window.innerWidth + 1;
+          });
+      })).toBe(true);
+    }
+    if (originalViewport) await page.setViewportSize(originalViewport);
+  }
 
   const evidenceDirectory = resolve(".work/evidence/commit-single-page");
   await mkdir(evidenceDirectory, { recursive: true });
@@ -155,15 +185,16 @@ test("资料可核算时不展示月份行，并给出来源覆盖反馈", async
   await expect(completeState.getByText("配送货件或纯 FMB 交易资料已覆盖当前站点和月份，可以继续核算。", { exact: true })).toBeVisible();
 });
 
-test("上传前可连续追加文件夹和文件，并以最后一次选择解决同路径冲突", async ({ page }, testInfo) => {
+test("上传前可连续追加、单选或全选移除文件，并以最后一次选择解决同路径冲突", async ({ page }, testInfo) => {
   let uploadBatchRequests = 0;
   let completeUploadRequests = 0;
   let uploadedPaths: string[] = [];
+  let uploadedPeriod: { periodStart?: string; periodEnd?: string } = {};
   let failNextChunk = true;
   let restoredPreviewRequests = 0;
   let releaseRestoredPreview!: () => void;
   const restoredPreviewGate = new Promise<void>((resolveGate) => { releaseRestoredPreview = resolveGate; });
-  const restoredPreview = { id: batchId, status: "READY", progress: "100", stage: "PREFLIGHT_READY", failureCode: null, files: [], ignored: [], issues: [], affectedVersions: [] };
+  const restoredPreview = { id: batchId, periodStart: "2026-04", periodEnd: "2026-06", status: "READY", progress: "100", stage: "PREFLIGHT_READY", failureCode: null, files: [], ignored: [], issues: [], affectedVersions: [] };
   const currentRestoredPreview = () => completeUploadRequests === 1 ? {
     ...restoredPreview,
     status: "RUNNING",
@@ -191,8 +222,12 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
     if (uploadBatchRequests === 1) {
       return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ code: "TEMPORARY_UNAVAILABLE", message: "temporary unavailable" }) });
     }
-    const payload = route.request().postDataJSON() as { files?: Array<{ relativePath: string }> };
+    const payload = route.request().postDataJSON() as { periodStart?: string; periodEnd?: string; files?: Array<{ relativePath: string }> };
     uploadedPaths = (payload.files ?? []).map((file) => file.relativePath);
+    uploadedPeriod = {
+      ...(payload.periodStart ? { periodStart: payload.periodStart } : {}),
+      ...(payload.periodEnd ? { periodEnd: payload.periodEnd } : {}),
+    };
     return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({
       id: batchId,
       files: (payload.files ?? []).map((file, index) => ({ id: `file-${index}`, relativePath: file.relativePath, offset: "0" })),
@@ -249,7 +284,12 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
   releaseRestoredPreview();
   await expect(folderInput).toBeEnabled();
   await expect(fileInput).toBeEnabled();
+  await folderInput.focus();
+  await expect(folderInput.locator("..")).toHaveCSS("outline-style", "solid");
   await expect(page.getByRole("heading", { name: "本次资料" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "本次核算月份（必选）" })).toContainText("系统只检查并计算这个范围");
+  await expect(page.getByLabel("开始月份")).toHaveValue("2026-04");
+  await expect(page.getByLabel("结束月份")).toHaveValue("2026-06");
 
   await folderInput.setInputFiles(usFolder);
 
@@ -266,10 +306,58 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
   await expect(folderInput).toHaveValue("");
   await expect(fileInput).toHaveValue("");
   await expect(page.locator(".selection-summary")).toContainText("4 个文件");
-  await expect(page.getByRole("region", { name: "待上传文件" })).toContainText("DE/transaction.csv");
-  await expect(page.getByRole("region", { name: "待上传文件" })).toContainText("notes.pdf");
-  await expect(page.getByRole("region", { name: "待上传文件" }).locator("div").filter({ hasText: "US/transaction.csv" })).toContainText("8 B");
+  const manifest = page.getByRole("region", { name: "待上传文件" });
+  await expect(manifest).toContainText("DE/transaction.csv");
+  await expect(manifest).toContainText("notes.pdf");
+  await expect(manifest.locator(".file-manifest-item").filter({ hasText: "US/transaction.csv" })).toContainText("8 B");
+  await expect(manifest.locator(".file-manifest-item").first().locator(".status-chip")).toHaveText("等待");
+  await expect(manifest.locator(".file-manifest-item").first().locator(".status-chip")).toHaveAttribute("data-state", "pending");
+  await expect(manifest.locator(".file-manifest-path")).toHaveText([
+    "DE/shipment.csv",
+    "DE/transaction.csv",
+    "US/transaction.csv",
+    "notes.pdf",
+  ]);
+  const firstFileCheckbox = manifest.getByRole("checkbox", { name: "选择待上传文件 DE/shipment.csv" });
+  const firstFileCheckboxBox = await firstFileCheckbox.boundingBox();
+  expect(firstFileCheckboxBox?.width).toBeGreaterThanOrEqual(24);
+  expect(firstFileCheckboxBox?.height).toBeGreaterThanOrEqual(24);
   expect(uploadBatchRequests).toBe(0);
+
+  await manifest.getByRole("checkbox", { name: "选择待上传文件 DE/transaction.csv" }).check();
+  await expect(manifest.locator(".file-manifest-selected-count")).toHaveText("已选 1 个");
+  await manifest.getByRole("button", { name: "移除已选文件" }).click();
+  await expect(page.locator(".selection-summary")).toContainText("3 个文件");
+  await expect(manifest).not.toContainText("DE/transaction.csv");
+  expect(uploadBatchRequests).toBe(0);
+
+  await folderInput.setInputFiles(deFolder);
+  await expect(page.locator(".selection-summary")).toContainText("4 个文件");
+  await manifest.getByRole("checkbox", { name: "全选待上传文件" }).check();
+  await expect(manifest.locator(".file-manifest-selected-count")).toHaveText("已选 4 个");
+  await manifest.getByRole("button", { name: "移除已选文件" }).click();
+  await expect(page.getByRole("region", { name: "待上传文件" })).toHaveCount(0);
+  await expect(page.locator(".selection-summary")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "开始上传" })).toHaveCount(0);
+  expect(uploadBatchRequests).toBe(0);
+
+  await fileInput.setInputFiles(Array.from({ length: 201 }, (_, index) => ({
+    name: `bulk-${String(index).padStart(3, "0")}.csv`,
+    mimeType: "text/csv",
+    buffer: Buffer.from(String(index)),
+  })));
+  await expect(page.locator(".selection-summary")).toContainText("201 个文件");
+  await expect(manifest).toContainText("当前显示前 200 个文件，另有 1 个；全选会作用于完整清单。");
+  await manifest.getByRole("checkbox", { name: "全选待上传文件" }).check();
+  await expect(manifest.locator(".file-manifest-selected-count")).toHaveText("已选 201 个");
+  await manifest.getByRole("button", { name: "移除已选文件" }).click();
+  await expect(page.getByRole("region", { name: "待上传文件" })).toHaveCount(0);
+  expect(uploadBatchRequests).toBe(0);
+
+  await folderInput.setInputFiles(usFolder);
+  await folderInput.setInputFiles(deFolder);
+  await fileInput.setInputFiles({ name: "notes.pdf", mimeType: "application/pdf", buffer: Buffer.from("metadata") });
+  await expect(page.locator(".selection-summary")).toContainText("4 个文件");
 
   await page.getByRole("button", { name: "开始上传" }).click();
   await expect.poll(() => uploadBatchRequests).toBe(1);
@@ -281,9 +369,11 @@ test("上传前可连续追加文件夹和文件，并以最后一次选择解�
   await page.getByRole("button", { name: "重试开始上传" }).click();
   await expect.poll(() => uploadBatchRequests).toBe(2);
   await expect(page.getByRole("button", { name: "继续上传" })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "全选待上传文件" })).toHaveCount(0);
   await expect(folderInput).toBeDisabled();
   await expect(fileInput).toBeDisabled();
   expect([...uploadedPaths].sort()).toEqual(["US/transaction.csv", "DE/transaction.csv", "DE/shipment.csv", "notes.pdf"].sort());
+  expect(uploadedPeriod).toEqual({ periodStart: "2026-04", periodEnd: "2026-06" });
   await page.getByRole("button", { name: "继续上传" }).click();
   await expect.poll(() => completeUploadRequests).toBe(1);
   await expect(page.getByRole("alert")).toContainText("文件已经上传");

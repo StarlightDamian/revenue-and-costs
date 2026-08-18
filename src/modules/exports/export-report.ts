@@ -8,8 +8,9 @@ import { once } from "node:events";
 import type { ColumnDefinition, ReportCell, ReportExportInput, ReportRow, ReportSection } from "./report-types";
 
 export const REPORT_SHEETS = ["口径说明", "月度明细账单", "季度明细账单", "年度明细账单", "成本核算表-人民币"] as const;
-export const REPORT_EXPORT_FORMAT = "revenue-and-costs-export-v8";
+export const REPORT_EXPORT_FORMAT = "revenue-and-costs-export-v9";
 const EXCEL_MAX_ROWS = 1_048_576;
+const REPORT_ROW_HEIGHT = 30;
 const HEADER_FILL = "1F4E78";
 const HEADER_LIGHT_FILL = "9DC3E6";
 const PROFIT_FILL = "FFF2CC";
@@ -143,7 +144,7 @@ function styleSheet(sheet: ExcelJS.Worksheet, columns: readonly ColumnDefinition
   header.fill = { type: "pattern", pattern: "solid", fgColor: { argb: `FF${HEADER_FILL}` } };
   header.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   for (let column = 1; column <= columns.length; column += 1) header.getCell(column).border = THIN_BORDER;
-  header.height = 28;
+  header.height = REPORT_ROW_HEIGHT;
   sheet.autoFilter = { from: { row: 2, column: 1 }, to: { row: 2, column: columns.length } };
 }
 
@@ -201,6 +202,7 @@ function excelColumn(index: number): string {
 function styleDataRow(row: ExcelJS.Row, columns: readonly ColumnDefinition[]): void {
   row.font = { name: "Microsoft YaHei", size: 10, color: { argb: "FF111827" } };
   row.alignment = { vertical: "top" };
+  row.height = REPORT_ROW_HEIGHT;
   for (const [index, column] of columns.entries()) {
     const cell = row.getCell(index + 1);
     if (column.kind === "decimal") cell.numFmt = '#,##0.00;[Red]-#,##0.00;0.00';
@@ -274,6 +276,7 @@ function reportPeriodLabel(periods: readonly string[]): string {
 
 function setFinancialHeader(sheet: ExcelJS.Worksheet, periods: readonly string[]): void {
   sheet.getRow(1).values = ["导出日期：", reportPeriodLabel(periods)];
+  sheet.getRow(1).height = REPORT_ROW_HEIGHT;
   sheet.mergeCells("B1:AF1");
   sheet.getRow(2).values = ["公司", "日期", "平台", "站点", "原币币种", "收入", "", "", "", "", "", "平台支出", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "采购成本", "", "", "利润", "", ""];
   sheet.getRow(3).values = ["", "", "", "", "", "收入总额", "", "退款金额", "", "收入净额", "", "商品税", "", "平台费", "", "FBA发货费", "", "FBA 仓储费", "", "广告费", "", "其他扣费", "", "费用合计", "", "平台扣费率", "销售成本率", "采购成本", "", "利润率", "利润金额", ""];
@@ -284,7 +287,7 @@ function setFinancialHeader(sheet: ExcelJS.Worksheet, periods: readonly string[]
     const current = sheet.getRow(row);
     current.font = { bold: true, name: "Microsoft YaHei", size: 10, color: { argb: "FF102A43" } };
     current.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-    current.height = row === 2 ? 30 : 26;
+    current.height = REPORT_ROW_HEIGHT;
     for (let column = 1; column <= 32; column += 1) current.getCell(column).fill = { type: "pattern", pattern: "solid", fgColor: { argb: `FF${HEADER_LIGHT_FILL}` } };
   }
   for (let column = 30; column <= 32; column += 1) {
@@ -316,7 +319,7 @@ async function writeFinancialRows(
     lastDataRow = row.number;
     row.font = { name: "Microsoft YaHei", size: 10, color: { argb: "FF111827" } };
     row.alignment = { vertical: "middle", horizontal: "center" };
-    row.height = 22;
+    row.height = REPORT_ROW_HEIGHT;
     for (let column = 1; column <= section.columns.length; column += 1) {
       const cell = row.getCell(column);
       cell.border = THIN_BORDER;
@@ -398,12 +401,17 @@ async function writeCsvParts(
 
 function writeIndexRows(sheet: ExcelJS.Worksheet, files: readonly ManifestFile[]): void {
   for (const file of files) {
-    sheet.addRow([safeText(file.name), file.rows ?? "0", file.sha256, "数据量超过 Excel 行限制，请使用同包 CSV 分片。"] as ExcelJS.CellValue[]).commit();
+    const row = sheet.addRow([safeText(file.name), file.rows ?? "0", file.sha256, "数据量超过 Excel 行限制，请使用同包 CSV 分片。"] as ExcelJS.CellValue[]);
+    row.height = REPORT_ROW_HEIGHT;
+    row.commit();
   }
 }
 
 function writeCnyCostAccountingSheet(workbook: ExcelJS.stream.xlsx.WorkbookWriter, input: ReportExportInput): void {
-  const sheet = workbook.addWorksheet(REPORT_SHEETS[4], { views: [{ state: "frozen", xSplit: 2, ySplit: 2, showGridLines: false }] });
+  const sheet = workbook.addWorksheet(REPORT_SHEETS[4], {
+    properties: { defaultRowHeight: REPORT_ROW_HEIGHT },
+    views: [{ state: "frozen", xSplit: 2, ySplit: 2, showGridLines: false }],
+  });
   const leftWidths = [7, 22, ...Array.from({ length: 17 }, () => 14)];
   leftWidths.forEach((width, index) => { sheet.getColumn(index + 1).width = width; });
   sheet.getColumn(20).width = 3;
@@ -512,6 +520,7 @@ function writeCnyCostAccountingSheet(workbook: ExcelJS.stream.xlsx.WorkbookWrite
   sheet.mergeCells("D16:S16");
 
   for (let row = 1; row <= 21; row += 1) {
+    sheet.getRow(row).height = row === 14 ? 42 : REPORT_ROW_HEIGHT;
     for (const [from, to] of [[1, 19], [21, 29]] as Array<[number, number]>) {
       for (let column = from; column <= to; column += 1) {
         const cell = sheet.getCell(row, column);
@@ -539,9 +548,6 @@ function writeCnyCostAccountingSheet(workbook: ExcelJS.stream.xlsx.WorkbookWrite
   fillRange(3, 21, 29, INCOME_FILL);
   fillRange(7, 21, 29, PROCUREMENT_FILL);
   fillRange(8, 21, 29, EXPENSE_FILL);
-  sheet.getRow(1).height = 28;
-  sheet.getRow(2).height = 32;
-  sheet.getRow(14).height = 42;
   sheet.commit();
 }
 
@@ -599,12 +605,16 @@ async function createWorkbook(
     await report(stage);
     const candidateKind: SummaryKind | undefined = name === REPORT_SHEETS[1] ? "monthly" : name === REPORT_SHEETS[2] ? "quarterly" : name === REPORT_SHEETS[3] ? "annual" : undefined;
     const financialKind = candidateKind && isFinancialSummary(section) ? candidateKind : undefined;
-    const sheet = workbook.addWorksheet(name, { views: [{ state: "frozen", ySplit: financialKind ? 4 : 2, xSplit: financialKind ? 5 : 0, showGridLines: false }] });
+    const sheet = workbook.addWorksheet(name, {
+      properties: { defaultRowHeight: REPORT_ROW_HEIGHT },
+      views: [{ state: "frozen", ySplit: financialKind ? 4 : 2, xSplit: financialKind ? 5 : 0, showGridLines: false }],
+    });
     if (requiredSheetRows(section) <= BigInt(maxRows)) {
       if (financialKind) written.set(name, await writeFinancialRows(sheet, section, financialKind, input.reportPeriods, onRows));
       else {
         styleSheet(sheet, section.columns);
         sheet.getRow(1).values = [`${input.shopName} / ${name} / 快照 ${input.snapshotId}`];
+        sheet.getRow(1).height = REPORT_ROW_HEIGHT;
         sheet.getRow(1).font = { bold: true, name: "Microsoft YaHei", color: { argb: `FF${HEADER_FILL}` } };
         written.set(name, await writeRows(sheet, section, onRows));
       }
@@ -619,6 +629,7 @@ async function createWorkbook(
         { key: "note", header: "说明", width: 48, kind: "text" },
       ]);
       sheet.getRow(1).values = [`${input.shopName} / ${name} / CSV索引`];
+      sheet.getRow(1).height = REPORT_ROW_HEIGHT;
       writeIndexRows(sheet, files);
       written.set(name, { lastDataRow: files.length + 2, overflow: true });
     }

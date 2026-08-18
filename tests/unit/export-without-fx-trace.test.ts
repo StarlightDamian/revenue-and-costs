@@ -1,10 +1,42 @@
 import type { Pool } from "pg";
 import { describe, expect, it, vi } from "vitest";
-import { PostgresExportService } from "../../src/modules/exports/postgres.js";
+import { isPermanentExportFailure, PostgresExportService, safeExportFailureCode } from "../../src/modules/exports/postgres.js";
 import type { ReportExportInput } from "../../src/modules/exports/report-types.js";
 import type { EncryptedObjectStore } from "../../src/modules/storage/encrypted-object-store.js";
 
 describe("export without embedded FX trace", () => {
+  it("fails closed with a safe permanent error when included slices span natural years", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM published_snapshot s JOIN published_snapshot_integrity")) {
+        return { rows: [{
+          shop_name: "shop", manifest: { slices: [] }, manifest_sha256: "a".repeat(64),
+          calculation_run_id: "run", published_at: new Date("2026-07-28T00:00:00Z"),
+        }], rowCount: 1 };
+      }
+      if (sql.includes("FROM published_snapshot_slice ps JOIN dataset_slice")) {
+        return { rows: [
+          { period: "2025-12", month: "2025-12", marketplace: "US", currency: "USD", disposition: "INCLUDED", datasetVersionId: "version-2025" },
+          { period: "2026-01", month: "2026-01", marketplace: "US", currency: "USD", disposition: "INCLUDED_WITH_WARNING", datasetVersionId: "version-2026" },
+        ], rowCount: 2 };
+      }
+      throw new Error(`UNEXPECTED_QUERY:${sql}`);
+    });
+    const service = new PostgresExportService(
+      { query } as unknown as Pool,
+      {} as EncryptedObjectStore,
+      "D:/tmp/export-cross-year",
+    );
+
+    const result = (service as unknown as {
+      buildInput(shopId: string, snapshotId: string): Promise<ReportExportInput>;
+    }).buildInput("10000000-0000-4000-8000-000000000001", "20000000-0000-4000-8000-000000000002");
+    await expect(result).rejects.toThrow("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR");
+
+    const error = new Error("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR");
+    expect(safeExportFailureCode(error)).toBe("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR");
+    expect(isPermanentExportFailure(error)).toBe(true);
+  });
+
   it("builds the report input without querying per-cell FX usage", async () => {
     const queries: string[] = [];
     const query = vi.fn(async (sql: string) => {

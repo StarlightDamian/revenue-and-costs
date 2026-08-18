@@ -115,7 +115,7 @@ export async function processRunFacts(
         product_price::text,product_tax::text,shipping_price::text,shipping_tax::text,gift_wrap_price::text,gift_wrap_tax::text,
         product_promotion_discount::text,shipment_promotion_discount::text
        FROM shipment_fact sf JOIN calculation_run_slice rs ON rs.dataset_version_id=sf.dataset_version_id
-        AND rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
+        AND rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
        WHERE sf.id>$2::bigint ORDER BY sf.id LIMIT 1000`, [runId, lastShipment.toString()],
     );
     if (!rows.rows.length) break;
@@ -137,7 +137,7 @@ export async function processRunFacts(
         tax_on_regulatory_fee::text,promotional_rebates::text,promotional_rebates_tax::text,marketplace_withheld_tax::text,
         selling_fees::text,fba_fees::text,other_transaction_fees::text,other_amount::text
        FROM transaction_fact tf JOIN calculation_run_slice rs ON rs.dataset_version_id=tf.dataset_version_id
-        AND rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
+        AND rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
        WHERE tf.id>$2::bigint ORDER BY tf.id LIMIT 1000`, [runId, lastTransaction.toString()],
     );
     if (!rows.rows.length) break;
@@ -232,7 +232,7 @@ async function processRunFeeClassifications(
       `SELECT tf.id::text AS fact_id,tf.normalized_type,tf.normalized_description,
         tf.selling_fees::text,tf.fba_fees::text,tf.other_transaction_fees::text,tf.other_amount::text
        FROM transaction_fact tf JOIN calculation_run_slice rs ON rs.dataset_version_id=tf.dataset_version_id
-        AND rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
+        AND rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
        WHERE tf.id>$2::bigint ORDER BY tf.id LIMIT 1000`,
       [runId, lastTransaction.toString()],
     );
@@ -315,8 +315,8 @@ export async function calculateRun(pool: Pool, runId: string, transactionClient?
     await client.query("UPDATE calculation_run SET status='RUNNING',started_at=COALESCE(started_at,clock_timestamp()),finished_at=NULL,failure_code=NULL WHERE id=$1", [runId]);
     const range = await client.query<{ from_date: string; to_date: string }>(
       `SELECT min(fx_date)::text from_date,max(fx_date)::text to_date FROM (
-        SELECT fx_date FROM shipment_fact sf JOIN calculation_run_slice rs ON rs.dataset_version_id=sf.dataset_version_id WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED'
-        UNION ALL SELECT fx_date FROM transaction_fact tf JOIN calculation_run_slice rs ON rs.dataset_version_id=tf.dataset_version_id WHERE rs.calculation_run_id=$1 AND rs.disposition<>'HARD_EXCLUDED') q`, [runId],
+        SELECT fx_date FROM shipment_fact sf JOIN calculation_run_slice rs ON rs.dataset_version_id=sf.dataset_version_id WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
+        UNION ALL SELECT fx_date FROM transaction_fact tf JOIN calculation_run_slice rs ON rs.dataset_version_id=tf.dataset_version_id WHERE rs.calculation_run_id=$1 AND rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')) q`, [runId],
     );
     const dateRange = range.rows[0];
     const manifestOverrideIds = runRow.input_manifest.fxOverrideIds;
@@ -332,7 +332,7 @@ export async function calculateRun(pool: Pool, runId: string, transactionClient?
       quote_ids uuid[],override_ids uuid[],rate numeric(30,8),
       UNIQUE(fact_kind,fact_id,source_column,component)) ON COMMIT DROP`);
     const slices = await client.query<CalculationSliceRow>(
-      "SELECT dataset_slice_id,dataset_version_id FROM calculation_run_slice WHERE calculation_run_id=$1 AND disposition<>'HARD_EXCLUDED' ORDER BY dataset_slice_id", [runId],
+      "SELECT dataset_slice_id,dataset_version_id FROM calculation_run_slice WHERE calculation_run_id=$1 AND disposition IN ('INCLUDED','INCLUDED_WITH_WARNING') ORDER BY dataset_slice_id", [runId],
     );
     const reader = await pool.connect();
     let summaries;

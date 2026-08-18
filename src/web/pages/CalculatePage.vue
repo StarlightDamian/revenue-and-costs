@@ -26,6 +26,8 @@ const intermediateNext = ref<string>();
 const intermediateAfter = ref<string>();
 const intermediateHistory = ref<string[]>([]);
 const intermediateLoading = ref(false);
+const intermediateSummaryLoading = ref(false);
+const intermediateSummaryReady = ref(false);
 const grain = ref<"MONTH" | "DAY">("MONTH");
 const start = ref("");
 const end = ref("");
@@ -33,8 +35,13 @@ const selectedMarketplaces = ref<string[]>([]);
 const selectedCurrencies = ref<string[]>([]);
 const selectedColumnKeys = ref<string[]>([]);
 const filterBar = ref<globalThis.HTMLElement | null>(null);
+const reviewResultDisclosure = ref<globalThis.HTMLDetailsElement | null>(null);
+const reviewResultOpen = ref(false);
 let timer: number | undefined;
 let reloadInFlight = false;
+let intermediateSummaryRequestSequence = 0;
+let intermediateListRequestSequence = 0;
+let intermediateKindChangeSequence = 0;
 
 const calculation = computed(() => current.value?.steps.find((step) => step.code === "CALCULATE"));
 const publication = computed(() => current.value?.steps.find((step) => step.code === "PUBLISH"));
@@ -53,6 +60,8 @@ const visibleColumns = computed(() => allColumns.value.filter((column) => select
 const blockingCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.blockingCount, 0) ?? 0);
 const warningCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.warningCount, 0) ?? 0);
 const stateText = computed(() => requiresHardExclusionConfirmation.value ? "资料缺失待确认" : requiresDateAttributionReplay.value ? "日期计算方式待统一" : requiresFxCoverage.value ? "汇率数据待补齐" : calculation.value?.severity === "BLOCKING" ? "需要先处理问题" : calculation.value?.state === "COMPLETED" ? "计算完成" : calculation.value?.state === "IN_PROGRESS" ? "计算中" : "等待资料");
+const intermediateBusy = computed(() => intermediateSummaryLoading.value || intermediateLoading.value);
+const intermediateExportReady = computed(() => intermediateSummaryReady.value && !intermediateBusy.value);
 
 function decimalDisplay(value: string, scale = 2): string {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
@@ -105,7 +114,19 @@ function saveColumns(): void {
 }
 
 async function loadSummary(resetCoverage = false) {
-  const next = await api.getIntermediateReportSummary(shopId.value, intermediateKind.value, filterQuery());
+  const sequence = ++intermediateSummaryRequestSequence;
+  const requestedKind = intermediateKind.value;
+  intermediateSummaryLoading.value = true;
+  intermediateSummaryReady.value = false;
+  let next: IntermediateReportSummary;
+  try {
+    next = await api.getIntermediateReportSummary(shopId.value, requestedKind, filterQuery());
+  } catch (caught) {
+    if (sequence !== intermediateSummaryRequestSequence || requestedKind !== intermediateKind.value) return;
+    intermediateSummaryLoading.value = false;
+    throw caught;
+  }
+  if (sequence !== intermediateSummaryRequestSequence || requestedKind !== intermediateKind.value) return;
   summary.value = next;
   if (resetCoverage) {
     const startValue = next.coverage.start ?? "";
@@ -113,18 +134,25 @@ async function loadSummary(resetCoverage = false) {
     start.value = grain.value === "MONTH" ? startValue.slice(0, 7) : startValue;
     end.value = grain.value === "MONTH" ? endValue.slice(0, 7) : endValue;
   }
+  intermediateSummaryReady.value = true;
+  intermediateSummaryLoading.value = false;
 }
 
 async function loadIntermediate(after?: string) {
+  const sequence = ++intermediateListRequestSequence;
+  const requestedKind = intermediateKind.value;
   intermediateLoading.value = true;
   error.value = "";
   try {
-    const page = await api.getIntermediateReport(shopId.value, intermediateKind.value, filterQuery(), after);
+    const page = await api.getIntermediateReport(shopId.value, requestedKind, filterQuery(), after);
+    if (sequence !== intermediateListRequestSequence || requestedKind !== intermediateKind.value) return;
     intermediateItems.value = page.items;
     intermediateNext.value = page.nextCursor;
     intermediateAfter.value = after;
-  } catch (caught) { error.value = userFacingError(caught, "暂时无法读取计算明细，请检查网络后重试"); }
-  finally { intermediateLoading.value = false; }
+  } catch (caught) {
+    if (sequence === intermediateListRequestSequence && requestedKind === intermediateKind.value) error.value = userFacingError(caught, "暂时无法读取计算明细，请检查网络后重试");
+  }
+  finally { if (sequence === intermediateListRequestSequence) intermediateLoading.value = false; }
 }
 
 async function applyFilters() {
@@ -142,13 +170,29 @@ async function resetFilters() {
 }
 
 async function changeIntermediateKind(kind: IntermediateReportKind) {
+  const sequence = ++intermediateKindChangeSequence;
+  intermediateListRequestSequence += 1;
   intermediateKind.value = kind;
   intermediateHistory.value = [];
   restoreColumns();
   selectedMarketplaces.value = [];
   selectedCurrencies.value = [];
-  await loadSummary(true);
-  await loadIntermediate();
+  intermediateItems.value = [];
+  intermediateNext.value = undefined;
+  intermediateAfter.value = undefined;
+  summary.value = undefined;
+  intermediateLoading.value = true;
+  error.value = "";
+  try {
+    await loadSummary(true);
+    if (sequence !== intermediateKindChangeSequence || intermediateKind.value !== kind) return;
+    await loadIntermediate();
+  } catch (caught) {
+    if (sequence === intermediateKindChangeSequence && intermediateKind.value === kind) {
+      error.value = userFacingError(caught, "暂时无法切换明细类型，请检查网络后重试");
+      intermediateLoading.value = false;
+    }
+  }
 }
 
 function changeGrain(next: "MONTH" | "DAY") {
@@ -165,6 +209,21 @@ function closeFilterPopovers(event: globalThis.PointerEvent) {
   }
 }
 
+function openReviewResult() {
+  if (!reviewResultDisclosure.value) return;
+  reviewResultDisclosure.value.open = true;
+  reviewResultOpen.value = true;
+}
+
+function syncReviewResultOpen(event: Event) {
+  const disclosure = event.currentTarget;
+  if (disclosure instanceof globalThis.HTMLDetailsElement) reviewResultOpen.value = disclosure.open;
+}
+
+function guardIntermediateExport(event: globalThis.MouseEvent) {
+  if (!intermediateExportReady.value) event.preventDefault();
+}
+
 async function nextIntermediate() { if (intermediateNext.value) { intermediateHistory.value.push(intermediateAfter.value ?? ""); await loadIntermediate(intermediateNext.value); } }
 async function previousIntermediate() { const prior = intermediateHistory.value.pop(); if (prior !== undefined) await loadIntermediate(prior || undefined); }
 
@@ -173,7 +232,10 @@ async function reload() {
   reloadInFlight = true;
   try {
     current.value = await api.getShopWorkflow(shopId.value); error.value = ""; emit("workflowChange");
-    completeness.value = requiresHardExclusionConfirmation.value ? await api.getCompleteness(shopId.value) : [];
+    const period = current.value.latestBatch?.periodStart && current.value.latestBatch.periodEnd
+      ? { periodStart: current.value.latestBatch.periodStart, periodEnd: current.value.latestBatch.periodEnd }
+      : undefined;
+    completeness.value = requiresHardExclusionConfirmation.value ? await api.getCompleteness(shopId.value, period) : [];
   } catch (caught) { error.value = userFacingError(caught, "暂时无法读取计算状态，请检查网络后重试"); }
   finally { reloadInFlight = false; }
 }
@@ -225,7 +287,7 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
       <a v-if="requiresHardExclusionConfirmation" class="primary-button compact" href="#review-blocker">处理资料缺失</a>
       <RouterLink v-else-if="requiresDateAttributionReplay" class="primary-button compact" :to="`/shops/${shopId}/workflow/commit`">按同一种日期方式重传</RouterLink>
       <RouterLink v-else-if="requiresFxCoverage" class="primary-button compact" to="/fx">查看汇率覆盖</RouterLink>
-      <a v-else-if="showResults" class="primary-button compact" href="#review-result">{{ publication?.state === 'COMPLETED' ? "查看正式结果" : "核对并发布" }}</a>
+      <a v-else-if="showResults" class="primary-button compact" href="#review-result" @click="openReviewResult">{{ publication?.state === 'COMPLETED' ? "查看正式结果" : "核对并发布" }}</a>
       <RouterLink v-else-if="calculation?.state === 'NOT_STARTED'" class="secondary-button compact" :to="`/shops/${shopId}/workflow/commit`">返回资料准备</RouterLink>
       <span v-else class="status-next">下一步：等待计算完成</span>
     </section>
@@ -249,9 +311,9 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
       <div class="stage-next-action"><span>也可以返回资料准备页补充文件。</span><RouterLink class="secondary-button" :to="`/shops/${shopId}/workflow/commit`">补充文件</RouterLink><button class="primary-button" type="button" :disabled="resuming || !missingCoverageRows.length" @click="confirmHardExclusions">{{ resuming ? "正在继续" : "确认排除并继续" }}</button></div>
     </section>
 
-    <section v-if="canManage && !requiresHardExclusionConfirmation" class="surface-section intermediate-results" aria-labelledby="intermediate-title">
-      <div class="section-heading split-heading"><div><h2 id="intermediate-title">系统识别出的明细</h2><p>可按日期、站点和币种查看；合计会计算所有符合条件的明细，不只计算当前这一页。</p></div><a class="primary-button compact" :href="exportUrl">导出当前筛选</a></div>
-      <div class="segmented-control" role="tablist" aria-label="明细类型"><button type="button" :class="{ active: intermediateKind === 'TRANSACTION' }" @click="changeIntermediateKind('TRANSACTION')">交易报告</button><button type="button" :class="{ active: intermediateKind === 'SHIPMENT' }" @click="changeIntermediateKind('SHIPMENT')">配送货件</button></div>
+    <section v-if="canManage && !requiresHardExclusionConfirmation" class="surface-section intermediate-results" aria-labelledby="intermediate-title" :aria-busy="intermediateBusy">
+      <div class="section-heading split-heading"><div><h2 id="intermediate-title">系统识别出的明细</h2><p>可按日期、站点和币种查看；合计会计算所有符合条件的明细，不只计算当前这一页。</p></div><a class="primary-button compact intermediate-export-link" role="link" :href="intermediateExportReady ? exportUrl : undefined" :aria-disabled="!intermediateExportReady" :title="intermediateExportReady ? undefined : '明细加载完成后可导出'" tabindex="0" @click="guardIntermediateExport">导出当前{{ intermediateKind === "TRANSACTION" ? "交易报告" : "配送货件" }}</a></div>
+      <div class="segmented-control intermediate-kind-control" role="group" aria-label="明细类型"><button type="button" :class="{ active: intermediateKind === 'TRANSACTION' }" :aria-pressed="intermediateKind === 'TRANSACTION'" @click="changeIntermediateKind('TRANSACTION')">交易报告</button><button type="button" :class="{ active: intermediateKind === 'SHIPMENT' }" :aria-pressed="intermediateKind === 'SHIPMENT'" @click="changeIntermediateKind('SHIPMENT')">配送货件</button></div>
 
       <details class="intermediate-filter-drawer" open>
         <summary>筛选日期和显示内容</summary>
@@ -264,13 +326,16 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
         </div>
       </details>
 
-      <p v-if="intermediateLoading" class="inline-empty">正在读取计算明细…</p>
-      <div v-else-if="intermediateItems.length" class="intermediate-table-scroll" tabindex="0"><table><thead><tr><th v-for="column in visibleColumns" :key="column.key">{{ column.header }}</th></tr></thead><tbody><tr v-for="item in intermediateItems" :key="item.id"><td v-for="column in visibleColumns" :key="column.key" :class="{ numeric: !['text', 'date'].includes(column.kind) }">{{ intermediateValue(item, column.key) }}</td></tr></tbody><tfoot><tr v-for="total in summary?.totalsByCurrency" :key="total.currency"><th v-for="(column, index) in visibleColumns" :key="column.key">{{ index === 0 ? `${total.currency} 合计` : column.total ? decimalDisplay(total.values[column.key] ?? '0', column.kind === 'rate' ? 8 : 2) : "" }}</th></tr></tfoot></table></div>
+      <p v-if="intermediateLoading" class="inline-empty" role="status" aria-live="polite">正在读取计算明细…</p>
+      <div v-else-if="intermediateItems.length" class="intermediate-table-scroll" tabindex="0" role="region" :aria-label="`${intermediateKind === 'TRANSACTION' ? '交易报告' : '配送货件'}明细表`"><table><thead><tr><th v-for="column in visibleColumns" :key="column.key">{{ column.header }}</th></tr></thead><tbody><tr v-for="item in intermediateItems" :key="item.id"><td v-for="column in visibleColumns" :key="column.key" :class="{ numeric: !['text', 'date'].includes(column.kind) }">{{ intermediateValue(item, column.key) }}</td></tr></tbody><tfoot><tr v-for="total in summary?.totalsByCurrency" :key="total.currency"><th v-for="(column, index) in visibleColumns" :key="column.key">{{ index === 0 ? `${total.currency} 合计` : column.total ? decimalDisplay(total.values[column.key] ?? '0', column.kind === 'rate' ? 8 : 2) : "" }}</th></tr></tfoot></table></div>
       <p v-else class="inline-empty">当前筛选没有{{ intermediateKind === "TRANSACTION" ? "交易报告" : "配送货件" }}数据。</p>
       <div class="table-footer-actions"><span>{{ intermediateKind === "SHIPMENT" ? `人民币跨币种总计：${summary?.cnyTotal ? decimalDisplay(summary.cnyTotal) : "汇率不完整"}` : "原币金额按币种分别合计" }}</span><div><button class="secondary-button" type="button" :disabled="intermediateHistory.length === 0 || intermediateLoading" @click="previousIntermediate">上一页</button><button class="secondary-button" type="button" :disabled="!intermediateNext || intermediateLoading" @click="nextIntermediate">下一页</button></div></div>
       <p v-if="error" class="form-error" role="alert">{{ error }}</p>
     </section>
 
-    <ResultsPage v-if="showResults && !requiresHardExclusionConfirmation" id="review-result" :workflow="current" embedded @workflow-change="reload" />
+    <details v-if="showResults && !requiresHardExclusionConfirmation" id="review-result" ref="reviewResultDisclosure" class="review-result-disclosure surface-section" @toggle="syncReviewResultOpen">
+      <summary><span class="review-result-summary-copy"><strong>核算结果</strong><small>展开查看九项指标、站点月份和费用来源。</small></span><span class="review-result-summary-action" aria-hidden="true">{{ reviewResultOpen ? "收起" : "展开" }}</span></summary>
+      <ResultsPage :workflow="current" embedded @workflow-change="reload" />
+    </details>
   </section>
 </template>
