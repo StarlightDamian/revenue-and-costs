@@ -68,6 +68,7 @@ describe("report filtering", () => {
     expect(sql).toContain("round(sf.shipment_promotion_discount,2)<>0)");
     expect(sql).toContain("LEFT JOIN calculation_fx_usage");
     expect(sql).toContain("bool_or(u.id IS NULL) missing_usage");
+    expect(sql).toContain("rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')");
   });
 
   it("loads intermediate FX rates without constructing a PostgreSQL text value containing NUL", async () => {
@@ -112,6 +113,8 @@ describe("report filtering", () => {
     expect(result.items).toEqual([
       expect.objectContaining({ id: "1", currency: "USD", cnyRate: "7.12345678" }),
     ]);
+    const factSql = query.mock.calls.find(([statement]) => statement.includes("FROM transaction_fact tf"))?.[0] ?? "";
+    expect(factSql).toContain("rs.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')");
   });
 
   it("applies date and marketplace filters to financial queries and visible slices", async () => {
