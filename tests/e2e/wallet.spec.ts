@@ -4,7 +4,7 @@ const accountId = "50000000-0000-4000-8000-000000000071";
 const enterpriseId = "60000000-0000-4000-8000-000000000071";
 const shopId = "10000000-0000-4000-8000-000000000071";
 
-test("企业钱包一键充值且账本说明来自真实公司引用", async ({ page }) => {
+test("企业钱包一键充值且账本说明来自真实店铺引用", async ({ page }) => {
   let quoteRequests = 0;
   let rechargeRequests = 0;
   let submittedCents = "";
@@ -73,7 +73,8 @@ test("企业钱包一键充值且账本说明来自真实公司引用", async ({
   await expect(amount).toHaveValue("");
   await expect(amount).toHaveAttribute("placeholder", "10000.00");
   await expect(page.getByRole("button", { name: "获取报价" })).toHaveCount(0);
-  await expect(page.getByText("公司：香港公司名称（回收站）", { exact: true })).toBeVisible();
+  await expect(page.getByText("店铺：香港公司名称（回收站）", { exact: true })).toBeVisible();
+  await expect(page.getByText("店铺费用", { exact: true })).toBeVisible();
 
   const recharge = page.getByRole("button", { name: "充值", exact: true });
   await recharge.click();

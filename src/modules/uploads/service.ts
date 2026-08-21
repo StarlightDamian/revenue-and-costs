@@ -7,7 +7,6 @@ import { pipeline } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import type { Pool, PoolClient } from "pg";
 import { withTransaction } from "../../db/pool";
-import { enqueueOutbox } from "../../db/outbox";
 import { AppError } from "../../shared/errors";
 import { safeErrorDiagnostic } from "../../shared/diagnostics.js";
 import { accountingPeriodStartDate, parseAccountingPeriodScope, type AccountingPeriodInput } from "../../shared/accounting-period.js";
@@ -27,10 +26,17 @@ import { cleanupUploadStagingArtifacts } from "./staging-cleanup.js";
 const MAX_BATCH_BYTES = BigInt(MAX_UPLOAD_BATCH_BYTES);
 export const MAX_UPLOAD_FILES = MAX_UPLOAD_BATCH_FILES;
 export const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
+const COMPLETABLE_IMPORT_BATCH_STATUSES = [
+  "UPLOADING",
+  "ANALYZING",
+  "AWAITING_MAPPING",
+  "AWAITING_COMMIT_CONFIRMATION",
+] as const;
 
 export interface CreateUploadFile { batchId: string; relativePath: string; declaredSize: bigint; contentType?: string; metadataOnly?: boolean }
 export type UploadFileRegistration = Omit<CreateUploadFile, "batchId">;
 export interface RegisteredUploadFile { id: string; relativePath: string; offset: string }
+export interface RemovedUploadFilesResult { removedCount: number; remainingCount: number; cancelled: boolean }
 export interface AppendChunk { fileId: string; expectedOffset: bigint; length: number; expectedSha256: string; contentEncoding?: "gzip"; body: Readable }
 
 interface NormalizedUploadFile {
@@ -115,9 +121,10 @@ export async function expireUploadStaging(pool: Pool): Promise<number> {
     const files = await tx.query<FailedStagingFile>(
       `SELECT file.id,file.batch_id,file.status,file.temp_path,file.archive_reservation_state,
               file.archive_expanded_bytes::text,file.archive_file_count
-         FROM upload_file file
-         JOIN upload_batch batch ON batch.id=file.batch_id
-        WHERE batch.status IN ('EXPIRED','CANCELLED') AND file.temp_path<>''
+       FROM upload_file file
+        JOIN upload_batch batch ON batch.id=file.batch_id
+        WHERE file.temp_path<>''
+          AND (file.status='FAILED' OR batch.status IN ('EXPIRED','CANCELLED'))
         ORDER BY file.updated_at,file.id
         LIMIT 100
         FOR UPDATE OF batch,file SKIP LOCKED`,
@@ -259,7 +266,7 @@ export class UploadService {
         registrations.map((file) => file.relativePath),
         registrations.map((file) => file.declaredSize.toString()),
         registrations.map((file) => file.contentType ?? null),
-        registrations.map((file) => file.metadataOnly ? "STORED" : file.declaredSize === 0n ? "COMPLETE" : "PENDING"),
+        registrations.map((file) => file.declaredSize === 0n ? "COMPLETE" : "PENDING"),
         registrations.map((file) => file.tempPath),
         registrations.map((file) => file.metadataOnly),
         registrations.map((file) => file.metadataOnly ? "PDF" : null),
@@ -280,21 +287,6 @@ export class UploadService {
         [batchId, registrations.map((file) => file.id)],
       );
       if ((metadataFiles.rowCount ?? 0) !== metadataOnlyCount) throw new Error("UPLOAD_METADATA_IMPORT_FILE_CREATE_FAILED");
-    }
-
-    const zeroByteIds = registrations
-      .filter((file) => !file.metadataOnly && file.declaredSize === 0n)
-      .map((file) => file.id);
-    if (zeroByteIds.length > 0) {
-      const outbox = await tx.query<{ id: string }>(
-        `INSERT INTO outbox_event (topic,business_key,payload)
-         SELECT 'upload.finalize',file_id::text,jsonb_build_object('fileId',file_id::text)
-           FROM unnest($1::uuid[]) AS pending(file_id)
-         ON CONFLICT (topic,business_key) DO UPDATE SET topic=EXCLUDED.topic
-         RETURNING id`,
-        [zeroByteIds],
-      );
-      if ((outbox.rowCount ?? 0) !== zeroByteIds.length) throw new Error("OUTBOX_INSERT_FAILED");
     }
 
     const updated = await tx.query(
@@ -474,7 +466,7 @@ export class UploadService {
           [shopId],
         );
         if (activeReplay.rows[0]) {
-          throw new AppError("UPLOAD_SOURCE_REPLAY_IN_PROGRESS", "当前公司正在安全重算历史资料，请稍后重试", 409);
+          throw new AppError("UPLOAD_SOURCE_REPLAY_IN_PROGRESS", "当前店铺正在安全重算历史资料，请稍后重试", 409);
         }
 
         const batchId = randomUUID();
@@ -518,36 +510,185 @@ export class UploadService {
 
   async completeBatch(batchId: string): Promise<{ id: string; status: string }> {
     return withTransaction(this.pool, async (tx) => {
-      const pending = await tx.query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM upload_file WHERE batch_id = $1 AND status IN ('PENDING','UPLOADING')",
+      const upload = await tx.query<{ status: string }>(
+        "SELECT status FROM upload_batch WHERE id=$1 FOR UPDATE",
         [batchId],
       );
-      if (BigInt(pending.rows[0]?.count ?? "0") !== 0n) throw new Error("UPLOAD_FILES_NOT_COMPLETE");
-      await tx.query("UPDATE upload_batch SET status = 'READY', updated_at = clock_timestamp() WHERE id = $1 AND status IN ('OPEN','UPLOADING','READY')", [batchId]);
+      const uploadStatus = upload.rows[0]?.status;
+      if (!uploadStatus) throw new Error("UPLOAD_BATCH_NOT_FOUND");
+      if (!["OPEN", "UPLOADING", "READY"].includes(uploadStatus)) {
+        throw new AppError("UPLOAD_BATCH_NOT_COMPLETABLE", "本次上传已结束，不能再次提交文件", 409);
+      }
       const currentImport = await tx.query<{ id: string; status: string }>(
         "SELECT id,status FROM import_batch WHERE upload_batch_id=$1 FOR UPDATE",
         [batchId],
       );
       const importBatchId = currentImport.rows[0]?.id;
       if (!importBatchId) throw new Error("IMPORT_BATCH_NOT_FOUND");
-      if (!["UPLOADING", "ANALYZING", "AWAITING_MAPPING", "AWAITING_COMMIT_CONFIRMATION"].includes(currentImport.rows[0]!.status)) {
+      if (!(COMPLETABLE_IMPORT_BATCH_STATUSES as readonly string[]).includes(currentImport.rows[0]!.status)) {
         return { id: importBatchId, status: currentImport.rows[0]!.status };
       }
-      await tx.query(
-        `INSERT INTO outbox_event (topic,business_key,payload)
-         SELECT 'upload.finalize',file.id::text,jsonb_build_object('fileId',file.id::text)
-           FROM upload_file file
-           JOIN upload_batch batch ON batch.id=file.batch_id
-           JOIN import_batch batch_import ON batch_import.upload_batch_id=batch.id
-          WHERE file.batch_id=$1 AND file.status='COMPLETE' AND NOT file.metadata_only
-            AND batch.status='READY'
-            AND batch_import.status IN ('UPLOADING','ANALYZING','AWAITING_MAPPING','AWAITING_COMMIT_CONFIRMATION')
-         ON CONFLICT (topic,business_key) DO NOTHING`,
+      const staged = await tx.query<{ pending: string; processable: string }>(
+        `SELECT count(*) FILTER (WHERE status IN ('PENDING','UPLOADING'))::text AS pending,
+                count(*) FILTER (WHERE status IN ('COMPLETE','ENCRYPTING','STORED'))::text AS processable
+           FROM upload_file WHERE batch_id=$1`,
         [batchId],
       );
+      if (BigInt(staged.rows[0]?.pending ?? "0") !== 0n) throw new Error("UPLOAD_FILES_NOT_COMPLETE");
+      if (BigInt(staged.rows[0]?.processable ?? "0") === 0n) {
+        throw new AppError("UPLOAD_BATCH_NO_STAGED_FILES", "本批次没有可处理文件，请删除空批次后重新选择资料", 409);
+      }
+      if (uploadStatus !== "READY") {
+        await tx.query("UPDATE upload_batch SET status = 'READY', updated_at = clock_timestamp() WHERE id = $1", [batchId]);
+        await tx.query(
+          `INSERT INTO outbox_event (topic,business_key,payload)
+           SELECT 'upload.finalize',file.id::text,jsonb_build_object('fileId',file.id::text)
+             FROM upload_file file
+             JOIN upload_batch upload ON upload.id=file.batch_id
+             JOIN import_batch batch_import ON batch_import.upload_batch_id=upload.id
+            WHERE file.batch_id=$1 AND file.status='COMPLETE' AND NOT file.metadata_only
+              AND upload.status='READY' AND batch_import.status=ANY($2::text[])
+           ON CONFLICT (topic,business_key) DO NOTHING`,
+          [batchId, COMPLETABLE_IMPORT_BATCH_STATUSES],
+        );
+      }
       const projection = await refreshUploadPreflight(tx, batchId, importBatchId);
       return { id: importBatchId, status: projection.status };
     });
+  }
+
+  async removeFiles(
+    batchId: string,
+    fileIds: readonly string[],
+    actorAccountId: string,
+  ): Promise<RemovedUploadFilesResult> {
+    const uniqueFileIds = [...new Set(fileIds)].sort();
+    if (uniqueFileIds.length === 0 || uniqueFileIds.length > MAX_UPLOAD_FILES) {
+      throw new AppError("UPLOAD_FILE_REMOVAL_INVALID", "请选择需要移除的文件", 400);
+    }
+    const staged = await withTransaction(this.pool, async (tx) => {
+      const batch = await tx.query<{ upload_status: string; import_batch_id: string; import_status: string }>(
+        `SELECT upload.status AS upload_status,batch_import.id AS import_batch_id,batch_import.status AS import_status
+           FROM upload_batch upload
+           JOIN import_batch batch_import ON batch_import.upload_batch_id=upload.id
+          WHERE upload.id=$1
+          FOR UPDATE OF upload,batch_import`,
+        [batchId],
+      );
+      const current = batch.rows[0];
+      if (!current) throw new Error("UPLOAD_BATCH_NOT_FOUND");
+      const files = await tx.query<{
+        id: string;
+        status: string;
+        temp_path: string;
+        declared_size: string;
+        received_size: string;
+        metadata_only: boolean;
+        stored_object_id: string | null;
+        archive_reservation_state: string;
+        removed_before: boolean;
+      }>(
+        `SELECT file.id,file.status,file.temp_path,file.declared_size::text,file.received_size::text,
+                file.metadata_only,file.stored_object_id,file.archive_reservation_state,
+                EXISTS (
+                  SELECT 1 FROM audit_event removed
+                   WHERE removed.object_type='UPLOAD_BATCH' AND removed.object_id=$1
+                     AND removed.action='UPLOAD_FILES_REMOVED_BEFORE_IMPORT'
+                     AND (removed.metadata->'fileIds') ? file.id::text
+                ) AS removed_before
+           FROM upload_file file
+          WHERE file.batch_id=$1 AND file.id=ANY($2::uuid[])
+          ORDER BY file.id
+          FOR UPDATE OF file`,
+        [batchId, uniqueFileIds],
+      );
+      if (files.rows.length !== uniqueFileIds.length) {
+        throw new AppError("UPLOAD_FILE_REMOVAL_TARGET_MISMATCH", "有文件不属于本次上传，请刷新后重试", 409);
+      }
+      const remaining = await tx.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM upload_file WHERE batch_id=$1 AND status<>'FAILED' AND NOT (id=ANY($2::uuid[]))",
+        [batchId, uniqueFileIds],
+      );
+      const remainingCount = Number(remaining.rows[0]?.count ?? "0");
+      const alreadyCancelled = current.upload_status === "CANCELLED"
+        && current.import_status === "CANCELLED"
+        && remainingCount === 0
+        && files.rows.every((file) => file.removed_before && file.status === "FAILED" && file.stored_object_id === null);
+      if (!alreadyCancelled && (current.upload_status !== "UPLOADING" || current.import_status !== "UPLOADING")) {
+        throw new AppError("UPLOAD_FILE_REMOVAL_CLOSED", "文件已进入归档或计算，不能从历史资料中删除。请新建一批正确资料。", 409);
+      }
+      if (files.rows.some((file) => file.stored_object_id !== null
+        || ["ENCRYPTING", "STORED"].includes(file.status)
+        || file.archive_reservation_state !== "NONE")) {
+        throw new AppError("UPLOAD_FILE_REMOVAL_IMMUTABLE", "所选文件已进入不可变归档，不能删除。请新建一批正确资料。", 409);
+      }
+      if (!alreadyCancelled) {
+        const newlyRemoved = files.rows.filter((file) => !file.removed_before);
+        if (newlyRemoved.length > 0) {
+          const releasedDeclaredBytes = newlyRemoved.reduce((total, file) => total + BigInt(file.declared_size), 0n);
+          const releasedReceivedBytes = newlyRemoved.reduce((total, file) => total + BigInt(file.received_size), 0n);
+          const releasedFileCount = newlyRemoved.length;
+          const released = await tx.query<{ id: string }>(
+            `UPDATE upload_batch
+                SET declared_bytes=declared_bytes-$2,
+                    received_bytes=received_bytes-$3,
+                    file_count=file_count-$4,
+                    updated_at=clock_timestamp()
+              WHERE id=$1 AND declared_bytes>=$2 AND received_bytes>=$3 AND file_count>=$4
+              RETURNING id`,
+            [batchId, releasedDeclaredBytes.toString(), releasedReceivedBytes.toString(), releasedFileCount],
+          );
+          if ((released.rowCount ?? 0) !== 1) throw new Error("UPLOAD_BATCH_USAGE_CORRUPTED");
+        }
+        const metadataIds = files.rows.filter((file) => file.metadata_only).map((file) => file.id);
+        if (metadataIds.length > 0) {
+          await tx.query(
+            `DELETE FROM import_file file
+              USING upload_file upload
+             WHERE file.import_batch_id=$1 AND file.metadata_only
+               AND upload.id=ANY($2::uuid[]) AND upload.batch_id=$3
+               AND file.relative_path=upload.relative_path`,
+            [current.import_batch_id, metadataIds, batchId],
+          );
+        }
+        await tx.query(
+          `UPDATE upload_file
+              SET status='FAILED',updated_at=clock_timestamp()
+            WHERE batch_id=$1 AND id=ANY($2::uuid[])
+              AND status IN ('PENDING','UPLOADING','COMPLETE','FAILED')`,
+          [batchId, uniqueFileIds],
+        );
+        const cancelled = remainingCount === 0;
+        if (cancelled) {
+          await tx.query(
+            "UPDATE upload_batch SET status='CANCELLED',updated_at=clock_timestamp() WHERE id=$1",
+            [batchId],
+          );
+          await tx.query(
+            "UPDATE import_batch SET status='CANCELLED',current_stage='CANCELLED',updated_at=clock_timestamp() WHERE id=$1",
+            [current.import_batch_id],
+          );
+        }
+        await tx.query(
+          `INSERT INTO audit_event(actor_account_id,action,object_type,object_id,metadata)
+           SELECT $1,'UPLOAD_FILES_REMOVED_BEFORE_IMPORT','UPLOAD_BATCH',$2,$3::jsonb
+            WHERE NOT EXISTS (
+              SELECT 1 FROM audit_event
+               WHERE action='UPLOAD_FILES_REMOVED_BEFORE_IMPORT' AND object_type='UPLOAD_BATCH' AND object_id=$2
+                 AND metadata->'fileIds'=$4::jsonb
+            )`,
+          [actorAccountId, batchId, JSON.stringify({ fileIds: uniqueFileIds, removedCount: uniqueFileIds.length, remainingCount, cancelled }), JSON.stringify(uniqueFileIds)],
+        );
+      }
+      return {
+        files: files.rows.map((file) => ({ fileId: file.id, tempPath: file.temp_path })),
+        result: { removedCount: uniqueFileIds.length, remainingCount, cancelled: remainingCount === 0 },
+      };
+    });
+    await forEachUploadFile(staged.files, async (file) => {
+      await cleanupUploadStagingArtifacts(this.pool, file);
+    });
+    return staged.result;
   }
 
   async failFile(fileId: string, reasonCode: ClientUploadFailureCode): Promise<void> {
@@ -709,7 +850,6 @@ export class UploadService {
         await tx.query("INSERT INTO upload_chunk_receipt (upload_file_id,chunk_offset,chunk_size,sha256) VALUES ($1,$2,$3,$4)", [input.fileId, current.toString(), verifier.bytes, actualDigest.toString("hex")]);
         await tx.query("UPDATE upload_file SET received_size=$2,status=$3,updated_at=clock_timestamp() WHERE id=$1", [input.fileId, next.toString(), complete ? "COMPLETE" : "UPLOADING"]);
         await tx.query("UPDATE upload_batch SET received_bytes=received_bytes+$2,updated_at=clock_timestamp() WHERE id=$1", [file.batch_id, verifier.bytes]);
-        if (complete) await enqueueOutbox(tx, { topic: "upload.finalize", businessKey: input.fileId, payload: { fileId: input.fileId } });
         const disk = await stat(targetPath);
         if (BigInt(disk.size) < next) throw new Error("UPLOAD_DURABILITY_CHECK_FAILED");
         return next;

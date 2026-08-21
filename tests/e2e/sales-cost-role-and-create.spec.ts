@@ -85,7 +85,7 @@ async function mockEnterpriseWorkspace(page: Page, me = accountant) {
   }));
 }
 
-test("做账员在销售成本页切换企业并按每年 188 元创建公司", async ({ page }, testInfo) => {
+test("做账员在销售成本页切换企业并按每年 188 元创建店铺", async ({ page }, testInfo) => {
   await mockEnterpriseWorkspace(page);
   await page.route("**/api/v1/shops**", (route) => {
     const selectedEnterprise = new URL(route.request().url()).searchParams.get("enterpriseId");
@@ -96,6 +96,7 @@ test("做账员在销售成本页切换企业并按每年 188 元创建公司", 
   await page.goto("/sales-cost");
 
   await expect(page.locator(".account-summary").getByText("做账员", { exact: true })).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "我的店铺" })).toBeVisible();
   const companyRow = page.locator(".shop-row").filter({ hasText: "星河跨境一公司" });
   await expect(companyRow.getByRole("heading", { name: "星河跨境一公司" })).toBeVisible();
   await expect(companyRow.getByText("未做账", { exact: true })).toBeVisible();
@@ -111,8 +112,8 @@ test("做账员在销售成本页切换企业并按每年 188 元创建公司", 
   await mkdir(evidenceDirectory, { recursive: true });
   await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
 
-  await page.getByRole("button", { name: "创建公司", exact: true }).first().click();
-  const dialog = page.getByRole("dialog", { name: "创建公司" });
+  await page.getByRole("button", { name: "创建店铺", exact: true }).first().click();
+  const dialog = page.getByRole("dialog", { name: "创建店铺" });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByText("188￥", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "创建（消耗188￥）" })).toBeVisible();
@@ -131,6 +132,12 @@ test("做账员在销售成本页切换企业并按每年 188 元创建公司", 
   await page.screenshot({ path: resolve(evidenceDirectory, `tutorial-${testInfo.project.name}.png`), fullPage: true });
   await tutorial.getByRole("button", { name: "关闭教程" }).click();
   await expect(tutorialTrigger).toBeFocused();
+
+  await page.goto("/organization/enterprise");
+  await expect(page.getByRole("heading", { name: "企业与成员" })).toBeVisible();
+  await expect(page.locator(".enterprise-summary").getByText("企业钱包", { exact: true })).toBeVisible();
+  await expect(page.getByText("店铺总数", { exact: true })).toBeVisible();
+  await expect(page.getByText("公司总数", { exact: true })).toHaveCount(0);
 });
 
 test("深色主题的企业下拉框和选项保持深底浅字", async ({ page }) => {
@@ -187,7 +194,7 @@ test("管理员侧栏按 MECE 分组并提供平台治理入口", async ({ page 
   await expect(navigation.getByRole("link", { name: "应用" })).toBeVisible();
   await expect(navigation.getByRole("link", { name: "运营状态" })).toBeVisible();
   await navigation.getByRole("button", { name: /销售成本/ }).click();
-  await expect(navigation.getByRole("link", { name: "公司与做账" })).toBeVisible();
+  await expect(navigation.getByRole("link", { name: "店铺成本测算" })).toBeVisible();
   await expect(navigation.getByRole("link", { name: "做账员" })).toBeHidden();
   await navigation.getByRole("button", { name: /数据与规则/ }).click();
   await expect(navigation.getByRole("link", { name: "外汇市场" })).toBeVisible();
@@ -337,7 +344,7 @@ test("账号设置采用同级信息行，名称只在弹窗中修改", async ({
   await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });
 });
 
-test("管理员为选定企业免费创建公司并记录 188 元原价", async ({ page }, testInfo) => {
+test("管理员为选定企业免费创建店铺并记录 188 元原价", async ({ page }, testInfo) => {
   const admin = { ...accountant, roles: ["ADMIN"] };
   let createPayload: Record<string, unknown> | undefined;
   await mockEnterpriseWorkspace(page, admin);
@@ -345,7 +352,7 @@ test("管理员为选定企业免费创建公司并记录 188 元原价", async 
     if (route.request().method() === "POST") {
       const payload = route.request().postDataJSON() as Record<string, unknown>;
       if (payload.name === "已有公司") {
-        await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "SHOP_NAME_CONFLICT", message: "已有同名公司（包括回收站），请更换公司名称", field: "name" }) });
+        await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "SHOP_NAME_CONFLICT", message: "已有同名店铺（包括回收站），请更换店铺名称", field: "name" }) });
         return;
       }
       createPayload = payload;
@@ -356,15 +363,15 @@ test("管理员为选定企业免费创建公司并记录 188 元原价", async 
   });
 
   await page.goto("/sales-cost");
-  await page.locator(".shop-index-heading").getByRole("button", { name: "创建公司", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "创建公司" });
+  await page.locator(".shop-index-heading").getByRole("button", { name: "创建店铺", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "创建店铺" });
   await expect(dialog.getByText("0￥", { exact: true })).toBeVisible();
   await expect(dialog.getByText("原价 188￥，系统会记录本次免费操作", { exact: true })).toBeVisible();
   await expect(dialog.getByLabel("减免原因")).toHaveCount(0);
-  await dialog.getByLabel("公司名称").fill("已有公司");
+  await dialog.getByLabel("店铺名称").fill("已有公司");
   await dialog.getByRole("button", { name: "创建（管理员免费）" }).click();
-  await expect(dialog.getByText("已有同名公司（包括回收站），请更换公司名称", { exact: true })).toBeVisible();
-  await dialog.getByLabel("公司名称").fill("管理员新公司");
+  await expect(dialog.getByText("已有同名店铺（包括回收站），请更换店铺名称", { exact: true })).toBeVisible();
+  await dialog.getByLabel("店铺名称").fill("管理员新公司");
   const evidenceDirectory = resolve(".work/evidence/admin-company-create");
   await mkdir(evidenceDirectory, { recursive: true });
   await page.screenshot({ path: resolve(evidenceDirectory, `${testInfo.project.name}.png`), fullPage: true });

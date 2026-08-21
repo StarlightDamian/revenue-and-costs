@@ -26,7 +26,7 @@ async function act(user: AdminUser, action: string) {
   <section>
     <PageHeader
       title="做账员管理"
-      description="管理做账员状态和平台管理员角色；企业、公司与钱包关系在企业工作台查看。"
+      description="管理做账员状态和平台管理员角色；企业、店铺与钱包关系在企业工作台查看。"
     />
     <section class="surface-section">
       <form
@@ -54,7 +54,7 @@ async function act(user: AdminUser, action: string) {
           tabindex="0"
         >
           <table>
-            <thead><tr><th>账号</th><th>角色</th><th>状态</th><th>企业</th><th>公司</th><th>治理操作</th></tr></thead><tbody>
+            <thead><tr><th>账号</th><th>角色</th><th>状态</th><th>企业</th><th>店铺</th><th>治理操作</th></tr></thead><tbody>
               <tr
                 v-for="user in users"
                 :key="user.id"

@@ -49,8 +49,11 @@ describe("export create authorization serialization", () => {
     });
     const { service, pool } = serviceWithClient(query);
 
-    await expect(service.create(customer, "shop", "snapshot", "idempotency-key", "request-create", assumptions))
-      .resolves.toMatchObject({ id: "export", status: "QUEUED" });
+    await expect(service.create(customer, "shop", "snapshot", "idempotency-key", "request-create", {
+      ...assumptions,
+      periodStart: "2026-04",
+      periodEnd: "2026-06",
+    })).resolves.toMatchObject({ id: "export", status: "QUEUED", periodStart: "2026-04", periodEnd: "2026-06" });
 
     const sql = query.mock.calls.map((call) => String(call[0]));
     const membershipIndex = sql.findIndex((statement) => statement.includes("FROM shop_membership"));
@@ -64,6 +67,8 @@ describe("export create authorization serialization", () => {
     expect(query.mock.calls[insertIndex]?.[1]?.[3]).toBe("7");
     expect(query.mock.calls[insertIndex]?.[1]?.[4]).toBe(`customer:${REPORT_EXPORT_FORMAT}:idempotency-key`);
     expect(query.mock.calls[insertIndex]?.[1]?.[5]).toBe(REPORT_EXPORT_FORMAT);
+    expect(query.mock.calls[insertIndex]?.[1]?.[9]).toBe("2026-04-01");
+    expect(query.mock.calls[insertIndex]?.[1]?.[10]).toBe("2026-06-01");
     const auditCall = query.mock.calls.find((call) => String(call[0]).startsWith("INSERT INTO audit_event"));
     expect(auditCall?.[1]?.[1]).toBe("EXPORT_CREATED");
     expect(pool.query).not.toHaveBeenCalled();

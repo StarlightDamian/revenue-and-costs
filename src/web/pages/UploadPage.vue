@@ -17,7 +17,7 @@ const emit = defineEmits<{ workflowChange: [] }>();
 const shopId = computed(() => String(route.params.shopId));
 const files = ref<File[]>([]);
 const uploadItems = ref<UploadFileItem[]>([]);
-const status = ref<"idle" | "uploading" | "preflight" | "processing" | "ready" | "error" | "cancelled">("idle");
+const status = ref<"idle" | "uploading" | "uploaded" | "preflight" | "processing" | "ready" | "error" | "cancelled">("idle");
 const progress = ref("0");
 const error = ref("");
 const batchId = ref("");
@@ -28,10 +28,11 @@ const resuming = ref(false);
 const dragActive = ref(false);
 const checkingSelection = ref(false);
 const restoringLatest = ref(true);
-const periodStart = ref("");
-const periodEnd = ref("");
 const selectionNotice = ref("");
 const selectedUploadPaths = ref<string[]>([]);
+const removingFiles = ref(false);
+const detailView = ref<"FILES" | "COVERAGE">("FILES");
+const restoredStagedManifest = ref(false);
 const selectedPaths = new WeakMap<File, string>();
 let pollingGeneration = 0;
 let stateEpoch = 0;
@@ -39,20 +40,12 @@ const totalBytes = computed(() => uploadItems.value.reduce((sum, item) => sum + 
 const accepted = computed(() => files.value.length > 0
   && files.value.length <= MAX_UPLOAD_BATCH_FILES
   && totalBytes.value <= MAX_UPLOAD_BATCH_BYTES);
-const periodError = computed(() => {
-  if (!periodStart.value || !periodEnd.value) return "请选择完整的本次核算起止月份";
-  if (periodStart.value > periodEnd.value) return "开始月份不能晚于结束月份";
-  if (periodStart.value.slice(0, 4) !== periodEnd.value.slice(0, 4)) return "起止月份必须位于同一自然年";
-  return "";
-});
 const selectionLocked = computed(() => restoringLatest.value
   || checkingSelection.value
   || resuming.value
+  || removingFiles.value
   || ["uploading", "preflight", "processing"].includes(status.value)
-  || (Boolean(batchId.value) && !preview.value && status.value !== "cancelled"));
-const canEditUploadSelection = computed(() => !selectionLocked.value
-  && !batchId.value
-  && ["idle", "error"].includes(status.value));
+  || Boolean(batchId.value));
 const selectedUploadCount = computed(() => selectedUploadPaths.value.length);
 const allUploadItemsSelected = computed(() => uploadItems.value.length > 0
   && selectedUploadCount.value === uploadItems.value.length);
@@ -62,15 +55,29 @@ const canStartUpload = computed(() => !restoringLatest.value
   && !checkingSelection.value
   && !resuming.value
   && accepted.value
-  && !periodError.value
   && !batchId.value
   && ["idle", "error"].includes(status.value));
 const uploadConclusion = computed(() => uploadBatchConclusion(uploadItems.value));
-const canContinue = computed(() => Boolean(batchId.value) && uploadItems.value.some((item) => item.state === "failed"));
+const canContinue = computed(() => !restoredStagedManifest.value
+  && Boolean(batchId.value)
+  && uploadItems.value.some((item) => item.state === "failed"));
 const canRetryCompletion = computed(() => Boolean(batchId.value)
   && status.value === "error"
-  && (preview.value?.uploadReady === true || (uploadItems.value.length > 0
-    && uploadItems.value.every((item) => ["complete", "skipped"].includes(item.state)))));
+  && ((preview.value?.uploadReady === true
+    && (preview.value.stagedUploadFiles === undefined
+      || preview.value.stagedUploadFiles.every((file) => ["COMPLETE", "FAILED"].includes(file.status))))
+    || (uploadItems.value.length > 0
+    && uploadItems.value.every((item) => ["complete", "skipped"].includes(item.state)
+      || (restoredStagedManifest.value && item.state === "failed")))));
+const canRemoveUploadedFiles = computed(() => Boolean(batchId.value)
+  && !preview.value
+  && (status.value === "uploaded" || (status.value === "error" && !canRetryCompletion.value)));
+const canEditUploadSelection = computed(() => !restoringLatest.value
+  && !checkingSelection.value
+  && !resuming.value
+  && !removingFiles.value
+  && ((!batchId.value && ["idle", "error"].includes(status.value)) || canRemoveUploadedFiles.value));
+const hasConfirmableUploadedFiles = computed(() => uploadItems.value.some((item) => item.state === "complete"));
 const uploadStateNames = { pending: "等待", uploading: "上传中", complete: "成功", failed: "失败", skipped: "已跳过" } as const;
 const uploadErrorText = (message?: string) => /read|读取|notreadable/iu.test(message ?? "")
   ? "浏览器无法读取这个文件，请重新选择文件后再试"
@@ -128,6 +135,8 @@ const retryableCommitFailure = computed(() => preview.value?.status === "FAILED"
   && ["IMPORT_DATABASE_CAPACITY_UNAVAILABLE", "IMPORT_DATABASE_CAPACITY_INSUFFICIENT"].includes(preview.value.failureCode ?? ""));
 const requiresHardExclusionConfirmation = computed(() => preview.value?.failureCode === "HARD_INCOMPLETE_CONFIRMATION_REQUIRED");
 const commitCoverageRows = computed(() => projectCommitCoverage(completeness.value));
+const coverageMatrixRows = computed(() => [...completeness.value]
+  .sort((left, right) => left.marketplace.localeCompare(right.marketplace) || left.month.localeCompare(right.month)));
 const hasCompleteness = computed(() => completeness.value.length > 0);
 const hardIncompleteSlices = computed(() => commitCoverageRows.value.filter((slice) =>
   slice.datasetVersionId && slice.missingReports.length > 0));
@@ -195,6 +204,25 @@ const previewStatusLabel = computed(() => ({
   AWAITING_MAPPING: "等待管理员确认表格内容", READY: "文件检查完成", PROCESSING: "正在保存和计算",
   PUBLISHED: "已完成", FAILED: "需要处理", CANCELLED: "已取消",
 } as Record<string, string>)[preview.value?.status ?? ""] ?? "处理中");
+const matrixSourceState = (slice: CompletenessSlice, kind: RecognizedFileKind): "MISSING" | "PRESENT" | "NOT_REQUIRED" => {
+  if (slice.missingReports?.includes(kind)) return "MISSING";
+  const quantity = kind === "TRANSACTION" ? slice.transactionQuantity : slice.shipmentQuantity;
+  return quantity !== undefined && quantity !== null ? "PRESENT" : "NOT_REQUIRED";
+};
+const matrixSourceLabel = (slice: CompletenessSlice, kind: RecognizedFileKind): string => ({
+  MISSING: "缺失",
+  PRESENT: "已收到",
+  NOT_REQUIRED: "无需补充",
+})[matrixSourceState(slice, kind)];
+const matrixNote = (slice: CompletenessSlice): string => {
+  const missing = slice.missingReports ?? [];
+  if (missing.length > 0) return `请补充${missing.map((kind) => classificationNames[kind]).join("、")}`;
+  if (["CONFLICT", "PUBLISHED_WARNING"].includes(slice.state)) return "两份资料数量需要复核";
+  if (slice.state === "AWAITING_MAPPING") return "表格列名等待确认";
+  if (slice.state === "MISSING_FX") return "缺少人民币换算汇率";
+  if (slice.state === "EXCLUDED") return "已确认不计算";
+  return "";
+};
 
 async function acceptSelection(selection: readonly DroppedFile[]) {
   if (selectionLocked.value || selection.length === 0) return;
@@ -225,6 +253,7 @@ async function acceptSelection(selection: readonly DroppedFile[]) {
       state: "pending",
     }));
     selectedUploadPaths.value = [];
+    restoredStagedManifest.value = false;
     batchId.value = "";
     preview.value = null;
     completeness.value = [];
@@ -264,21 +293,53 @@ function toggleAllUploadItems() {
     : uploadItems.value.map((item) => item.path);
 }
 
-function removeSelectedUploadItems() {
+async function removeSelectedUploadItems() {
   if (!canEditUploadSelection.value || selectedUploadCount.value === 0) return;
   const selected = new Set(selectedUploadPaths.value);
   const removed = uploadItems.value.filter((item) => selected.has(item.path)).length;
-  files.value = files.value.filter((file) => !selected.has(relativePath(file)));
-  uploadItems.value = uploadItems.value.filter((item) => !selected.has(item.path));
+  const removingUploadedFiles = Boolean(batchId.value);
+  let cancelledByRemoval = false;
+  if (batchId.value) {
+    const remoteIds = uploadItems.value
+      .filter((item) => selected.has(item.path))
+      .map((item) => item.remoteId)
+      .filter(Boolean);
+    if (remoteIds.length !== removed) {
+      error.value = "文件清单还没有完整保存，请刷新后重试。";
+      return;
+    }
+    removingFiles.value = true;
+    error.value = "";
+    try {
+      const result = await api.removeUploadFiles(batchId.value, remoteIds);
+      if (result.removedCount !== removed) throw new Error("UPLOAD_FILE_REMOVAL_COUNT_MISMATCH");
+      if (result.cancelled) {
+        cancelledByRemoval = true;
+        batchId.value = "";
+        restoredStagedManifest.value = false;
+      }
+    } catch {
+      error.value = "暂时无法移除所选文件。文件不会只从页面隐藏，请刷新后重试；已进入归档的文件需要通过新批次修正。";
+      return;
+    } finally {
+      removingFiles.value = false;
+    }
+  }
+  files.value = cancelledByRemoval ? [] : files.value.filter((file) => !selected.has(relativePath(file)));
+  uploadItems.value = cancelledByRemoval ? [] : uploadItems.value.filter((item) => !selected.has(item.path));
   selectedUploadPaths.value = [];
   stateEpoch += 1;
   pollingGeneration += 1;
-  status.value = "idle";
-  progress.value = "0";
+  status.value = uploadItems.value.length
+    ? uploadItems.value.some((item) => item.state === "failed") ? "error" : batchId.value ? "uploaded" : "idle"
+    : "idle";
+  progress.value = batchId.value ? "100" : "0";
   error.value = "";
-  selectionNotice.value = uploadItems.value.length
-    ? `已从待上传清单移除 ${removed} 个文件；当前还剩 ${uploadItems.value.length} 个文件。`
-    : `已从待上传清单移除全部 ${removed} 个文件。`;
+  selectionNotice.value = cancelledByRemoval
+    ? "本批次已没有可处理文件，已清空，可以重新选择资料。"
+    : uploadItems.value.length
+    ? `${removingUploadedFiles ? "已删除" : "已从待上传清单移除"} ${removed} 个文件；当前还剩 ${uploadItems.value.length} 个文件。`
+    : `${removingUploadedFiles ? "已删除" : "已从待上传清单移除"}全部 ${removed} 个文件。`;
 }
 
 function isMetadataPdf(file: Pick<File, "name" | "type">): boolean {
@@ -297,13 +358,7 @@ async function refreshPreview(importBatchId = preview.value?.id, expectedEpoch?:
   if (!importBatchId) return false;
   const next = await api.getImportPreview(shopId.value, importBatchId);
   if (expectedEpoch !== undefined && expectedEpoch !== stateEpoch) return false;
-  if (next.periodStart && next.periodEnd) {
-    periodStart.value = next.periodStart;
-    periodEnd.value = next.periodEnd;
-  }
-  const nextCompleteness = await api.getCompleteness(shopId.value, next.periodStart && next.periodEnd
-    ? { periodStart: next.periodStart, periodEnd: next.periodEnd }
-    : undefined);
+  const nextCompleteness = await api.getCompleteness(shopId.value);
   if (expectedEpoch !== undefined && expectedEpoch !== stateEpoch) return false;
   preview.value = next;
   completeness.value = nextCompleteness;
@@ -351,6 +406,42 @@ async function restoreLatestPreview() {
     if (!await refreshPreview(latest.id, restoreEpoch)) return;
     if (preview.value?.status === "RUNNING" && preview.value.stage === "UPLOAD" && preview.value.uploadBatchId) {
       batchId.value = preview.value.uploadBatchId;
+      const stagedFiles = preview.value.stagedUploadFiles ?? [];
+      const stagedManifestAvailable = preview.value.stagedUploadFiles !== undefined;
+      if (preview.value.uploadReady
+        && stagedManifestAvailable
+        && stagedFiles.every((file) => ["COMPLETE", "FAILED"].includes(file.status))) {
+        const restoredFiles = stagedFiles.map((staged) => {
+          const size = Number(staged.bytes);
+          if (!Number.isSafeInteger(size) || size < 0 || size > MAX_UPLOAD_BATCH_BYTES) {
+            throw new Error("UPLOAD_STAGED_FILE_SIZE_INVALID");
+          }
+          const name = staged.relativePath.split("/").at(-1) || "staged-file";
+          const source = new File([], name, { type: staged.metadataOnly ? "application/pdf" : "application/octet-stream" });
+          selectedPaths.set(source, staged.relativePath);
+          return { staged, size, source };
+        });
+        files.value = restoredFiles.map((file) => file.source);
+        uploadItems.value = restoredFiles.map(({ staged, size, source }) => ({
+          key: staged.id,
+          path: staged.relativePath,
+          size,
+          remoteId: staged.id,
+          source,
+          state: staged.status === "FAILED" ? "failed" : "complete",
+        }));
+        selectedUploadPaths.value = [];
+        preview.value = null;
+        completeness.value = [];
+        restoredStagedManifest.value = true;
+        status.value = "uploaded";
+        progress.value = "100";
+        error.value = "";
+        selectionNotice.value = hasConfirmableUploadedFiles.value
+          ? "已恢复服务器上的暂存文件。仍可单选、多选或全选删除；确认后才会归档并开始计算。"
+          : "已恢复服务器上的暂存清单，但没有可处理文件。请删除失败文件后重新选择资料。";
+        return;
+      }
       status.value = "error";
       error.value = preview.value.uploadReady
         ? "文件已经上传，但系统还没有开始检查。请点击“重新检查已上传文件”；不需要重新选择文件。"
@@ -389,10 +480,7 @@ async function startUpload() {
   try {
     if (!batchId.value) {
       await prepareUploadChecksum();
-      const batch = await api.createUploadBatch(shopId.value, files.value.map((file) => ({ relativePath: relativePath(file), bytes: String(isMetadataPdf(file) ? 0 : file.size), contentType: file.type || "application/octet-stream", ...(isMetadataPdf(file) ? { metadataOnly: true } : {}) })), {
-        periodStart: periodStart.value,
-        periodEnd: periodEnd.value,
-      });
+      const batch = await api.createUploadBatch(shopId.value, files.value.map((file) => ({ relativePath: relativePath(file), bytes: String(isMetadataPdf(file) ? 0 : file.size), contentType: file.type || "application/octet-stream", ...(isMetadataPdf(file) ? { metadataOnly: true } : {}) })));
       batchId.value = batch.id;
       for (const item of uploadItems.value) {
         const remote = batch.files.find((candidate) => candidate.relativePath === item.path);
@@ -413,7 +501,9 @@ async function startUpload() {
       error.value = uploadFailureMessage(result.failed);
       return;
     }
-    await completeCurrentUpload();
+    status.value = "uploaded";
+    progress.value = "100";
+    selectionNotice.value = "文件字节已上传。请最后核对清单；可单选、多选或全选移除，确认后系统才会归档并开始计算。";
   } catch (caught) {
     status.value = "error";
     const detail = caught instanceof Error ? caught.message : undefined;
@@ -421,9 +511,31 @@ async function startUpload() {
   }
 }
 
+async function confirmUploadedFiles() {
+  if (status.value !== "uploaded" || !batchId.value || !hasConfirmableUploadedFiles.value || removingFiles.value) return;
+  selectedUploadPaths.value = [];
+  selectionNotice.value = "";
+  await completeCurrentUpload();
+}
+
 async function cancel() {
-  if (batchId.value) await api.cancelUpload(batchId.value);
-  status.value = "cancelled";
+  if (!batchId.value) return;
+  try {
+    await api.cancelUpload(batchId.value);
+    batchId.value = "";
+    files.value = [];
+    uploadItems.value = [];
+    selectedUploadPaths.value = [];
+    preview.value = null;
+    completeness.value = [];
+    progress.value = "0";
+    restoredStagedManifest.value = false;
+    status.value = "idle";
+    error.value = "";
+    selectionNotice.value = "本次上传已安全取消，可以重新选择文件。";
+  } catch {
+    error.value = "暂时无法安全取消本次上传，请刷新后重试。";
+  }
 }
 
 function clientFailureCode(message: string | undefined): "CLIENT_NETWORK_RETRY_EXHAUSTED" | "CLIENT_FILE_READ_FAILED" {
@@ -440,7 +552,8 @@ async function skipFailedFiles() {
       await api.failUploadFile(item.remoteId, clientFailureCode(item.error));
       item.state = "skipped";
     }
-    await completeCurrentUpload();
+    status.value = "uploaded";
+    selectionNotice.value = "其余文件字节已上传。请最后核对清单；确认后系统才会归档并开始计算。";
   } catch {
     status.value = "error";
     error.value = "系统暂时无法继续检查其他文件。请刷新页面后重试；已上传成功的文件不需要重新选择。";
@@ -499,14 +612,6 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
 
     <section id="upload-source" class="surface-section upload-picker">
       <div class="section-heading"><h2>选择来源文件</h2><p>请选择完整文件夹，系统会记住文件在文件夹中的位置。CSV、从表格软件导出的 TXT 和系统已确认列名的配送货件 XLSX 可以用于计算；PDF 只登记文件名，交易报告 XLSX 和其他文件只保留文件信息。</p></div>
-      <fieldset class="accounting-period-scope" :disabled="selectionLocked || Boolean(batchId)">
-        <legend>本次核算月份（必选）</legend>
-        <label class="form-field"><span>开始月份</span><input v-model="periodStart" type="month" :max="periodEnd || undefined" /></label>
-        <span class="accounting-period-separator" aria-hidden="true">至</span>
-        <label class="form-field"><span>结束月份</span><input v-model="periodEnd" type="month" :min="periodStart || undefined" /></label>
-        <p>系统只检查并计算这个范围；范围外资料不会显示为本次缺失。成本表按自然年展示，因此起止月份必须在同一年。</p>
-      </fieldset>
-      <p v-if="periodError" class="form-error" role="alert">{{ periodError }}</p>
       <div
         class="upload-drop-zone"
         :class="{ 'is-active': dragActive, 'is-disabled': selectionLocked }"
@@ -521,20 +626,20 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
         <div><strong>拖入文件夹、ZIP 或文件</strong><p>如果原生窗口一次只能选择一个文件夹，请选完后继续点击“追加文件夹”；也可以一次拖入多个文件夹，或选择它们共同的上一级文件夹。直接选择的 PDF 只登记文件名；ZIP 中有 PDF 时，整个 ZIP 都不会上传。</p></div>
         <div class="upload-source-actions">
           <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加文件夹" : "选择文件夹" }}<input type="file" multiple webkitdirectory directory :disabled="selectionLocked" @change="collect" /></label>
-          <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加 ZIP 或文件" : "选择 ZIP 或文件" }}<input type="file" multiple accept=".zip,.csv,.txt,.pdf,.xlsx,.xls" :disabled="selectionLocked" @change="collect" /></label>
+          <label class="secondary-button file-button" :class="{ 'is-disabled': selectionLocked }">{{ files.length ? "追加 ZIP 或文件" : "选择 ZIP 或文件" }}<input type="file" multiple accept=".zip,application/zip,application/x-zip-compressed,.csv,text/csv,.txt,text/plain,.pdf,application/pdf,.xlsx,.xls" :disabled="selectionLocked" @change="collect" /></label>
         </div>
       </div>
       <div v-if="files.length" class="selection-summary"><span>{{ files.length }} 个文件</span><strong>{{ formatBytes(totalBytes) }}</strong><span>上限 20,000 个文件 / 2GB</span></div>
       <p v-if="restoringLatest" class="action-help" role="status">正在查看上次上传的进度，完成前暂时不能选择文件或开始上传。</p>
       <p v-if="selectionNotice" class="action-help" role="status">{{ selectionNotice }}</p>
-      <div v-if="uploadItems.length" class="file-manifest" role="region" aria-label="待上传文件" tabindex="0">
+      <div v-if="uploadItems.length" class="file-manifest" role="region" :aria-label="batchId ? '已上传文件' : '待上传文件'" tabindex="0">
         <header v-if="canEditUploadSelection" class="file-manifest-actions">
-          <label class="file-manifest-select-all"><input type="checkbox" aria-label="全选待上传文件" :checked="allUploadItemsSelected" :indeterminate="someUploadItemsSelected" :aria-checked="allUploadItemsSelected ? 'true' : someUploadItemsSelected ? 'mixed' : 'false'" @change="toggleAllUploadItems" /><span>{{ allUploadItemsSelected ? "取消全选" : `全选全部 ${uploadItems.length} 个` }}</span></label>
+          <label class="file-manifest-select-all"><input type="checkbox" :aria-label="batchId ? '全选已上传文件' : '全选待上传文件'" :checked="allUploadItemsSelected" :indeterminate="someUploadItemsSelected" :aria-checked="allUploadItemsSelected ? 'true' : someUploadItemsSelected ? 'mixed' : 'false'" @change="toggleAllUploadItems" /><span>{{ allUploadItemsSelected ? "取消全选" : `全选全部 ${uploadItems.length} 个` }}</span></label>
           <span class="file-manifest-selected-count">已选 {{ selectedUploadCount }} 个</span>
-          <button class="secondary-button compact" type="button" :disabled="selectedUploadCount === 0" @click="removeSelectedUploadItems">移除已选文件</button>
+          <button class="secondary-button compact" type="button" :disabled="selectedUploadCount === 0 || removingFiles" @click="removeSelectedUploadItems">{{ removingFiles ? "正在删除" : batchId ? "删除已选文件" : "移除已选文件" }}</button>
         </header>
         <div v-for="item in uploadItems.slice(0, 200)" :key="item.key" class="file-manifest-item">
-          <input v-if="canEditUploadSelection" v-model="selectedUploadPaths" class="file-manifest-checkbox" type="checkbox" :value="item.path" :aria-label="`选择待上传文件 ${item.path}`" />
+          <input v-if="canEditUploadSelection" v-model="selectedUploadPaths" class="file-manifest-checkbox" type="checkbox" :value="item.path" :aria-label="`选择${batchId ? '已上传' : '待上传'}文件 ${item.path}`" />
           <span class="status-chip" :data-state="item.state">{{ /\.pdf$/i.test(item.path) && item.state === "complete" ? "未读取正文" : uploadStateNames[item.state] }}</span>
           <span class="file-manifest-path" :title="item.path">{{ item.path }}</span>
           <b class="file-manifest-size">{{ /\.pdf$/i.test(item.path) ? "仅登记文件名" : formatBytes(item.size) }}</b>
@@ -543,9 +648,9 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
         <p v-if="uploadItems.length > 200">当前显示前 200 个文件，另有 {{ uploadItems.length - 200 }} 个；全选会作用于完整清单。</p>
       </div>
       <p v-if="error && !preview" class="form-error" role="alert">{{ error }}</p>
-      <div v-if="status !== 'idle' && !preview" class="warning-panel" :data-tone="uploadConclusion.tone" role="status"><strong>{{ uploadConclusion.title }}</strong><p>{{ uploadConclusion.detail }}</p></div>
+      <div v-if="status !== 'idle' && !preview" class="warning-panel" :data-tone="uploadConclusion.tone" role="status"><strong>{{ status === "uploaded" ? "等待确认文件清单" : uploadConclusion.title }}</strong><p>{{ status === "uploaded" ? hasConfirmableUploadedFiles ? "当前仍是可撤回暂存文件。删除所选文件后端会同步排除；点击确认后才会进入不可变归档和计算。" : "当前没有可处理文件。请删除失败项并重新选择资料，系统不会生成空结果。" : uploadConclusion.detail }}</p></div>
       <div v-if="status === 'uploading'" class="upload-progress" role="status" aria-live="polite"><div><span>正在上传 {{ progress }}%</span><b>网络中断后，可从上次成功的位置继续</b></div><progress :value="Number(progress)" max="100"></progress></div>
-      <div class="form-actions"><button v-if="files.length && !batchId && ['idle','error'].includes(status)" class="primary-button" type="button" :disabled="!canStartUpload" @click="startUpload">{{ status === "error" ? "重试开始上传" : "开始上传" }}</button><button v-if="canContinue" class="primary-button" type="button" @click="startUpload">继续上传</button><button v-if="canContinue" class="secondary-button" type="button" @click="skipFailedFiles">跳过失败并继续</button><button v-if="canRetryCompletion" class="primary-button" type="button" @click="completeCurrentUpload">重新检查已上传文件</button><button v-if="batchId && ['uploading','preflight','error'].includes(status)" class="secondary-button" type="button" @click="cancel">安全取消</button></div>
+      <div class="form-actions"><button v-if="files.length && !batchId && ['idle','error'].includes(status)" class="primary-button" type="button" :disabled="!canStartUpload" @click="startUpload">{{ status === "error" ? "重试开始上传" : "开始上传" }}</button><button v-if="canContinue" class="primary-button" type="button" @click="startUpload">继续上传</button><button v-if="canContinue" class="secondary-button" type="button" @click="skipFailedFiles">跳过失败并继续</button><button v-if="status === 'uploaded'" class="primary-button" type="button" :disabled="removingFiles || !hasConfirmableUploadedFiles" @click="confirmUploadedFiles">确认文件并开始检查</button><button v-if="canRetryCompletion" class="primary-button" type="button" @click="completeCurrentUpload">重新检查已上传文件</button><button v-if="batchId && (status === 'uploading' || status === 'uploaded' || (status === 'error' && !canRetryCompletion))" class="secondary-button" type="button" @click="cancel">安全取消</button></div>
     </section>
 
     <section v-if="preview" class="surface-section workflow-commit-panel">
@@ -556,12 +661,14 @@ onUnmounted(() => { pollingGeneration += 1; stateEpoch += 1; });
         <div><span>问题数量</span><strong>{{ preflightIssueCount }}</strong></div>
         <div><span>当前状态</span><strong>{{ previewStatusLabel }}</strong></div>
       </div>
-      <p v-if="preview.periodStart && preview.periodEnd" class="accounting-period-summary">本次只核算 {{ preview.periodStart }} 至 {{ preview.periodEnd }}；范围外资料保留，但不参与本次缺失检查、计算和导出。</p>
       <div class="warning-panel" :data-tone="preview.status === 'FAILED' ? 'error' : preview.status === 'PUBLISHED' ? 'success' : undefined" role="status"><strong>处理结论</strong><p>{{ preflightConclusion }}</p></div>
 
-      <details v-if="preflightFiles.length || preview.issues.length" class="preflight-detail">
+      <details v-if="preflightFiles.length || coverageMatrixRows.length || preview.issues.length" class="preflight-detail">
         <summary>查看文件与问题明细</summary>
-        <div v-if="preflightFiles.length" class="table-scroll" tabindex="0" role="region" aria-label="文件检查结果"><table><thead><tr><th>文件在所选文件夹中的位置</th><th>文件内容</th><th>处理结果</th><th>说明</th></tr></thead><tbody><tr v-for="file in preflightFiles" :key="file.path"><td>{{ file.path }}</td><td><span v-if="file.classificationKind" class="file-kind-chip" :data-kind="file.classificationKind">{{ file.classification }}</span><span v-else>{{ file.classification }}</span></td><td><span class="status-chip" :data-state="file.tone">{{ file.status }}</span></td><td>{{ file.detail }}</td></tr></tbody></table></div>
+        <div class="segmented-control compact preflight-dimension-switch" role="group" aria-label="资料明细查看维度"><button type="button" :class="{ active: detailView === 'FILES' }" :aria-pressed="detailView === 'FILES'" @click="detailView = 'FILES'">按文件查看</button><button type="button" :class="{ active: detailView === 'COVERAGE' }" :aria-pressed="detailView === 'COVERAGE'" @click="detailView = 'COVERAGE'">按站点和月份</button></div>
+        <div v-if="detailView === 'FILES' && preflightFiles.length" class="table-scroll" tabindex="0" role="region" aria-label="文件检查结果"><table><thead><tr><th>文件在所选文件夹中的位置</th><th>文件内容</th><th>处理结果</th><th>说明</th></tr></thead><tbody><tr v-for="file in preflightFiles" :key="file.path"><td>{{ file.path }}</td><td><span v-if="file.classificationKind" class="file-kind-chip" :data-kind="file.classificationKind">{{ file.classification }}</span><span v-else>{{ file.classification }}</span></td><td><span class="status-chip" :data-state="file.tone">{{ file.status }}</span></td><td>{{ file.detail }}</td></tr></tbody></table></div>
+        <div v-else-if="detailView === 'COVERAGE' && coverageMatrixRows.length" class="table-scroll source-coverage-matrix" tabindex="0" role="region" aria-label="按站点和月份查看资料"><table><thead><tr><th>站点</th><th>日期</th><th>交易报告</th><th>配送货件</th><th>备注</th></tr></thead><tbody><tr v-for="slice in coverageMatrixRows" :key="slice.datasetVersionId || `${slice.marketplace}-${slice.month}`" :data-missing="(slice.missingReports?.length ?? 0) > 0"><td>{{ slice.marketplace }}</td><td>{{ slice.month }}</td><td><span class="status-chip" :data-state="matrixSourceState(slice, 'TRANSACTION') === 'MISSING' ? 'failed' : matrixSourceState(slice, 'TRANSACTION') === 'PRESENT' ? 'complete' : 'neutral'">{{ matrixSourceLabel(slice, 'TRANSACTION') }}</span></td><td><span class="status-chip" :data-state="matrixSourceState(slice, 'SHIPMENT') === 'MISSING' ? 'failed' : matrixSourceState(slice, 'SHIPMENT') === 'PRESENT' ? 'complete' : 'neutral'">{{ matrixSourceLabel(slice, 'SHIPMENT') }}</span></td><td>{{ matrixNote(slice) || "暂无备注" }}</td></tr></tbody></table></div>
+        <div v-else-if="detailView === 'COVERAGE'" class="inline-empty">站点和月份仍在汇总，完成后会在这里更新。</div>
         <div v-if="preview.issues.length" class="issue-list"><article v-for="issue in preview.issues" :key="issue.id" :data-severity="issue.severity"><header><strong>{{ issue.message }}</strong><span>{{ issue.exactCount ? `${issue.count} 条` : `${issue.count} 条示例` }}</span></header><p>{{ issue.action }}</p></article></div>
       </details>
 

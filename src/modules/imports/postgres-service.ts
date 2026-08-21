@@ -130,14 +130,17 @@ export class PostgresImportService {
   async getBatch(shopId: string, batchId: string) {
     const batch = await this.database.query<{
       id: string; status: string; current_stage: string; failure_code: string | null;
-      upload_batch_id: string; upload_ready: boolean; accounting_period_start: string | null; accounting_period_end: string | null;
+      upload_batch_id: string; upload_batch_status: string; upload_ready: boolean; accounting_period_start: string | null; accounting_period_end: string | null;
     }>(
       `SELECT batch.id,batch.status,batch.current_stage,batch.failure_code,batch.upload_batch_id,
+              upload.status AS upload_batch_status,
               to_char(batch.accounting_period_start,'YYYY-MM') accounting_period_start,
               to_char(batch.accounting_period_end,'YYYY-MM') accounting_period_end,
               NOT EXISTS (SELECT 1 FROM upload_file file
                 WHERE file.batch_id=batch.upload_batch_id AND file.status IN ('PENDING','UPLOADING')) AS upload_ready
-         FROM import_batch batch WHERE batch.id=$1 AND batch.shop_id=$2`,
+         FROM import_batch batch
+         JOIN upload_batch upload ON upload.id=batch.upload_batch_id
+        WHERE batch.id=$1 AND batch.shop_id=$2`,
       [batchId, shopId],
     );
     const row = batch.rows[0];
@@ -145,6 +148,29 @@ export class PostgresImportService {
     const files = await this.database.query<{
       id: string; relative_path: string; size_bytes: string; classification: string; parse_status: string;
     }>("SELECT id,relative_path,size_bytes::text,classification,parse_status FROM import_file WHERE import_batch_id=$1 ORDER BY relative_path", [batchId]);
+    const stagedManifestAvailable = row.status === "UPLOADING" && row.upload_batch_status === "UPLOADING";
+    const stagedUploadFiles = stagedManifestAvailable
+      ? await this.database.query<{
+        id: string; relative_path: string; declared_size: string; status: "PENDING" | "UPLOADING" | "COMPLETE" | "FAILED"; metadata_only: boolean;
+      }>(
+        `SELECT upload_file.id,upload_file.relative_path,upload_file.declared_size::text,
+                upload_file.status,upload_file.metadata_only
+           FROM upload_file
+          WHERE upload_file.batch_id=$1
+            AND upload_file.status IN ('PENDING','UPLOADING','COMPLETE','FAILED')
+            AND upload_file.stored_object_id IS NULL
+            AND upload_file.archive_reservation_state='NONE'
+            AND NOT EXISTS (
+              SELECT 1 FROM audit_event removed
+               WHERE removed.object_type='UPLOAD_BATCH'
+                 AND removed.object_id=$1
+                 AND removed.action='UPLOAD_FILES_REMOVED_BEFORE_IMPORT'
+                 AND (removed.metadata->'fileIds') ? upload_file.id::text
+            )
+          ORDER BY upload_file.relative_path,upload_file.id`,
+        [row.upload_batch_id],
+      )
+      : { rows: [] };
     const issues = await this.database.query<{
       id: string; import_file_id: string | null; issue_code: string; severity: string;
       field_name: string | null; issue_count: string; exact_count: boolean;
@@ -181,6 +207,15 @@ export class PostgresImportService {
       progress: publicStatus === "PUBLISHED" || publicStatus === "READY" ? "100" : publicStatus === "PROCESSING" ? "75" : "0",
       stage: row.current_stage,
       failureCode: row.failure_code,
+      ...(stagedManifestAvailable ? {
+        stagedUploadFiles: stagedUploadFiles.rows.map((file) => ({
+          id: file.id,
+          relativePath: file.relative_path,
+          bytes: file.declared_size,
+          status: file.status,
+          metadataOnly: file.metadata_only,
+        })),
+      } : {}),
       ...(row.accounting_period_start && row.accounting_period_end
         ? { periodStart: row.accounting_period_start, periodEnd: row.accounting_period_end }
         : {}),

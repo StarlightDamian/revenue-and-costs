@@ -226,6 +226,9 @@ describe("one-click code release guardrails", () => {
     expect(remote).not.toMatch(/bootstrap-admin|assert-production-initial-state/);
     expect(remote).toContain("ACTIVE_CALCULATIONS_REQUIRE_DRAIN");
     expect(remote).toContain("ACTIVE_IMPORTS_REQUIRE_DRAIN");
+    expect(remote).toContain("ACTIVE_EXPORTS_REQUIRE_DRAIN");
+    expect(remote).toContain("ACTIVE_UPLOADS_REQUIRE_DRAIN");
+    expect(remote).toContain("PENDING_BUSINESS_OUTBOX_REQUIRE_DRAIN");
     expect(remote).toContain("dist/cli/migrate.js");
     expect(remote).toContain("dist/cli/bootstrap-mappings.js");
     expect(remote).toContain("REQUIRE_BOOTSTRAP_MAPPINGS=true");
@@ -268,6 +271,43 @@ describe("one-click code release guardrails", () => {
     expect(remote.indexOf("umask 027")).toBeLessThan(remote.indexOf('migration_manifest "$previous_app/migrations"'));
     expect(remote).toContain("payload.service !== \"api\"");
     expect(remote).toContain("setfacl -R -m u:www:r-X");
+  });
+
+  it("drains every version-sensitive business workflow after stopping both services", async () => {
+    const remote = await readFile("bin/push-remote.sh", "utf8");
+    const servicesStopped = remote.indexOf("services_stopped=1");
+    const stopServices = remote.indexOf('systemctl stop "$api_service" "$worker_service"', servicesStopped);
+    const backup = remote.indexOf('runuser -u postgres -- "$pg_dump_bin"', stopServices);
+    const drain = remote.slice(stopServices, backup);
+
+    expect(servicesStopped).toBeGreaterThan(0);
+    expect(stopServices).toBeGreaterThan(servicesStopped);
+    expect(backup).toBeGreaterThan(stopServices);
+    expect(drain).toContain("FROM calculation_run WHERE status IN ('QUEUED','RUNNING','BLOCKED')");
+    expect(drain).toContain("FROM import_batch WHERE status NOT IN ('RESULT_PUBLISHED','FAILED','CANCELLED')");
+    expect(drain).toContain("FROM export_request WHERE status IN ('QUEUED','RUNNING')");
+    expect(drain).toContain("FROM upload_file WHERE status IN ('PENDING','UPLOADING','COMPLETE','ENCRYPTING')");
+    expect(drain).toContain("FROM outbox_event WHERE dispatched_at IS NULL");
+    for (const topic of [
+      "upload.finalize",
+      "import.analyze",
+      "import.commit",
+      "calculation.requested",
+      "calculation.run",
+      "report.auto-publish",
+      "export.generate",
+    ]) {
+      expect(drain).toContain(`'${topic}'`);
+    }
+    for (const guard of [
+      '[[ "$active_calculations" == \'0\' ]] || fail \'ACTIVE_CALCULATIONS_REQUIRE_DRAIN\'',
+      '[[ "$active_imports" == \'0\' ]] || fail \'ACTIVE_IMPORTS_REQUIRE_DRAIN\'',
+      '[[ "$active_exports" == \'0\' ]] || fail \'ACTIVE_EXPORTS_REQUIRE_DRAIN\'',
+      '[[ "$active_uploads" == \'0\' ]] || fail \'ACTIVE_UPLOADS_REQUIRE_DRAIN\'',
+      '[[ "$pending_business_outbox" == \'0\' ]] || fail \'PENDING_BUSINESS_OUTBOX_REQUIRE_DRAIN\'',
+    ]) {
+      expect(drain).toContain(guard);
+    }
   });
 
   it("does not stop services or switch current while handling a pre-stop failure", async () => {

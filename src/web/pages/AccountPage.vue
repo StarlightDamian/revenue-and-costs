@@ -95,7 +95,7 @@ async function saveAvatar(avatarId: number) {
         </div>
         <div><dt>手机号</dt><dd><PhoneDisplay :value="session.me?.phoneMasked" /></dd></div>
         <div><dt>账号类型</dt><dd>{{ roleText }}</dd></div>
-        <div v-if="session.me?.customerShopCount"><dt>可查看的客户公司</dt><dd>{{ session.me.customerShopCount }}</dd></div>
+        <div v-if="session.me?.customerShopCount"><dt>可查看的客户店铺</dt><dd>{{ session.me.customerShopCount }}</dd></div>
         <div class="account-avatar-setting">
           <dt>个人头像</dt>
           <dd><AvatarPicker :model-value="session.me?.avatarId ?? 1" label="更换账号头像" @update:model-value="saveAvatar" /><small>头像会显示在侧边栏和做账员列表中。</small></dd>

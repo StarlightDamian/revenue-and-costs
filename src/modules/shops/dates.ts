@@ -49,5 +49,5 @@ export function billedYears(startDate: string, requestedCloseDate: string): numb
   for (let years = 1; years <= 100; years += 1) {
     if (comparePlainDate(requestedCloseDate, anniversary(startDate, years)) <= 0) return years;
   }
-  throw new AppError('SHOP_TERM_LIMIT', '单次公司期限不能超过 100 个计费年', 400);
+  throw new AppError('SHOP_TERM_LIMIT', '单次店铺期限不能超过 100 个计费年', 400);
 }

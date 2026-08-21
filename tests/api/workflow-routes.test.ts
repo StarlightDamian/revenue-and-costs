@@ -86,13 +86,15 @@ describe("workflow route contract", () => {
       method: "POST",
       url: `/api/v1/shops/${shopId}/exports/current`,
       headers: { "idempotency-key": "current-export-key" },
-      payload: { profitRate: "0.04370000", minimumSalesCostRate: "0.15000000" },
+      payload: { profitRate: "0.04370000", minimumSalesCostRate: "0.15000000", periodStart: "2026-04", periodEnd: "2026-06" },
     });
 
     expect(response.statusCode).toBe(200);
     expect(createCurrent).toHaveBeenCalledWith(actor, shopId, "current-export-key", "current-export-request", {
       profitRate: "0.04370000",
       minimumSalesCostRate: "0.15000000",
+      periodStart: "2026-04",
+      periodEnd: "2026-06",
     });
     await app.close();
   });
@@ -108,7 +110,7 @@ describe("workflow route contract", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: `/api/v1/shops/${shopId}/exports/cost-preview?profitRate=0.04370000&minimumSalesCostRate=`,
+      url: `/api/v1/shops/${shopId}/exports/cost-preview?profitRate=0.04370000&minimumSalesCostRate=&periodStart=2026-04&periodEnd=2026-06`,
     });
 
     expect(response.statusCode).toBe(200);
@@ -116,6 +118,9 @@ describe("workflow route contract", () => {
     expect(previewCostAccounting).toHaveBeenCalledWith(actor, shopId, {
       profitRate: "0.04370000",
       minimumSalesCostRate: null,
+    }, {
+      periodStart: "2026-04",
+      periodEnd: "2026-06",
     });
     await app.close();
   });

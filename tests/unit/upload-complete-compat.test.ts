@@ -7,7 +7,11 @@ describe("upload completion compatibility", () => {
     const calls: string[] = [];
     const query = vi.fn(async (sql: string): Promise<Partial<QueryResult>> => {
       calls.push(sql);
+      if (sql.includes("SELECT status FROM upload_batch")) return { rows: [{ status: "UPLOADING" }] };
       if (sql.includes("count(*)::text AS count")) return { rows: [{ count: "0" }] };
+      if (sql.includes("count(*) FILTER (WHERE status IN ('PENDING','UPLOADING'))")) {
+        return { rows: [{ pending: "0", processable: "1" }] };
+      }
       if (sql.includes("SELECT id,status FROM import_batch")) {
         return { rows: [{ id: "00000000-0000-4000-8000-000000000002", status: "ANALYZING" }] };
       }
@@ -27,10 +31,12 @@ describe("upload completion compatibility", () => {
 
     const finalizeSql = calls.find((sql) => sql.includes("'upload.finalize'"));
     expect(finalizeSql).toContain("file.status='COMPLETE' AND NOT file.metadata_only");
-    expect(finalizeSql).toContain("JOIN upload_batch batch ON batch.id=file.batch_id");
-    expect(finalizeSql).toContain("JOIN import_batch batch_import ON batch_import.upload_batch_id=batch.id");
-    expect(finalizeSql).toContain("batch.status='READY'");
-    expect(finalizeSql).toContain("batch_import.status IN ('UPLOADING','ANALYZING','AWAITING_MAPPING','AWAITING_COMMIT_CONFIRMATION')");
+    expect(finalizeSql).toContain("JOIN upload_batch upload ON upload.id=file.batch_id");
+    expect(finalizeSql).toContain("JOIN import_batch batch_import ON batch_import.upload_batch_id=upload.id");
+    expect(finalizeSql).toContain("upload.status='READY'");
+    expect(finalizeSql).toContain("batch_import.status=ANY($2::text[])");
     expect(finalizeSql).toContain("ON CONFLICT (topic,business_key) DO NOTHING");
+    expect(calls.findIndex((sql) => sql.includes("UPDATE upload_batch SET status = 'READY'")))
+      .toBeLessThan(calls.findIndex((sql) => sql.includes("'upload.finalize'")));
   });
 });

@@ -3,11 +3,16 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 
 type Grain = "MONTH" | "DAY";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   readonly grain: Grain;
   readonly start: string;
   readonly end: string;
-}>();
+  readonly allowEmpty?: boolean;
+  readonly allowGrainChange?: boolean;
+}>(), {
+  allowEmpty: false,
+  allowGrainChange: true,
+});
 
 const emit = defineEmits<{
   "update:grain": [value: Grain];
@@ -45,8 +50,9 @@ function formatDay(value: string): string {
 }
 
 const displayRange = computed(() => {
+  if (props.allowEmpty && !props.start && !props.end) return props.grain === "MONTH" ? "全部月份" : "全部日期";
   const format = props.grain === "MONTH" ? formatMonth : formatDay;
-  return `${format(props.start)} — ${format(props.end)}`;
+  return `${format(props.start)} 至 ${format(props.end)}`;
 });
 const leftYear = computed(() => Number((viewMonth.value || currentMonth()).slice(0, 4)));
 const rightYear = computed(() => leftYear.value + 1);
@@ -67,6 +73,14 @@ function togglePanel() {
 
 function closePanel() {
   panelOpen.value = false;
+}
+
+function clearSelection() {
+  draftStart.value = "";
+  draftEnd.value = "";
+  emit("update:start", "");
+  emit("update:end", "");
+  closePanel();
 }
 
 function chooseGrain(value: Grain) {
@@ -149,7 +163,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", handleOutside)
 
     <div v-if="panelOpen" class="date-range-panel" role="dialog" aria-label="选择日期范围" @keydown.esc="closePanel">
       <header class="date-range-panel-head">
-        <div class="segmented-control compact" aria-label="日期粒度">
+        <div v-if="allowGrainChange !== false" class="segmented-control compact" aria-label="日期粒度">
           <button type="button" :class="{ active: grain === 'MONTH' }" :aria-pressed="grain === 'MONTH'" @click="chooseGrain('MONTH')">月度</button>
           <button type="button" :class="{ active: grain === 'DAY' }" :aria-pressed="grain === 'DAY'" @click="chooseGrain('DAY')">日度</button>
         </div>
@@ -186,7 +200,10 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", handleOutside)
         </section>
       </div>
 
-      <footer><span>{{ draftStart ? (grain === "MONTH" ? formatMonth(draftStart) : formatDay(draftStart)) : "选择开始" }}</span><b>—</b><span>{{ draftEnd ? (grain === "MONTH" ? formatMonth(draftEnd) : formatDay(draftEnd)) : "请选择结束" }}</span></footer>
+      <footer>
+        <button v-if="allowEmpty" class="secondary-button compact date-range-clear" type="button" @click="clearSelection">全部范围</button>
+        <span>{{ draftStart ? (grain === "MONTH" ? formatMonth(draftStart) : formatDay(draftStart)) : "选择开始" }}</span><b>至</b><span>{{ draftEnd ? (grain === "MONTH" ? formatMonth(draftEnd) : formatDay(draftEnd)) : "请选择结束" }}</span>
+      </footer>
     </div>
   </div>
 </template>

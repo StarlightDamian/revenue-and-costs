@@ -70,7 +70,7 @@ function normalizeShopName(name: string): { name: string; normalized: string } {
   const visible = name.normalize('NFKC').trim().replace(/\s+/g, ' ');
   const length = [...visible].length;
   if (length < 1 || length > 120) {
-    throw new AppError('SHOP_NAME_INVALID', '公司名称长度必须为 1–120 个字符', 400, 'name');
+    throw new AppError('SHOP_NAME_INVALID', '店铺名称长度必须为 1–120 个字符', 400, 'name');
   }
   return { name: visible, normalized: visible.toLocaleLowerCase('zh-CN') };
 }
@@ -120,7 +120,7 @@ function sameChargeWaiver(
 }
 
 function idempotencyConflict(): never {
-  throw new AppError('IDEMPOTENCY_KEY_REUSED', '同一幂等键不能用于不同公司操作', 409);
+  throw new AppError('IDEMPOTENCY_KEY_REUSED', '同一幂等键不能用于不同店铺操作', 409);
 }
 
 function rethrowShopNameConflict(error: unknown): never {
@@ -132,7 +132,7 @@ function rethrowShopNameConflict(error: unknown): never {
     && 'constraint' in error
     && error.constraint === 'shop_enterprise_live_name_uq'
   ) {
-    throw new AppError('SHOP_NAME_CONFLICT', '已有同名公司（包括回收站），请更换公司名称', 409, 'name');
+    throw new AppError('SHOP_NAME_CONFLICT', '已有同名店铺（包括回收站），请更换店铺名称', 409, 'name');
   }
   throw error;
 }
@@ -478,7 +478,7 @@ export class ShopService {
     const startedAt = Date.now();
     const shopIds = [...new Set(input.shopIds)].sort();
     const reason = input.reason.trim();
-    if (!reason) throw new AppError('REASON_REQUIRED', '批量删除公司必须填写原因', 400, 'reason');
+    if (!reason) throw new AppError('REASON_REQUIRED', '批量删除店铺必须填写原因', 400, 'reason');
     const requestHash = createHash('sha256').update(JSON.stringify({ shopIds, reason })).digest('hex');
     try {
       const result = await this.transactions.transaction(async (client) => {
@@ -505,7 +505,7 @@ export class ShopService {
         if (selected.rows.length !== shopIds.length) throw new AppError('RESOURCE_NOT_FOUND', '资源不存在或无权访问', 404);
         for (const shop of selected.rows) {
           requireAllowed(authorizeShop(input.actor, { id: shop.id, enterpriseId: shop.enterprise_id, state: shop.status }, null, 'SHOP_TRASH'));
-          if (!['ACTIVE', 'EXPIRED_READONLY'].includes(shop.status)) throw new AppError('SHOP_STATE_CONFLICT', '所选公司当前状态不允许删除', 409);
+          if (!['ACTIVE', 'EXPIRED_READONLY'].includes(shop.status)) throw new AppError('SHOP_STATE_CONFLICT', '所选店铺当前状态不允许删除', 409);
         }
         const active = await client.query<{ shop_id: string }>(
           `SELECT DISTINCT shop_id FROM (
@@ -518,7 +518,7 @@ export class ShopService {
            ) active`,
           [shopIds],
         );
-        if (active.rows.length) throw new AppError('SHOP_HAS_ACTIVE_WORKFLOW', '所选公司存在运行中的任务，请完成或取消后再删除', 409);
+        if (active.rows.length) throw new AppError('SHOP_HAS_ACTIVE_WORKFLOW', '所选店铺存在运行中的任务，请完成或取消后再删除', 409);
 
         const updated = await client.query<ShopRow>(
           `UPDATE shop SET status='TRASHED',trashed_at=clock_timestamp(),purge_after=clock_timestamp()+interval '30 days',
@@ -673,7 +673,7 @@ export class ShopService {
       } catch (error) {
         rethrowShopNameConflict(error);
       }
-      if (!shop) throw new Error('创建公司失败');
+      if (!shop) throw new Error('创建店铺失败');
       if (!isAdmin && original > 0n) {
         const ledger = await appendWalletEntry(client, {
           walletId: enterpriseRow.wallet_id,
@@ -694,7 +694,7 @@ export class ShopService {
         [shop.id, input.startDate, closeDate, years, currentPrice.id],
       );
       const termId = term.rows[0]?.id;
-      if (!termId) throw new Error('创建公司期限失败');
+      if (!termId) throw new Error('创建店铺期限失败');
       await client.query(
         `INSERT INTO shop_charge
           (shop_id, shop_term_id, price_version_id, original_amount_cents, charged_amount_cents,
@@ -890,7 +890,7 @@ export class ShopService {
       const shop = result.rows[0];
       if (!shop) throw new AppError('RESOURCE_NOT_FOUND', '资源不存在或无权访问', 404);
       requireAllowed(authorizeShop(input.actor, { id: shop.id, enterpriseId: shop.enterprise_id, state: shop.status }, null, 'SHOP_RENAME'));
-      if (shop.rename_count !== 0) throw new AppError('SHOP_RENAME_LIMIT', '每个公司只能成功改名一次', 409);
+      if (shop.rename_count !== 0) throw new AppError('SHOP_RENAME_LIMIT', '每个店铺只能成功改名一次', 409);
       const updated = await client.query<ShopRow>(
         `UPDATE shop
             SET name = $2, normalized_name = $3, rename_count = 1,
@@ -899,7 +899,7 @@ export class ShopService {
         [shop.id, names.name, names.normalized, input.actor.accountId],
       );
       const row = updated.rows[0];
-      if (!row) throw new AppError('SHOP_RENAME_CONFLICT', '公司改名冲突', 409);
+      if (!row) throw new AppError('SHOP_RENAME_CONFLICT', '店铺改名冲突', 409);
       await client.query(
         'INSERT INTO shop_name_history (shop_id, old_name, new_name, changed_by) VALUES ($1,$2,$3,$4)',
         [shop.id, shop.name, names.name, input.actor.accountId],
@@ -960,7 +960,7 @@ export class ShopService {
         );
       }
       const row = updated.rows[0];
-      if (!row) throw new AppError('SHOP_STATE_CONFLICT', '公司当前状态不允许该操作', 409);
+      if (!row) throw new AppError('SHOP_STATE_CONFLICT', '店铺当前状态不允许该操作', 409);
       await this.effects.audit(client, {
         actorAccountId: input.actor.accountId,
         actorRoles: [...input.actor.roles],

@@ -80,19 +80,13 @@ test("报告下载固定五个 Sheet，并把旧格式任务与当前版本分�
 
   await page.goto(`/shops/${shopId}/workflow/export`);
 
-  await expect(page.getByRole("navigation", { name: "公司数据处理阶段" }).getByRole("link")).toHaveCount(3);
+  await expect(page.getByRole("navigation", { name: "店铺数据处理阶段" }).getByRole("link")).toHaveCount(3);
   const onboarding = page.locator("body > .onboarding-overlay");
   await expect(onboarding).toHaveCount(0);
   expect(onboardingRequests).toBe(0);
-  const sheetList = page.getByRole("list", { name: "报告包含的表格" });
   await expect(page.getByText("当前正式版本", { exact: true })).toHaveCount(0);
-  await expect(page.locator(".export-generation-row").getByRole("button", { name: "生成并下载" })).toBeVisible();
-  await expect(sheetList.getByRole("listitem")).toHaveCount(5);
-  await expect(sheetList).toContainText("成本核算表-人民币");
-  await expect(sheetList).not.toContainText("完整性检查");
-  await expect(sheetList).not.toContainText("费用明细");
-  await expect(sheetList).not.toContainText("导入审计");
-  await expect(sheetList).not.toContainText("汇率追溯");
+  await expect(page.locator(".export-assumption-actions").getByRole("button", { name: "生成并下载" })).toBeVisible();
+  await expect(page.getByRole("list", { name: "报告包含的表格" })).toHaveCount(0);
   const rows = page.locator(".surface-section table tbody tr");
   await expect(rows).toHaveCount(2);
   await expect(rows.nth(0)).toContainText("当前版本");

@@ -109,7 +109,7 @@ onMounted(async () => { await loadEnterprises(); resetProfileForm(); emit("selec
 <template>
   <section class="surface-section enterprise-workspace" aria-labelledby="enterprise-title">
     <div class="enterprise-toolbar">
-      <div class="section-heading"><h2 id="enterprise-title">企业工作台</h2><p>企业用于集中管理公司、企业钱包和一起做账的同事。</p></div>
+      <div class="section-heading"><h2 id="enterprise-title">企业工作台</h2><p>企业用于集中管理店铺、企业钱包和一起做账的同事。</p></div>
       <div class="enterprise-switch-actions">
         <label v-if="enterpriseState.items.length" class="form-field compact-field"><span>当前企业</span><select :value="enterpriseState.currentId" @change="choose(($event.target as HTMLSelectElement).value)"><option v-for="enterprise in enterpriseState.items" :key="enterprise.id" :value="enterprise.id">{{ enterprise.name }}</option></select></label>
         <button v-if="canCreateEnterprise" class="secondary-button compact" type="button" @click="creating = true; editing = false; name = ''; creditCode = ''">创建企业</button>
@@ -118,10 +118,10 @@ onMounted(async () => { await loadEnterprises(); resetProfileForm(); emit("selec
 
     <div v-if="currentEnterprise" class="enterprise-current">
       <div class="enterprise-identity"><div><strong>{{ currentEnterprise.name }}</strong><span>{{ currentEnterprise.unifiedSocialCreditCode || "历史企业资料待补录" }}</span></div><div class="row-actions"><button v-if="currentEnterprise.canEditName || currentEnterprise.canEditCreditCode" class="secondary-button compact" type="button" @click="editing = true; creating = false; resetProfileForm()">编辑资料</button><button class="secondary-button compact" type="button" @click="toggleMembers">{{ membersOpen ? "收起做账员" : "管理做账员" }}</button></div></div>
-      <dl class="summary-list enterprise-summary"><div><dt>企业钱包</dt><dd>¥{{ walletYuan }}</dd></div><div><dt>做账员</dt><dd>{{ currentEnterprise.memberCount }}</dd></div><div><dt>公司总数</dt><dd>{{ currentEnterprise.companyCount }}</dd></div><div><dt>未做账 / 已提交</dt><dd>{{ currentEnterprise.notStartedCount }} / {{ currentEnterprise.submittedCount }}</dd></div></dl>
-      <p v-if="!currentEnterprise.profileComplete" class="form-error">历史企业需补齐名称和统一社会信用代码后，才能充值、新建公司或新增做账员。</p>
+      <dl class="summary-list enterprise-summary"><div><dt>企业钱包</dt><dd>¥{{ walletYuan }}</dd></div><div><dt>做账员</dt><dd>{{ currentEnterprise.memberCount }}</dd></div><div><dt>店铺总数</dt><dd>{{ currentEnterprise.companyCount }}</dd></div><div><dt>未做账 / 已提交</dt><dd>{{ currentEnterprise.notStartedCount }} / {{ currentEnterprise.submittedCount }}</dd></div></dl>
+      <p v-if="!currentEnterprise.profileComplete" class="form-error">历史企业需补齐名称和统一社会信用代码后，才能充值、新建店铺或新增做账员。</p>
     </div>
-    <div v-else-if="!enterpriseState.loading" class="workflow-empty-stage"><strong>{{ canCreateEnterprise ? "先创建企业" : "暂无企业" }}</strong><p>创建企业后，可以在这里管理公司、企业钱包和一起做账的同事。</p><button v-if="canCreateEnterprise" class="primary-button compact" type="button" @click="creating = true">创建企业</button></div>
+    <div v-else-if="!enterpriseState.loading" class="workflow-empty-stage"><strong>{{ canCreateEnterprise ? "先创建企业" : "暂无企业" }}</strong><p>创建企业后，可以在这里管理店铺、企业钱包和一起做账的同事。</p><button v-if="canCreateEnterprise" class="primary-button compact" type="button" @click="creating = true">创建企业</button></div>
 
     <form v-if="creating || editing" class="enterprise-inline-form" @submit.prevent="saveEnterprise">
       <div class="form-grid three"><label class="form-field"><span>企业名称</span><input v-model.trim="name" maxlength="120" :readonly="editing && !currentEnterprise?.canEditName" /></label><label class="form-field"><span>统一社会信用代码</span><input v-model.trim="creditCode" maxlength="18" autocomplete="off" :readonly="editing && !currentEnterprise?.canEditCreditCode" /><small v-if="editing && !currentEnterprise?.canEditCreditCode">创建后仅管理员可修改</small></label><div class="form-actions"><button class="secondary-button" type="button" @click="creating = false; editing = false; resetProfileForm()">取消</button><button class="primary-button" type="submit" :disabled="busy">保存</button></div></div>

@@ -30,7 +30,7 @@ export function deriveNavigation(me: Me | null, hasEnterprise = true): Navigatio
   ];
   return [
     { id: "workspace", label: "工作台", marker: "台", description: "概览与当前进度", items: [{ label: "概览", marker: "览", to: "/workspace" }] },
-    { id: "sales-cost", label: "销售成本", marker: "成", description: "公司与做账入口", items: [{ label: "公司与做账", marker: "账", to: "/sales-cost" }] },
+    { id: "sales-cost", label: "销售成本", marker: "成", description: "店铺成本测算入口", items: [{ label: "店铺成本测算", marker: "账", to: "/sales-cost" }] },
     { id: "data-rules", label: "数据与规则", marker: "规", description: "做账参数与汇率", items: [{ label: "做账习惯", marker: "习", to: "/accounting-habits" }, { label: "外汇市场", marker: "汇", to: "/fx" }] },
     { id: "organization", label: "组织与账号", marker: "组", description: "企业、成员与账号", items: organizationItems },
     ...(admin ? [{ id: "platform", label: "平台管理", marker: "管", description: "平台治理与运营", items: [

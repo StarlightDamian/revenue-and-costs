@@ -142,7 +142,7 @@ function conversionResult(row: FxConversionRow): string {
     </AsyncState>
     <section v-if="isAdmin" class="surface-section fx-override-section" aria-labelledby="fx-override-title">
       <div class="section-heading split-heading"><div><h2 id="fx-override-title">人工授权汇率</h2><p>只用于补上官方没有公布的汇率。每次新增和修改都会保留来源、原因和时间，不会改变已经完成的计算或正式结果。</p></div><button class="secondary-button compact" type="button" :disabled="overrideState === 'loading'" @click="loadOverrides">刷新</button></div>
-      <div v-if="requestedSubject" class="warning-panel" data-tone="error" role="alert"><strong>当前计算缺少 {{ requestedSubject }}</strong><p>请依据授权来源新增覆盖该日期的汇率；保存后返回公司重新导入。</p><button class="primary-button compact" type="button" @click="openOverride()">新增该日期汇率</button></div>
+      <div v-if="requestedSubject" class="warning-panel" data-tone="error" role="alert"><strong>当前计算缺少 {{ requestedSubject }}</strong><p>请依据授权来源新增覆盖该日期的汇率；保存后返回店铺重新导入。</p><button class="primary-button compact" type="button" @click="openOverride()">新增该日期汇率</button></div>
       <p v-if="overrideMessage" class="form-success" role="status">{{ overrideMessage }}</p>
       <div v-if="overrideState === 'loading'" class="skeleton-stack" aria-busy="true"><div class="skeleton-line is-wide"></div><div class="skeleton-line"></div></div>
       <div v-else-if="overrideState === 'error'" class="state-panel state-error" role="alert"><strong>无法读取人工汇率</strong><p>{{ overrideListError }}</p><button class="secondary-button" type="button" @click="loadOverrides">重试</button></div>

@@ -101,6 +101,21 @@ describe("forward migration runner", () => {
         run_disposition_check: expect.stringContaining("OUT_OF_SCOPE"),
         snapshot_disposition_check: expect.stringContaining("OUT_OF_SCOPE"),
       });
+      const exportPeriodContract = await first.query<{ columns: string; period_check: string }>(
+        `SELECT
+           (SELECT count(*)::text FROM information_schema.columns
+             WHERE table_schema=current_schema() AND table_name='export_request'
+               AND column_name IN ('report_period_start','report_period_end')) columns,
+           (SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con
+             JOIN pg_class relation ON relation.oid=con.conrelid
+             JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+            WHERE namespace.nspname=current_schema() AND relation.relname='export_request'
+              AND con.conname='export_request_report_period_check') period_check`,
+      );
+      expect(exportPeriodContract.rows[0]).toMatchObject({
+        columns: "2",
+        period_check: expect.stringContaining("date_trunc"),
+      });
       const fulfillmentContract = await first.query<{ is_nullable: string; definition: string }>(
         `SELECT column_info.is_nullable,pg_get_constraintdef(con.oid) definition
            FROM information_schema.columns column_info

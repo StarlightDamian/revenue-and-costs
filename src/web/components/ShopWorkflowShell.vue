@@ -70,7 +70,7 @@ async function loadWorkflow(initial = false) {
     status.value = "ready";
   } catch (caught) {
     if (sequence !== workflowRequestSequence || requestedShopId !== shopId.value) return;
-    error.value = userFacingError(caught, "暂时无法读取公司流程，请检查网络后重试");
+    error.value = userFacingError(caught, "暂时无法读取店铺流程，请检查网络后重试");
     status.value = "error";
   } finally {
     if (sequence === workflowRequestSequence) workflowLoading = false;
@@ -153,9 +153,9 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
   <div class="workflow-shell">
     <header class="workflow-topbar">
       <div class="workflow-brand">
-        <RouterLink class="workflow-brand-home" to="/sales-cost" aria-label="返回公司列表"><img :src="logoUrl" alt="跨境电商服务中心" /></RouterLink>
+        <RouterLink class="workflow-brand-home" to="/sales-cost" aria-label="返回店铺列表"><img :src="logoUrl" alt="跨境电商服务中心" /></RouterLink>
         <span>
-          <strong>{{ workflow?.shop.name || "公司工作台" }}</strong>
+          <strong>{{ workflow?.shop.name || "店铺工作台" }}</strong>
           <button
             class="workflow-diagnostic-id"
             type="button"
@@ -178,7 +178,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
         </span>
       </div>
 
-      <nav class="workflow-steps workflow-phases" aria-label="公司数据处理阶段">
+      <nav class="workflow-steps workflow-phases" aria-label="店铺数据处理阶段">
         <template v-for="(phase, index) in phases" :key="phase.key">
           <RouterLink
             v-if="phase.clickable && phase.target"
@@ -232,7 +232,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
     <p v-if="downloadError" class="workflow-global-error" role="alert">{{ downloadError }}</p>
     <WorkflowBlockerDialog :blocker="visibleBlocker" @dismiss="dismissBlocker" />
     <main class="workflow-content">
-      <AsyncState :status="status" :error="error" empty-title="无法读取公司" empty-message="请返回公司列表重试。" @retry="loadWorkflow(true)">
+      <AsyncState :status="status" :error="error" empty-title="无法读取店铺" empty-message="请返回店铺列表重试。" @retry="loadWorkflow(true)">
         <RouterView :workflow="workflow" @workflow-change="loadWorkflow" />
       </AsyncState>
     </main>

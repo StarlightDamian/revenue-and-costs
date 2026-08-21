@@ -52,6 +52,7 @@ describe("compressed upload chunks", () => {
         expect.stringContaining("INSERT INTO upload_chunk_receipt"),
         expect.arrayContaining([raw.length]),
       );
+      expect(query.mock.calls.some(([sql]) => String(sql).includes("upload.finalize"))).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
