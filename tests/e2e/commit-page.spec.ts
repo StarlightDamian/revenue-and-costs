@@ -6,6 +6,48 @@ const shopId = "10000000-0000-4000-8000-000000000009";
 const batchId = "20000000-0000-4000-8000-000000000009";
 const enterpriseId = "60000000-0000-4000-8000-000000000009";
 
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function storedZip(name: string, content: string): Buffer {
+  const nameBytes = Buffer.from(name, "utf8");
+  const contentBytes = Buffer.from(content, "utf8");
+  const checksum = crc32(contentBytes);
+  const local = Buffer.alloc(30 + nameBytes.length + contentBytes.length);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(0x0800, 6);
+  local.writeUInt32LE(checksum, 14);
+  local.writeUInt32LE(contentBytes.length, 18);
+  local.writeUInt32LE(contentBytes.length, 22);
+  local.writeUInt16LE(nameBytes.length, 26);
+  nameBytes.copy(local, 30);
+  contentBytes.copy(local, 30 + nameBytes.length);
+  const central = Buffer.alloc(46 + nameBytes.length);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(0x0800, 8);
+  central.writeUInt32LE(checksum, 16);
+  central.writeUInt32LE(contentBytes.length, 20);
+  central.writeUInt32LE(contentBytes.length, 24);
+  central.writeUInt16LE(nameBytes.length, 28);
+  nameBytes.copy(central, 46);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length, 12);
+  end.writeUInt32LE(local.length, 16);
+  return Buffer.concat([local, central, end]);
+}
+
 const me = {
   id: "50000000-0000-4000-8000-000000000001",
   phoneMasked: "138****0000",
@@ -40,10 +82,12 @@ const preview = {
 };
 
 const completeness = [
-  { sliceId: "slice-sa", datasetVersionId: "version-sa", marketplace: "SA", month: "2025-09", state: "MISSING_SHIPMENT", missingReports: ["TRANSACTION", "SHIPMENT"] },
-  { sliceId: "slice-be", datasetVersionId: "version-be", marketplace: "BE", month: "2025-10", state: "MISSING_TRANSACTION", missingReports: ["TRANSACTION"] },
-  { sliceId: "slice-us", datasetVersionId: "version-us", marketplace: "US", month: "2025-10", state: "COMPLETE", missingReports: [] },
-  { sliceId: "slice-ae", datasetVersionId: "version-ae", marketplace: "AE", month: "2025-11", state: "MISSING_SHIPMENT", missingReports: ["SHIPMENT"] },
+  { sliceId: "slice-sa", datasetVersionId: "version-sa", marketplace: "SA", month: "2025-09", state: "MISSING_SHIPMENT", missingReports: ["TRANSACTION", "SHIPMENT"], transactionSourceCount: "0", shipmentSourceCount: "0" },
+  { sliceId: "slice-be", datasetVersionId: "version-be", marketplace: "BE", month: "2025-10", state: "MISSING_TRANSACTION", missingReports: ["TRANSACTION"], transactionSourceCount: "0", shipmentSourceCount: "1" },
+  { sliceId: "slice-ca", datasetVersionId: "version-ca", marketplace: "CA", month: "2025-10", state: "COMPLETE", missingReports: [], transactionSourceCount: "0", shipmentSourceCount: "1" },
+  { sliceId: "slice-mx", datasetVersionId: "version-mx", marketplace: "MX", month: "2025-10", state: "COMPLETE", missingReports: [], transactionSourceCount: "1", shipmentSourceCount: "0" },
+  { sliceId: "slice-us", datasetVersionId: "version-us", marketplace: "US", month: "2025-10", state: "COMPLETE", missingReports: [], transactionSourceCount: "1", shipmentSourceCount: "1" },
+  { sliceId: "slice-ae", datasetVersionId: "version-ae", marketplace: "AE", month: "2025-11", state: "MISSING_SHIPMENT", missingReports: ["SHIPMENT"], transactionSourceCount: "1", shipmentSourceCount: "0" },
 ];
 
 test("资料准备页用白话说明缺少的资料和处理方法", async ({ page }, testInfo) => {
@@ -112,6 +156,15 @@ test("资料准备页用白话说明缺少的资料和处理方法", async ({ pa
   await expect(page.locator(".workflow-commit-panel > .commit-coverage-table table")).toHaveCount(1);
   await expect(page.locator("details.preflight-detail")).not.toHaveAttribute("open", "");
   await page.locator("details.preflight-detail").click();
+  await expect(page.getByRole("group", { name: "资料明细查看维度" })).toBeVisible();
+  await page.getByRole("button", { name: "按站点和月份" }).click();
+  const coverageMatrix = page.getByRole("region", { name: "按站点和月份查看资料" });
+  await expect(coverageMatrix.locator("tbody tr")).toHaveCount(6);
+  await expect(coverageMatrix.locator("tbody tr td:first-child")).toHaveText(["AE", "BE", "CA", "MX", "SA", "US"]);
+  await expect(coverageMatrix.locator("tbody tr").filter({ hasText: "SA" }).locator(".status-chip")).toHaveText(["缺失", "缺失"]);
+  await expect(coverageMatrix.locator("tbody tr").filter({ hasText: "CA" }).locator(".status-chip")).toHaveText(["无需补充", "已收到"]);
+  await expect(coverageMatrix.locator("tbody tr").filter({ hasText: "MX" }).locator(".status-chip")).toHaveText(["已收到", "无需补充"]);
+  await page.getByRole("button", { name: "按文件查看" }).click();
   await expect(page.getByRole("cell", { name: "交易报告", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "配送货件", exact: true })).toBeVisible();
   await expect(page.locator('.file-kind-chip[data-kind="TRANSACTION"]')).toHaveText("交易报告");
@@ -185,24 +238,44 @@ test("资料可核算时不展示月份行，并给出来源覆盖反馈", async
   await expect(completeState.getByText("配送货件或纯 FMB 交易资料已覆盖当前站点和月份，可以继续核算。", { exact: true })).toBeVisible();
 });
 
-test("上传前可连续追加、单选或全选移除文件，并以最后一次选择解决同路径冲突", async ({ page }, testInfo) => {
+test("文件可连续追加、上传后单选或全选删除，并支持普通 ZIP", async ({ page }, testInfo) => {
   let uploadBatchRequests = 0;
   let completeUploadRequests = 0;
   let uploadedPaths: string[] = [];
-  let uploadedPeriod: { periodStart?: string; periodEnd?: string } = {};
+  let remainingUploadedFiles = 4;
+  const removedFileSelections: string[][] = [];
+  const removedStagedFileIds = new Set<string>();
+  const genuinelyFailedPaths = new Set<string>();
   let failNextChunk = true;
+  let exposeStagedManifest = false;
   let restoredPreviewRequests = 0;
   let releaseRestoredPreview!: () => void;
   const restoredPreviewGate = new Promise<void>((resolveGate) => { releaseRestoredPreview = resolveGate; });
   const restoredPreview = { id: batchId, periodStart: "2026-04", periodEnd: "2026-06", status: "READY", progress: "100", stage: "PREFLIGHT_READY", failureCode: null, files: [], ignored: [], issues: [], affectedVersions: [] };
-  const currentRestoredPreview = () => completeUploadRequests === 1 ? {
+  const currentRestoredPreview = () => exposeStagedManifest ? {
     ...restoredPreview,
     status: "RUNNING",
     progress: "0",
     stage: "UPLOAD",
     uploadBatchId: batchId,
     uploadReady: true,
-  } : restoredPreview;
+    stagedUploadFiles: uploadedPaths
+      .map((relativePath, index) => ({ id: `file-${index}`, relativePath }))
+      .filter((file) => !removedStagedFileIds.has(file.id))
+      .map((file) => ({
+        ...file,
+        bytes: "1",
+        status: genuinelyFailedPaths.has(file.relativePath) ? "FAILED" : "COMPLETE",
+        metadataOnly: false,
+      })),
+  } : completeUploadRequests === 1 ? {
+      ...restoredPreview,
+      status: "RUNNING",
+      progress: "0",
+      stage: "UPLOAD",
+      uploadBatchId: batchId,
+      uploadReady: true,
+    } : restoredPreview;
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
   await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{
     id: shopId, enterpriseId, createdByAccountId: me.id, lastOperatedByAccountId: me.id,
@@ -224,10 +297,11 @@ test("上传前可连续追加、单选或全选移除文件，并以最后一�
     }
     const payload = route.request().postDataJSON() as { periodStart?: string; periodEnd?: string; files?: Array<{ relativePath: string }> };
     uploadedPaths = (payload.files ?? []).map((file) => file.relativePath);
-    uploadedPeriod = {
-      ...(payload.periodStart ? { periodStart: payload.periodStart } : {}),
-      ...(payload.periodEnd ? { periodEnd: payload.periodEnd } : {}),
-    };
+    expect(payload.periodStart).toBeUndefined();
+    expect(payload.periodEnd).toBeUndefined();
+    remainingUploadedFiles = uploadedPaths.length;
+    removedStagedFileIds.clear();
+    genuinelyFailedPaths.clear();
     return route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({
       id: batchId,
       files: (payload.files ?? []).map((file, index) => ({ id: `file-${index}`, relativePath: file.relativePath, offset: "0" })),
@@ -259,6 +333,17 @@ test("上传前可连续追加、单选或全选移除文件，并以最后一�
       body: JSON.stringify({ id: batchId, status: "QUEUED" }),
     });
   });
+  await page.route(`**/api/v1/uploads/batches/${batchId}/remove-files`, (route) => {
+    const payload = route.request().postDataJSON() as { fileIds: string[] };
+    removedFileSelections.push(payload.fileIds);
+    payload.fileIds.forEach((fileId) => removedStagedFileIds.add(fileId));
+    remainingUploadedFiles -= payload.fileIds.length;
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      removedCount: payload.fileIds.length,
+      remainingCount: remainingUploadedFiles,
+      cancelled: remainingUploadedFiles === 0,
+    }) });
+  });
   await page.route(`**/api/v1/imports/shops/${shopId}/batches/${batchId}`, async (route) => {
     restoredPreviewRequests += 1;
     if (restoredPreviewRequests === 1) await restoredPreviewGate;
@@ -287,9 +372,22 @@ test("上传前可连续追加、单选或全选移除文件，并以最后一�
   await folderInput.focus();
   await expect(folderInput.locator("..")).toHaveCSS("outline-style", "solid");
   await expect(page.getByRole("heading", { name: "本次资料" })).toBeVisible();
-  await expect(page.getByRole("group", { name: "本次核算月份（必选）" })).toContainText("系统只检查并计算这个范围");
-  await expect(page.getByLabel("开始月份")).toHaveValue("2026-04");
-  await expect(page.getByLabel("结束月份")).toHaveValue("2026-06");
+  await expect(page.getByRole("group", { name: "本次核算月份（必选）" })).toHaveCount(0);
+
+  const draggedZipBase64 = storedZip("DE/shipment.csv", "date,amount\n2026-04-01,1\n").toString("base64");
+  await page.getByRole("region", { name: "拖放文件夹或文件" }).evaluate((element, base64) => {
+    const binary = atob(base64);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([bytes], "dragged-reports.zip", { type: "application/zip" }));
+    element.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  }, draggedZipBase64);
+  const draggedZipManifest = page.getByRole("region", { name: "待上传文件" });
+  await expect(draggedZipManifest).toContainText("dragged-reports.zip");
+  await draggedZipManifest.getByRole("checkbox", { name: "全选待上传文件" }).check();
+  await draggedZipManifest.getByRole("button", { name: "移除已选文件" }).click();
+  await expect(page.getByRole("region", { name: "待上传文件" })).toHaveCount(0);
+  expect(uploadBatchRequests).toBe(0);
 
   await folderInput.setInputFiles(usFolder);
 
@@ -373,8 +471,55 @@ test("上传前可连续追加、单选或全选移除文件，并以最后一�
   await expect(folderInput).toBeDisabled();
   await expect(fileInput).toBeDisabled();
   expect([...uploadedPaths].sort()).toEqual(["US/transaction.csv", "DE/transaction.csv", "DE/shipment.csv", "notes.pdf"].sort());
-  expect(uploadedPeriod).toEqual({ periodStart: "2026-04", periodEnd: "2026-06" });
   await page.getByRole("button", { name: "继续上传" }).click();
+  await expect.poll(() => completeUploadRequests).toBe(0);
+  const uploadedManifest = page.getByRole("region", { name: "已上传文件" });
+  await expect(uploadedManifest.getByRole("checkbox", { name: "全选已上传文件" })).toBeVisible();
+  await uploadedManifest.getByRole("checkbox", { name: "选择已上传文件 US/transaction.csv" }).check();
+  await uploadedManifest.getByRole("button", { name: "删除已选文件" }).click();
+  await expect.poll(() => removedFileSelections).toEqual([["file-2"]]);
+  await expect(uploadedManifest).not.toContainText("US/transaction.csv");
+  await uploadedManifest.getByRole("checkbox", { name: "全选已上传文件" }).check();
+  await expect(uploadedManifest.locator(".file-manifest-selected-count")).toHaveText("已选 3 个");
+  await uploadedManifest.getByRole("button", { name: "删除已选文件" }).click();
+  await expect.poll(() => removedFileSelections).toHaveLength(2);
+  expect(removedFileSelections[1]).toEqual(["file-0", "file-1", "file-3"]);
+  await expect(page.getByRole("region", { name: "已上传文件" })).toHaveCount(0);
+  await expect(fileInput).toBeEnabled();
+
+  await fileInput.setInputFiles([
+    { name: "reports.zip", mimeType: "application/x-zip-compressed", buffer: storedZip("US/transaction.csv", "date,amount\n2026-04-01,1\n") },
+    { name: "keep.csv", mimeType: "text/csv", buffer: Buffer.from("date,amount\n2026-04-01,2\n") },
+    { name: "retry.csv", mimeType: "text/csv", buffer: Buffer.from("date,amount\n2026-04-01,3\n") },
+  ]);
+  const zipManifest = page.getByRole("region", { name: "待上传文件" });
+  await expect(zipManifest).toContainText("reports.zip");
+  await expect(page.locator('input[type="file"]:not([webkitdirectory])')).toHaveAttribute("accept", /application\/x-zip-compressed/u);
+  await page.getByRole("button", { name: "开始上传" }).click();
+  await expect.poll(() => uploadBatchRequests).toBe(3);
+  await expect(page.getByRole("region", { name: "已上传文件" })).toContainText("reports.zip");
+  genuinelyFailedPaths.add("retry.csv");
+  exposeStagedManifest = true;
+  await page.reload();
+  const restoredManifest = page.getByRole("region", { name: "已上传文件" });
+  await expect(page.getByText("已恢复服务器上的暂存文件", { exact: false })).toBeVisible();
+  await expect(restoredManifest).toContainText("reports.zip");
+  await expect(restoredManifest).toContainText("keep.csv");
+  await expect(restoredManifest).toContainText("retry.csv");
+  await expect(restoredManifest.getByText("失败", { exact: true })).toBeVisible();
+  await restoredManifest.getByRole("checkbox", { name: "选择已上传文件 reports.zip" }).check();
+  await restoredManifest.getByRole("button", { name: "删除已选文件" }).click();
+  await expect.poll(() => removedFileSelections).toHaveLength(3);
+  expect(removedFileSelections[2]).toEqual(["file-1"]);
+  await expect(restoredManifest).not.toContainText("reports.zip");
+  await page.reload();
+  const restoredAfterRemoval = page.getByRole("region", { name: "已上传文件" });
+  await expect(restoredAfterRemoval).not.toContainText("reports.zip");
+  await expect(restoredAfterRemoval).toContainText("keep.csv");
+  await expect(restoredAfterRemoval).toContainText("retry.csv");
+  await expect(restoredAfterRemoval.getByText("失败", { exact: true })).toBeVisible();
+  exposeStagedManifest = false;
+  await page.getByRole("button", { name: "确认文件并开始检查" }).click();
   await expect.poll(() => completeUploadRequests).toBe(1);
   await expect(page.getByRole("alert")).toContainText("文件已经上传");
   await expect(page.getByRole("alert")).not.toContainText("temporary unavailable");
@@ -383,5 +528,5 @@ test("上传前可连续追加、单选或全选移除文件，并以最后一�
   await page.getByRole("button", { name: "重新检查已上传文件" }).click();
   await expect.poll(() => completeUploadRequests).toBe(2);
   await expect(page.getByRole("heading", { name: "本次资料" })).toBeVisible();
-  expect(uploadBatchRequests).toBe(2);
+  expect(uploadBatchRequests).toBe(3);
 });

@@ -10,7 +10,12 @@ describe("single-role navigation", () => {
   it("keeps customer relationships independent from the accountant platform role", () => {
     const account = me(["ACCOUNTANT"], 2);
     expect(hasPlatformRole(account, "ACCOUNTANT")).toBe(true);
-    expect(deriveNavigation(account, true).map((group) => group.label)).toEqual(["工作台", "销售成本", "数据与规则", "组织与账号"]);
+    const groups = deriveNavigation(account, true);
+    expect(groups.map((group) => group.label)).toEqual(["工作台", "销售成本", "数据与规则", "组织与账号"]);
+    expect(groups.find((group) => group.id === "sales-cost")).toMatchObject({
+      description: "店铺成本测算入口",
+      items: [{ label: "店铺成本测算", marker: "账", to: "/sales-cost" }],
+    });
   });
 
   it("gives administrators sales, FX, and governance navigation without user billing features", () => {

@@ -188,7 +188,7 @@ export class MembershipService {
     readonly requestId: string;
   }): Promise<CustomerMembership> {
     if (input.actor.status !== 'ACTIVE') {
-      throw new AppError('ACCOUNT_ROLE_CONFLICT', '只有有效账号可以激活公司客户授权', 409);
+      throw new AppError('ACCOUNT_ROLE_CONFLICT', '只有有效账号可以激活店铺客户授权', 409);
     }
     const result = await this.transactions.transaction(async (client) => {
       const invitation = await client.query<{
@@ -470,7 +470,7 @@ export class MembershipService {
     const invitee = account.rows[0];
     if (!invitee) return 'PENDING';
     if (invitee.status !== 'ACTIVE') {
-      throw new AppError('ACCOUNT_DISABLED', '该账号已停用，无法授权公司', 409);
+      throw new AppError('ACCOUNT_DISABLED', '该账号已停用，无法授权店铺', 409);
     }
     if (!invitee.role) {
       throw new AppError('ACCOUNT_ROLE_CONFLICT', '该手机号尚未完成平台注册，暂不能激活客户授权', 409);

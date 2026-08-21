@@ -24,6 +24,12 @@ import {
 import type { EncryptedObjectStore } from "../storage/encrypted-object-store.js";
 import { decimal, decimal8 } from "../../shared/decimal.js";
 import {
+  accountingPeriodStartDate,
+  parseAccountingPeriodScope,
+  type AccountingPeriodInput,
+  type AccountingPeriodScope,
+} from "../../shared/accounting-period.js";
+import {
   assertExportCapacityAvailable,
   estimateExportArtifactBytes,
   exportReport,
@@ -33,7 +39,7 @@ import {
 import { rowsFromArray, type ColumnDefinition, type ReportExportInput, type ReportRow, type ReportSection } from "./report-types.js";
 
 const SUMMARY_COLUMNS: ColumnDefinition[] = [
-  {key:"shop",header:"公司",width:28,kind:"text",maxBytes:512},{key:"period",header:"日期",width:16,kind:"text",maxBytes:24},
+  {key:"shop",header:"店铺",width:28,kind:"text",maxBytes:512},{key:"period",header:"日期",width:16,kind:"text",maxBytes:24},
   {key:"platform",header:"平台",width:12,kind:"text",maxBytes:32},{key:"marketplace",header:"站点",width:12,kind:"text",maxBytes:512},
   {key:"currency",header:"原币币种",width:12,kind:"text",maxBytes:3},
   {key:"incomeOriginal",header:"收入总额-原币",width:16,kind:"decimal"},{key:"incomeCny",header:"收入总额-人民币",width:16,kind:"decimal"},
@@ -133,12 +139,16 @@ export interface ExportAssumptionInput {
   readonly continentPrefixes?: readonly string[];
 }
 
+export interface ExportRequestInput extends ExportAssumptionInput, AccountingPeriodInput {}
+
 interface ExportIdentity {
   readonly shopId: string;
   readonly snapshotId: string;
   readonly profitRate?: string | null;
   readonly minimumSalesCostRate?: string | null;
   readonly continentPrefixes?: readonly string[];
+  readonly periodStart?: string | null;
+  readonly periodEnd?: string | null;
 }
 
 export interface CostAccountingPreviewRow extends CostAccountingResult {
@@ -151,6 +161,8 @@ export interface CostAccountingPreviewRow extends CostAccountingResult {
 export interface CostAccountingPreview {
   readonly snapshotId: string;
   readonly year: string;
+  readonly periodStart?: string;
+  readonly periodEnd?: string;
   readonly assumptions: AccountingAssumptions;
   readonly rows: readonly CostAccountingPreviewRow[];
   readonly total: Omit<CostAccountingPreviewRow, "period">;
@@ -166,6 +178,8 @@ export function assertExportIdempotencyMatch(
     || (prior.profitRate ?? null) !== (requested.profitRate ?? null)
     || (prior.minimumSalesCostRate ?? null) !== (requested.minimumSalesCostRate ?? null)
     || (prior.continentPrefixes ?? []).join(",") !== (requested.continentPrefixes ?? []).join(",")
+    || (prior.periodStart ?? null) !== (requested.periodStart ?? null)
+    || (prior.periodEnd ?? null) !== (requested.periodEnd ?? null)
   ) {
     throw new Error("IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_EXPORT");
   }
@@ -212,7 +226,7 @@ function systemExportRequestId(exportId: string): string {
 }
 
 export function exportDownloadFileName(shopName: string, outputKind: string): string {
-  const safeName = shopName.normalize("NFKC").replaceAll(/[<>:"/\\|?*\p{Cc}]/gu, "_").trim().slice(0, 100) || "未命名公司";
+  const safeName = shopName.normalize("NFKC").replaceAll(/[<>:"/\\|?*\p{Cc}]/gu, "_").trim().slice(0, 100) || "未命名店铺";
   return `销售成本表-${safeName}.${outputKind === "ZIP" ? "zip" : "xlsx"}`;
 }
 
@@ -490,19 +504,20 @@ export class PostgresExportService {
     snapshotId: string,
     idempotencyKey: string,
     requestId: string,
-    assumptionInput: ExportAssumptionInput = {},
+    requestInput: ExportRequestInput = {},
   ) {
     try {
       return await withTransaction(this.pool,async(client)=>{
         const access=await this.authorizeCreate(client,actor,shopId);
         const customerBinding=this.usesCustomerMembership(actor,access);
-        const assumptions = await this.resolveAccountingAssumptions(actor.accountId, assumptionInput, client);
+        const assumptions = await this.resolveAccountingAssumptions(actor.accountId, requestInput, client);
+        const reportPeriod = parseAccountingPeriodScope(requestInput);
         const snap=await client.query("SELECT id FROM published_snapshot WHERE id=$1 AND shop_id=$2",[snapshotId,shopId]);
         if(!snap.rows[0]) throw new Error("SNAPSHOT_NOT_FOUND");
         const businessKey=`${actor.accountId}:${REPORT_EXPORT_FORMAT}:${idempotencyKey}`;
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended('export.create:' || $1,0))",[businessKey]);
-        const prior=await client.query<{id:string;shop_id:string;published_snapshot_id:string;status:string;output_kind:string|null;format_version:string;created_at:Date;profit_rate:string|null;minimum_sales_cost_rate:string|null;continent_prefixes:string[];stage:ExportProgressStage;progress_percent:number;processed_rows:string;total_rows:string|null;heartbeat_at:Date|null}>(
-          "SELECT id,shop_id,published_snapshot_id,status,output_kind,format_version,created_at,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at FROM export_request WHERE business_key=$1",
+        const prior=await client.query<{id:string;shop_id:string;published_snapshot_id:string;status:string;output_kind:string|null;format_version:string;created_at:Date;profit_rate:string|null;minimum_sales_cost_rate:string|null;continent_prefixes:string[];period_start:string|null;period_end:string|null;stage:ExportProgressStage;progress_percent:number;processed_rows:string;total_rows:string|null;heartbeat_at:Date|null}>(
+          "SELECT id,shop_id,published_snapshot_id,status,output_kind,format_version,created_at,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,to_char(report_period_start,'YYYY-MM') period_start,to_char(report_period_end,'YYYY-MM') period_end,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at FROM export_request WHERE business_key=$1",
           [businessKey],
         );
         let row=prior.rows[0];
@@ -512,15 +527,15 @@ export class PostgresExportService {
             throw new AppError("EXPORT_FORMAT_IDEMPOTENCY_CONFLICT", "该幂等键属于旧版导出，请重新发起当前版本下载", 409);
           }
           assertExportIdempotencyMatch(
-            {shopId:row.shop_id,snapshotId:row.published_snapshot_id,profitRate:row.profit_rate,minimumSalesCostRate:row.minimum_sales_cost_rate,continentPrefixes:row.continent_prefixes},
-            {shopId,snapshotId,...assumptions},
+            {shopId:row.shop_id,snapshotId:row.published_snapshot_id,profitRate:row.profit_rate,minimumSalesCostRate:row.minimum_sales_cost_rate,continentPrefixes:row.continent_prefixes,periodStart:row.period_start,periodEnd:row.period_end},
+            {shopId,snapshotId,...assumptions,...(reportPeriod ?? {})},
           );
         }else{
-          row=(await client.query<{id:string;shop_id:string;published_snapshot_id:string;status:string;output_kind:string|null;format_version:string;created_at:Date;profit_rate:string|null;minimum_sales_cost_rate:string|null;continent_prefixes:string[];stage:ExportProgressStage;progress_percent:number;processed_rows:string;total_rows:string|null;heartbeat_at:Date|null}>(
-            `INSERT INTO export_request(shop_id,requested_by,published_snapshot_id,membership_authorization_version,status,business_key,format_version,profit_rate,minimum_sales_cost_rate,continent_prefixes,expires_at)
-             VALUES($1,$2,$3,$4,'QUEUED',$5,$6,$7::numeric,$8::numeric,$9::text[],clock_timestamp()+interval '7 days')
-             RETURNING id,shop_id,published_snapshot_id,status,output_kind,format_version,created_at,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at`,
-            [shopId,actor.accountId,snapshotId,customerBinding?access.authorization_epoch:null,businessKey,REPORT_EXPORT_FORMAT,assumptions.profitRate,assumptions.minimumSalesCostRate,assumptions.continentPrefixes],
+          row=(await client.query<{id:string;shop_id:string;published_snapshot_id:string;status:string;output_kind:string|null;format_version:string;created_at:Date;profit_rate:string|null;minimum_sales_cost_rate:string|null;continent_prefixes:string[];period_start:string|null;period_end:string|null;stage:ExportProgressStage;progress_percent:number;processed_rows:string;total_rows:string|null;heartbeat_at:Date|null}>(
+            `INSERT INTO export_request(shop_id,requested_by,published_snapshot_id,membership_authorization_version,status,business_key,format_version,profit_rate,minimum_sales_cost_rate,continent_prefixes,report_period_start,report_period_end,expires_at)
+             VALUES($1,$2,$3,$4,'QUEUED',$5,$6,$7::numeric,$8::numeric,$9::text[],$10::date,$11::date,clock_timestamp()+interval '7 days')
+             RETURNING id,shop_id,published_snapshot_id,status,output_kind,format_version,created_at,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,to_char(report_period_start,'YYYY-MM') period_start,to_char(report_period_end,'YYYY-MM') period_end,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at`,
+            [shopId,actor.accountId,snapshotId,customerBinding?access.authorization_epoch:null,businessKey,REPORT_EXPORT_FORMAT,assumptions.profitRate,assumptions.minimumSalesCostRate,assumptions.continentPrefixes,reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null,reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null],
           )).rows[0];
         }
         if(!row) throw new Error("EXPORT_CREATE_FAILED");
@@ -535,9 +550,9 @@ export class PostgresExportService {
           reason: null,
           requestId,
           before: null,
-          after: { shopId, snapshotId, status: row.status, formatVersion: REPORT_EXPORT_FORMAT, ...assumptions },
+          after: { shopId, snapshotId, status: row.status, formatVersion: REPORT_EXPORT_FORMAT, ...assumptions, ...(reportPeriod ?? {}) },
         });
-        return {id:row.id,shopId:row.shop_id,snapshotId:row.published_snapshot_id,status:row.status,...exportProgressProjection(row),format:row.output_kind??'XLSX',isCurrentFormat:row.format_version===REPORT_EXPORT_FORMAT,createdAt:row.created_at.toISOString(),...assumptions};
+        return {id:row.id,shopId:row.shop_id,snapshotId:row.published_snapshot_id,status:row.status,...exportProgressProjection(row),format:row.output_kind??'XLSX',isCurrentFormat:row.format_version===REPORT_EXPORT_FORMAT,createdAt:row.created_at.toISOString(),...assumptions,...(reportPeriod ?? {})};
       });
     } catch (error) {
       await this.auditFailure(actor, "published_snapshot", snapshotId, "EXPORT_CREATE_FAILED", requestId, { shopId });
@@ -549,18 +564,19 @@ export class PostgresExportService {
     shopId: string,
     idempotencyKey: string,
     requestId: string,
-    assumptionInput: ExportAssumptionInput = {},
+    requestInput: ExportRequestInput = {},
   ) {
     const startedAt = Date.now();
     try {
       const access = await this.authorize(actor, shopId);
-      const assumptions = await this.resolveAccountingAssumptions(actor.accountId, assumptionInput);
+      const assumptions = await this.resolveAccountingAssumptions(actor.accountId, requestInput);
+      const reportPeriod = parseAccountingPeriodScope(requestInput);
       const pointer = await this.pool.query<{ published_snapshot_id: string }>(
         "SELECT published_snapshot_id FROM shop_current_published_snapshot WHERE shop_id=$1",
         [shopId],
       );
       const snapshotId = pointer.rows[0]?.published_snapshot_id;
-      if (!snapshotId) throw new AppError("PUBLISHED_SNAPSHOT_NOT_FOUND", "当前公司还没有可导出的正式结果", 409);
+      if (!snapshotId) throw new AppError("PUBLISHED_SNAPSHOT_NOT_FOUND", "当前店铺还没有可导出的正式结果", 409);
       structuredLog("info", "api", "export_current_snapshot_resolved", { durationMs: Date.now() - startedAt });
       const reusable = await this.pool.query<{
         id: string; shop_id: string; published_snapshot_id: string; status: string;
@@ -568,11 +584,13 @@ export class PostgresExportService {
         membership_authorization_version: string | null;
         profit_rate: string | null; minimum_sales_cost_rate: string | null;
         continent_prefixes: string[];
+        period_start: string | null; period_end: string | null;
         stage: ExportProgressStage; progress_percent: number; processed_rows: string;
         total_rows: string | null; heartbeat_at: Date | null;
       }>(
         `SELECT id,shop_id,published_snapshot_id,status,output_kind,created_at,requested_by,
                 membership_authorization_version::text,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,
+                to_char(report_period_start,'YYYY-MM') period_start,to_char(report_period_end,'YYYY-MM') period_end,
                 stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at
            FROM export_request
           WHERE shop_id=$1 AND requested_by=$2 AND published_snapshot_id=$3
@@ -580,11 +598,13 @@ export class PostgresExportService {
             AND profit_rate IS NOT DISTINCT FROM $5::numeric
             AND minimum_sales_cost_rate IS NOT DISTINCT FROM $6::numeric
             AND continent_prefixes=$7::text[]
+            AND report_period_start IS NOT DISTINCT FROM $8::date
+            AND report_period_end IS NOT DISTINCT FROM $9::date
             AND expires_at>clock_timestamp()
             AND (status IN ('QUEUED','RUNNING') OR (status='SUCCEEDED' AND output_object_id IS NOT NULL))
           ORDER BY CASE status WHEN 'SUCCEEDED' THEN 0 WHEN 'RUNNING' THEN 1 ELSE 2 END,created_at DESC
           LIMIT 1`,
-        [shopId, actor.accountId, snapshotId, REPORT_EXPORT_FORMAT, assumptions.profitRate, assumptions.minimumSalesCostRate, assumptions.continentPrefixes],
+        [shopId, actor.accountId, snapshotId, REPORT_EXPORT_FORMAT, assumptions.profitRate, assumptions.minimumSalesCostRate, assumptions.continentPrefixes, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null],
       );
       const existing = reusable.rows[0];
       if (existing) {
@@ -603,9 +623,10 @@ export class PostgresExportService {
           isCurrentFormat: true,
           createdAt: existing.created_at.toISOString(),
           ...assumptions,
+          ...(reportPeriod ?? {}),
         };
       }
-      const result = await this.create(actor, shopId, snapshotId, idempotencyKey, requestId, assumptions);
+      const result = await this.create(actor, shopId, snapshotId, idempotencyKey, requestId, { ...assumptions, ...(reportPeriod ?? {}) });
       structuredLog("info", "api", "export_current_created", { replayStatus: result.status, durationMs: Date.now() - startedAt });
       return result;
     } catch (error) {
@@ -613,45 +634,56 @@ export class PostgresExportService {
       throw error;
     }
   }
-  async list(actor:Actor,shopId:string){ await this.authorize(actor,shopId); const result=await this.pool.query<{id:string;published_snapshot_id:string;status:string;output_kind:string|null;format_version:string;created_at:Date;error_code:string|null;profit_rate:string|null;minimum_sales_cost_rate:string|null;continent_prefixes:string[];stage:ExportProgressStage;progress_percent:number;processed_rows:string;total_rows:string|null;heartbeat_at:Date|null}>("SELECT id,published_snapshot_id,status,output_kind,format_version,created_at,error_code,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at FROM export_request WHERE shop_id=$1 AND requested_by=$2 ORDER BY created_at DESC LIMIT 100",[shopId,actor.accountId]); return result.rows.map(row=>({id:row.id,shopId,snapshotId:row.published_snapshot_id,status:row.status,...exportProgressProjection(row),format:row.output_kind??'XLSX',isCurrentFormat:row.format_version===REPORT_EXPORT_FORMAT,createdAt:row.created_at.toISOString(),profitRate:row.profit_rate,minimumSalesCostRate:row.minimum_sales_cost_rate,continentPrefixes:row.continent_prefixes,...(row.error_code?{error:safeExportFailureCode(row.error_code)}:{})})); }
+  async list(actor:Actor,shopId:string){ await this.authorize(actor,shopId); const result=await this.pool.query<{id:string;published_snapshot_id:string;status:string;output_kind:string|null;format_version:string;created_at:Date;error_code:string|null;profit_rate:string|null;minimum_sales_cost_rate:string|null;continent_prefixes:string[];period_start:string|null;period_end:string|null;stage:ExportProgressStage;progress_percent:number;processed_rows:string;total_rows:string|null;heartbeat_at:Date|null}>("SELECT id,published_snapshot_id,status,output_kind,format_version,created_at,error_code,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,to_char(report_period_start,'YYYY-MM') period_start,to_char(report_period_end,'YYYY-MM') period_end,stage,progress_percent,processed_rows::text,total_rows::text,heartbeat_at FROM export_request WHERE shop_id=$1 AND requested_by=$2 ORDER BY created_at DESC LIMIT 100",[shopId,actor.accountId]); return result.rows.map(row=>({id:row.id,shopId,snapshotId:row.published_snapshot_id,status:row.status,...exportProgressProjection(row),format:row.output_kind??'XLSX',isCurrentFormat:row.format_version===REPORT_EXPORT_FORMAT,createdAt:row.created_at.toISOString(),profitRate:row.profit_rate,minimumSalesCostRate:row.minimum_sales_cost_rate,continentPrefixes:row.continent_prefixes,...(row.period_start&&row.period_end?{periodStart:row.period_start,periodEnd:row.period_end}:{}),...(row.error_code?{error:safeExportFailureCode(row.error_code)}:{})})); }
 
   async previewCostAccounting(
     actor: Actor,
     shopId: string,
     assumptionInput: ExportAssumptionInput = {},
+    periodInput: AccountingPeriodInput = {},
   ): Promise<CostAccountingPreview> {
     await this.authorize(actor, shopId);
     const assumptions = await this.resolveAccountingAssumptions(actor.accountId, assumptionInput);
+    const reportPeriod = parseAccountingPeriodScope(periodInput);
     const pointer = await this.pool.query<{
       published_snapshot_id: string;
       calculation_run_id: string;
-      year: string;
+      year: string | null;
       yearCount: string;
     }>(
-      `SELECT current.published_snapshot_id,snapshot.calculation_run_id,
-              to_char(min(slice.local_month),'YYYY') AS year,
-              count(DISTINCT date_trunc('year',slice.local_month))::text AS "yearCount"
+      `SELECT current.published_snapshot_id,snapshot.calculation_run_id,scope.year,scope.year_count AS "yearCount"
          FROM shop_current_published_snapshot current
          JOIN published_snapshot snapshot ON snapshot.id=current.published_snapshot_id
-         JOIN published_snapshot_slice published_slice ON published_slice.published_snapshot_id=snapshot.id
-         JOIN dataset_slice slice ON slice.id=published_slice.dataset_slice_id
+         LEFT JOIN LATERAL (
+           SELECT to_char(min(slice.local_month),'YYYY') AS year,
+                  count(DISTINCT date_trunc('year',slice.local_month))::text AS year_count
+             FROM published_snapshot_slice published_slice
+             JOIN dataset_slice slice ON slice.id=published_slice.dataset_slice_id
+            WHERE published_slice.published_snapshot_id=snapshot.id
+              AND published_slice.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
+              AND ($2::date IS NULL OR slice.local_month BETWEEN $2::date AND $3::date)
+         ) scope ON TRUE
         WHERE current.shop_id=$1
-          AND published_slice.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING')
-        GROUP BY current.published_snapshot_id,snapshot.calculation_run_id`,
-      [shopId],
+        `,
+      [shopId, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null],
     );
     const current = pointer.rows[0];
-    if (!current) throw new AppError("PUBLISHED_SNAPSHOT_NOT_FOUND", "当前公司还没有可预览的正式结果", 409);
-    if (current.yearCount !== "1") {
-      throw new AppError("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR", "当前正式结果包含多个自然年，无法生成单年度成本预览", 409);
+    if (!current) throw new AppError("PUBLISHED_SNAPSHOT_NOT_FOUND", "当前店铺还没有可预览的正式结果", 409);
+    if (current.yearCount === "0" || !current.year) {
+      throw new AppError("EXPORT_NO_INCLUDED_SLICES", "所选月份没有可导出的正式数据", 409);
     }
-    const actual = await this.aggregateMonthlyFinancialRows(current.calculation_run_id);
+    if (current.yearCount !== "1") {
+      throw new AppError("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR", "当前正式结果包含多个自然年，请选择同一自然年的月份范围", 409);
+    }
+    const actual = await this.aggregateMonthlyFinancialRows(current.calculation_run_id, reportPeriod);
+    const firstMonth = reportPeriod ? Number(reportPeriod.periodStart.slice(5, 7)) : 1;
+    const lastMonth = reportPeriod ? Number(reportPeriod.periodEnd.slice(5, 7)) : 12;
     const monthly = new Map<string, {
       income: ReturnType<typeof decimal>;
       net: ReturnType<typeof decimal>;
       expenses: ReturnType<typeof decimal>;
-    }>(Array.from({ length: 12 }, (_, index) => {
-      const period = `${current.year}-${String(index + 1).padStart(2, "0")}`;
+    }>(Array.from({ length: lastMonth - firstMonth + 1 }, (_, index) => {
+      const period = `${current.year}-${String(firstMonth + index).padStart(2, "0")}`;
       return [period, {
         income: decimal("0"),
         net: decimal("0"),
@@ -689,6 +721,7 @@ export class PostgresExportService {
     return {
       snapshotId: current.published_snapshot_id,
       year: current.year,
+      ...(reportPeriod ?? {}),
       assumptions,
       rows,
       total: {
@@ -854,8 +887,8 @@ export class PostgresExportService {
   }
 
   async generate(exportId: string): Promise<void> {
-    const claimed = await this.pool.query<{ shop_id: string; published_snapshot_id: string; requested_by: string; format_version: string; profit_rate: string | null; minimum_sales_cost_rate: string | null; continent_prefixes: string[] }>(
-      "UPDATE export_request SET status='RUNNING',stage='VALIDATING',progress_percent=1,processed_rows=0,total_rows=NULL,heartbeat_at=clock_timestamp(),started_at=COALESCE(started_at,clock_timestamp()),error_code=NULL,finished_at=NULL WHERE id=$1 AND status IN ('QUEUED','RUNNING') RETURNING shop_id,published_snapshot_id,requested_by,format_version,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes",
+    const claimed = await this.pool.query<{ shop_id: string; published_snapshot_id: string; requested_by: string; format_version: string; profit_rate: string | null; minimum_sales_cost_rate: string | null; continent_prefixes: string[]; period_start: string | null; period_end: string | null }>(
+      "UPDATE export_request SET status='RUNNING',stage='VALIDATING',progress_percent=1,processed_rows=0,total_rows=NULL,heartbeat_at=clock_timestamp(),started_at=COALESCE(started_at,clock_timestamp()),error_code=NULL,finished_at=NULL WHERE id=$1 AND status IN ('QUEUED','RUNNING') RETURNING shop_id,published_snapshot_id,requested_by,format_version,profit_rate::text,minimum_sales_cost_rate::text,continent_prefixes,to_char(report_period_start,'YYYY-MM') period_start,to_char(report_period_end,'YYYY-MM') period_end",
       [exportId],
     );
     const job = claimed.rows[0];
@@ -910,7 +943,10 @@ export class PostgresExportService {
         profitRate: job.profit_rate,
         minimumSalesCostRate: job.minimum_sales_cost_rate,
         continentPrefixes: normalizeContinentPrefixes(job.continent_prefixes),
-      }, exportId);
+      }, exportId, parseAccountingPeriodScope({
+        ...(job.period_start ? { periodStart: job.period_start } : {}),
+        ...(job.period_end ? { periodEnd: job.period_end } : {}),
+      }));
       await mkdir(this.outputRoot, { recursive: true });
       await assertExportCapacity(this.outputRoot, input);
       const result = await exportReport(input, plain, {
@@ -964,7 +1000,10 @@ export class PostgresExportService {
     }
   }
 
-  private async aggregateMonthlyFinancialRows(calculationRunId: string): Promise<Record<string, string>[]> {
+  private async aggregateMonthlyFinancialRows(
+    calculationRunId: string,
+    reportPeriod?: AccountingPeriodScope,
+  ): Promise<Record<string, string>[]> {
     const result = await this.pool.query<Record<string, string>>(
       `WITH component_amount AS (
          SELECT to_char(ds.local_month,'YYYY-MM') period,ds.normalized_marketplace marketplace,
@@ -977,6 +1016,7 @@ export class PostgresExportService {
            LEFT JOIN transaction_fact tf ON r.fact_kind='TRANSACTION' AND tf.id=r.fact_id
            LEFT JOIN shipment_fact sf ON r.fact_kind='SHIPMENT' AND sf.id=r.fact_id
           WHERE r.calculation_run_id=$1
+            AND ($2::date IS NULL OR ds.local_month BETWEEN $2::date AND $3::date)
           GROUP BY period,ds.normalized_marketplace,COALESCE(tf.currency,sf.currency),r.component
        ), pivot AS (
          SELECT period,marketplace,min(currency) currency,count(DISTINCT currency) currency_count,
@@ -1014,7 +1054,7 @@ export class PostgresExportService {
          CASE WHEN net_cny=0 THEN 0 ELSE round((net_cny-expense_cny)/net_cny,8) END::text "profitRate",
          (net_original-expense_original)::text "profitOriginal",(net_cny-expense_cny)::text "profitCny"
        FROM totals ORDER BY period,marketplace`,
-      [calculationRunId],
+      [calculationRunId, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null],
     );
     for (const row of result.rows) if (row.currencyCount !== "1") throw new Error("EXPORT_MULTIPLE_CURRENCIES_PER_SLICE");
     return result.rows;
@@ -1025,6 +1065,7 @@ export class PostgresExportService {
     snapshotId: string,
     preferences: AccountingPreferences = { profitRate: null, minimumSalesCostRate: null, continentPrefixes: DEFAULT_CONTINENT_PREFIXES },
     exportId?: string,
+    reportPeriod?: AccountingPeriodScope,
   ): Promise<ReportExportInput> {
     const header = await this.pool.query<{ shop_name: string; manifest: Record<string, unknown>; manifest_sha256: string; calculation_run_id: string; published_at: Date }>(
       "SELECT sh.name shop_name,s.manifest,encode(integrity.canonical_manifest_sha256,'hex') manifest_sha256,s.calculation_run_id,s.published_at FROM published_snapshot s JOIN published_snapshot_integrity integrity ON integrity.published_snapshot_id=s.id JOIN shop sh ON sh.id=s.shop_id WHERE s.id=$1 AND s.shop_id=$2",
@@ -1046,15 +1087,22 @@ export class PostgresExportService {
               COALESCE((SELECT tf.currency FROM transaction_fact tf WHERE tf.dataset_version_id=ps.dataset_version_id ORDER BY tf.id LIMIT 1),
                        (SELECT sf.currency FROM shipment_fact sf WHERE sf.dataset_version_id=ps.dataset_version_id ORDER BY sf.id LIMIT 1)) currency
          FROM published_snapshot_slice ps JOIN dataset_slice ds ON ds.id=ps.dataset_slice_id
-        WHERE ps.published_snapshot_id=$1 ORDER BY ds.local_month,ds.normalized_marketplace`,
-      [snapshotId],
+        WHERE ps.published_snapshot_id=$1
+          AND ($2::date IS NULL OR ds.local_month BETWEEN $2::date AND $3::date)
+        ORDER BY ds.local_month,ds.normalized_marketplace`,
+      [snapshotId, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null],
     );
     const includedScope = scope.rows.filter((row) => ["INCLUDED", "INCLUDED_WITH_WARNING"].includes(row.disposition));
     if (includedScope.length === 0) throw new Error("EXPORT_NO_INCLUDED_SLICES");
     if (new Set(includedScope.map((row) => row.period.slice(0, 4))).size !== 1) {
       throw new Error("EXPORT_ACCOUNTING_PERIOD_CROSS_YEAR");
     }
-    const reportPeriods = [...new Set(includedScope.map((row) => row.period))].sort();
+    const reportPeriods = reportPeriod
+      ? Array.from(
+        { length: Number(reportPeriod.periodEnd.slice(5, 7)) - Number(reportPeriod.periodStart.slice(5, 7)) + 1 },
+        (_, index) => `${reportPeriod.periodStart.slice(0, 4)}-${String(Number(reportPeriod.periodStart.slice(5, 7)) + index).padStart(2, "0")}`,
+      )
+      : [...new Set(includedScope.map((row) => row.period))].sort();
     const marketplaceCurrency = new Map<string, string>();
     const fallbackCurrency: Readonly<Record<string, string>> = {
       BE: "EUR", ES: "EUR", FR: "EUR", IE: "EUR", IT: "EUR", NL: "EUR", DE: "EUR",
@@ -1105,12 +1153,12 @@ export class PostgresExportService {
       marketplace: row.marketplace,
     })));
     const annualScope = uniqueScope(includedScope.map((row) => ({ period: row.period.slice(0, 4), marketplace: row.marketplace })));
-    const monthlyActual = await this.aggregateMonthlyFinancialRows(meta.calculation_run_id);
+    const monthlyActual = await this.aggregateMonthlyFinancialRows(meta.calculation_run_id, reportPeriod);
     const monthlyRows = dense(monthlyScope, monthlyActual);
     const quarterlyRows = dense(quarterScope, rollupFinancialRows(monthlyActual, "quarter"));
     const annualRows = dense(annualScope, rollupFinancialRows(monthlyActual, "year"));
-    const fees=await this.pool.query<Record<string,string>>(`SELECT ds.normalized_marketplace AS marketplace,to_char(ds.local_month,'YYYY-MM') AS "month",r.component AS category,count(*)::text AS "sourceRows",sum(r.amount_cny)::text AS "amountCny" FROM calculation_fact_result r JOIN dataset_version dv ON dv.id=r.dataset_version_id JOIN dataset_slice ds ON ds.id=dv.dataset_slice_id WHERE r.calculation_run_id=$1 AND r.component NOT IN('INCOME','REFUND','WITHHELD_TAX') GROUP BY ds.id,r.component ORDER BY ds.local_month,ds.normalized_marketplace,r.component`,[meta.calculation_run_id]);
-    const audit=await this.pool.query<Record<string,string>>(`SELECT f.relative_path "relativePath",f.classification,f.parse_status "parseStatus",f.read_row_count::text "readRows",f.inserted_row_count::text "insertedRows",f.excluded_row_count::text "excludedRows",f.error_row_count::text "errorRows",CASE WHEN f.read_row_count=f.inserted_row_count+f.excluded_row_count+f.error_row_count THEN 'PASS' ELSE 'FAIL' END conservation,encode(f.sha256,'hex') sha256 FROM import_file f WHERE f.id IN(SELECT DISTINCT b.import_file_id FROM published_snapshot_slice ps JOIN dataset_source_binding b ON b.dataset_version_id=ps.dataset_version_id WHERE ps.published_snapshot_id=$1) ORDER BY f.relative_path`,[snapshotId]);
+    const fees=await this.pool.query<Record<string,string>>(`SELECT ds.normalized_marketplace AS marketplace,to_char(ds.local_month,'YYYY-MM') AS "month",r.component AS category,count(*)::text AS "sourceRows",sum(r.amount_cny)::text AS "amountCny" FROM calculation_fact_result r JOIN dataset_version dv ON dv.id=r.dataset_version_id JOIN dataset_slice ds ON ds.id=dv.dataset_slice_id WHERE r.calculation_run_id=$1 AND r.component NOT IN('INCOME','REFUND','WITHHELD_TAX') AND ($2::date IS NULL OR ds.local_month BETWEEN $2::date AND $3::date) GROUP BY ds.id,r.component ORDER BY ds.local_month,ds.normalized_marketplace,r.component`,[meta.calculation_run_id, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null]);
+    const audit=await this.pool.query<Record<string,string>>(`SELECT f.relative_path "relativePath",f.classification,f.parse_status "parseStatus",f.read_row_count::text "readRows",f.inserted_row_count::text "insertedRows",f.excluded_row_count::text "excludedRows",f.error_row_count::text "errorRows",CASE WHEN f.read_row_count=f.inserted_row_count+f.excluded_row_count+f.error_row_count THEN 'PASS' ELSE 'FAIL' END conservation,encode(f.sha256,'hex') sha256 FROM import_file f WHERE f.id IN(SELECT DISTINCT b.import_file_id FROM published_snapshot_slice ps JOIN dataset_source_binding b ON b.dataset_version_id=ps.dataset_version_id JOIN dataset_slice ds ON ds.id=ps.dataset_slice_id WHERE ps.published_snapshot_id=$1 AND ps.disposition IN ('INCLUDED','INCLUDED_WITH_WARNING') AND ($2::date IS NULL OR ds.local_month BETWEEN $2::date AND $3::date)) ORDER BY f.relative_path`,[snapshotId, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodStart) : null, reportPeriod ? accountingPeriodStartDate(reportPeriod.periodEnd) : null]);
     if (audit.rows.some((row) => row.conservation !== "PASS")) throw new Error("EXPORT_IMPORT_CONSERVATION_FAILED");
     const feeTotal = fees.rows.reduce((sum, row) => sum.add(decimal(row.amountCny ?? "0")), decimal("0"));
     const classifiedExpenseTotal = monthlyRows.reduce((sum, row) => sum
@@ -1144,6 +1192,7 @@ export class PostgresExportService {
       manifestSha256: meta.manifest_sha256,
       costAssumptions: normalizeAccountingAssumptions(preferences),
       continentPrefixes: preferences.continentPrefixes,
+      ...(reportPeriod ? { reportPeriod } : {}),
       reportPeriods,
       monthly: section(SUMMARY_COLUMNS, monthlyRows),
       quarterly: section(SUMMARY_COLUMNS, quarterlyRows),

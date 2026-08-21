@@ -100,6 +100,7 @@ describe('ShopService idempotency binding', () => {
       code: 'SHOP_NAME_CONFLICT',
       statusCode: 409,
       field: 'name',
+      message: '已有同名店铺（包括回收站），请更换店铺名称',
     });
   });
 
@@ -127,7 +128,7 @@ describe('ShopService idempotency binding', () => {
     });
   });
 
-  it('rejects creating a company for an enterprise the accountant cannot access before idempotency lookup', async () => {
+  it('rejects creating a shop for an enterprise the accountant cannot access before idempotency lookup', async () => {
     const fixture = serviceFor(baseCharge);
     await expect(fixture.service.create(createInput({ enterpriseId: '50000000-0000-4000-8000-000000000009' })))
       .rejects.toMatchObject({ code: 'RESOURCE_NOT_FOUND', statusCode: 404 });

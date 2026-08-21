@@ -52,7 +52,29 @@ describe("current published snapshot export", () => {
     const reuseCall = pool.query.mock.calls[2];
     expect(String(reuseCall?.[0])).toContain("format_version=$4");
     expect(String(reuseCall?.[0])).toContain("profit_rate IS NOT DISTINCT FROM $5::numeric");
-    expect(reuseCall?.[1]).toEqual(["shop-1", actor.accountId, "snapshot-1", REPORT_EXPORT_FORMAT, null, null, ["EU"]]);
+    expect(reuseCall?.[1]).toEqual(["shop-1", actor.accountId, "snapshot-1", REPORT_EXPORT_FORMAT, null, null, ["EU"], null, null]);
+  });
+
+  it("reuses only an export with the same immutable report period", async () => {
+    const period = { periodStart: "2026-04", periodEnd: "2026-06" } as const;
+    const pool = { query: vi.fn()
+      .mockResolvedValueOnce({ rows: [{ id: "shop-1", enterprise_id: "enterprise-1", status: "ACTIVE", membership_id: null, membership_status: null, export_allowed: null, authorization_epoch: null }] })
+      .mockResolvedValueOnce({ rows: [{ published_snapshot_id: "snapshot-1" }] })
+      .mockResolvedValueOnce({ rows: [{
+        id: "export-period", shop_id: "shop-1", published_snapshot_id: "snapshot-1",
+        status: "SUCCEEDED", output_kind: "XLSX", created_at: new Date("2026-07-28T00:00:00.000Z"),
+        requested_by: actor.accountId, membership_authorization_version: null,
+        period_start: period.periodStart, period_end: period.periodEnd,
+      }] }) };
+    const service = new PostgresExportService(pool as never, {} as never, ".work/exports");
+
+    await expect(service.createCurrent(actor, "shop-1", "key-period", "request-period", { ...assumptions, ...period }))
+      .resolves.toMatchObject({ id: "export-period", ...period });
+
+    expect(pool.query.mock.calls[2]?.[1]).toEqual([
+      "shop-1", actor.accountId, "snapshot-1", REPORT_EXPORT_FORMAT,
+      null, null, ["EU"], "2026-04-01", "2026-06-01",
+    ]);
   });
 
   it.each([

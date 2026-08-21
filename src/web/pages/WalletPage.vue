@@ -41,13 +41,13 @@ function shopReferenceDescription(entry: WalletEntry) {
   if (entry.reference.status === "EXPIRED_READONLY") annotations.push("已到期");
   if (entry.reference.status === "TRASHED") annotations.push("回收站");
   if (entry.reference.status === "PURGED") annotations.push("已清除");
-  return name ? `公司：${name}${annotations.length ? `（${annotations.join("；")}）` : ""}` : `公司记录：${entry.reference.id}`;
+  return name ? `店铺：${name}${annotations.length ? `（${annotations.join("；")}）` : ""}` : `店铺记录：${entry.reference.id}`;
 }
 
 const walletEntryTypeNames: Record<string, string> = {
   TOP_UP: "充值",
   TOP_UP_REVERSAL: "充值退回",
-  SHOP_CHARGE: "公司费用",
+  SHOP_CHARGE: "店铺费用",
   ADMIN_ADJUSTMENT: "管理员调整",
   DEBT_SETTLEMENT: "补足欠款",
 };
@@ -63,7 +63,7 @@ const walletEntryTypeNames: Record<string, string> = {
     </section>
     <section class="surface-section">
       <div class="section-heading"><h2>钱包明细</h2><p>每次充值、扣费和退款都会新增一条记录，旧记录不会被改掉，方便以后核对。</p></div>
-      <AsyncState :status="status" :error="error" empty-title="暂无钱包记录" empty-message="完成充值或公司消费后，记录会显示在这里。" @retry="reload">
+      <AsyncState :status="status" :error="error" empty-title="暂无钱包记录" empty-message="完成充值或店铺消费后，记录会显示在这里。" @retry="reload">
         <div class="table-scroll" tabindex="0" role="region" aria-label="钱包流水"><table><thead><tr><th>时间</th><th>类型</th><th>变动</th><th>变动后余额</th><th>说明</th></tr></thead><tbody><tr v-for="entry in entries as WalletEntry[]" :key="entry.id"><td>{{ entry.occurredAt }}</td><td>{{ walletEntryTypeNames[entry.type] ?? "其他变动" }}</td><td class="numeric">{{ yuan(entry.amountCents) }}</td><td class="numeric">{{ yuan(entry.balanceAfterCents) }}</td><td>{{ shopReferenceDescription(entry) }}</td></tr></tbody></table></div>
       </AsyncState>
     </section>

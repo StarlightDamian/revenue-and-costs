@@ -15,14 +15,24 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
   let lastListUrl = "";
   let reportMode: "DRAFT" | "STALE" = "DRAFT";
   let publishRequests = 0;
+  let summaryRequests = 0;
+  let lastShipmentSummaryUrl = "";
   let delayNextShipmentSummary = false;
+  let delayNextTransactionSummary = false;
   let failNextTransactionSummary = false;
   let shipmentSummaryStarted = Promise.resolve();
+  let transactionSummaryStarted = Promise.resolve();
   let markShipmentSummaryStarted: () => void = () => undefined;
+  let markTransactionSummaryStarted: () => void = () => undefined;
   let releaseShipmentSummary: () => void = () => undefined;
+  let releaseTransactionSummary: () => void = () => undefined;
   const armShipmentSummaryDelay = () => {
     delayNextShipmentSummary = true;
     shipmentSummaryStarted = new Promise<void>((resolve) => { markShipmentSummaryStarted = resolve; });
+  };
+  const armTransactionSummaryDelay = () => {
+    delayNextTransactionSummary = true;
+    transactionSummaryStarted = new Promise<void>((resolve) => { markTransactionSummaryStarted = resolve; });
   };
   await page.route("**/api/v1/me", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(me) }));
   await page.route("**/api/v1/shops", (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([shop]) }));
@@ -42,23 +52,36 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
     const url = new URL(route.request().url());
     if (url.pathname.endsWith("/summary")) {
       const kind = url.searchParams.get("kind");
+      summaryRequests += 1;
+      if (kind === "SHIPMENT") lastShipmentSummaryUrl = url.toString();
       if (kind === "SHIPMENT" && delayNextShipmentSummary) {
         delayNextShipmentSummary = false;
         markShipmentSummaryStarted();
         await new Promise<void>((resolve) => { releaseShipmentSummary = resolve; });
       }
+      if (kind === "TRANSACTION" && delayNextTransactionSummary) {
+        delayNextTransactionSummary = false;
+        markTransactionSummaryStarted();
+        await new Promise<void>((resolve) => { releaseTransactionSummary = resolve; });
+      }
       if (kind === "TRANSACTION" && failNextTransactionSummary) {
         failNextTransactionSummary = false;
         return route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ message: "temporary summary failure" }) });
       }
+      const expectedStart = kind === "SHIPMENT" ? "2026-06-01" : "2026-04-01";
+      const expectedEnd = kind === "SHIPMENT" ? "2026-06-30" : "2026-05-31";
+      const requestedStart = url.searchParams.get("start");
+      const requestedEnd = url.searchParams.get("end");
+      const rangeMatches = (!requestedStart && !requestedEnd)
+        || (requestedStart === expectedStart && requestedEnd === expectedEnd);
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
         coverage: kind === "SHIPMENT"
           ? { start: "2026-06-01", end: "2026-06-30" }
           : { start: "2026-04-01", end: "2026-05-31" },
         options: { marketplaces: ["BE", "US"], currencies: ["EUR", "USD"] },
-        matchedRows: "1250",
-        totalsByCurrency: [{ currency: "EUR", values: { quantity: "12.00", productSales: "1250.50" } }],
-        cnyTotal: "8960.25",
+        matchedRows: rangeMatches ? "1250" : "0",
+        totalsByCurrency: [{ currency: "EUR", values: { quantity: rangeMatches ? "12.00" : "0", productSales: rangeMatches ? "1250.50" : "0" } }],
+        cnyTotal: rangeMatches ? "8960.25" : "0",
       }) });
     }
     lastListUrl = url.toString();
@@ -152,14 +175,14 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
   }
 
   const dateRange = page.locator(".date-range-picker");
-  await expect(dateRange.getByRole("button", { name: /日期范围/u })).toContainText("2026年04月 — 2026年05月");
+  await expect(dateRange.getByRole("button", { name: /日期范围/u })).toContainText("2026年04月 至 2026年05月");
   await expect(page.getByLabel("开始", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("结束（含）", { exact: true })).toHaveCount(0);
   await dateRange.getByRole("button", { name: /日期范围/u }).click();
   await expect(dateRange.getByRole("dialog", { name: "选择日期范围" })).toBeVisible();
   await expect(dateRange.getByRole("button", { name: "月度" })).toHaveAttribute("aria-pressed", "true");
   await dateRange.getByRole("button", { name: "日度" }).click();
-  await expect(dateRange.getByRole("button", { name: /日期范围/u })).toContainText("2026年04月01日 — 2026年05月31日");
+  await expect(dateRange.getByRole("button", { name: /日期范围/u })).toContainText("2026年04月01日 至 2026年05月31日");
   await page.locator("#intermediate-title").click();
   await expect(dateRange.getByRole("dialog", { name: "选择日期范围" })).toHaveCount(0);
 
@@ -173,14 +196,67 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
   const transactionButton = page.getByRole("button", { name: "交易报告" });
   const shipmentButton = page.getByRole("button", { name: "配送货件" });
   const intermediateSection = page.locator(".intermediate-results");
-  const exportAction = page.locator(".intermediate-export-link");
+  const transactionExportAction = page.getByRole("link", { name: "导出交易报告" });
+  const shipmentExportAction = page.getByRole("link", { name: "导出配送货件" });
+  const reportToolbar = page.locator(".intermediate-filter-bar > .intermediate-report-toolbar");
+  await expect(reportToolbar).toBeVisible();
+  if ((page.viewportSize()?.width ?? 1440) > 1300) {
+    expect(await reportToolbar.evaluate((toolbar) => {
+      const filterBarBounds = toolbar.parentElement!.getBoundingClientRect();
+      const firstFilterBounds = toolbar.parentElement!.querySelector<HTMLElement>(".filter-popover")!.getBoundingClientRect();
+      const toolbarBounds = toolbar.getBoundingClientRect();
+      return filterBarBounds.right - toolbarBounds.right <= 16
+        && Math.abs(firstFilterBounds.bottom - toolbarBounds.bottom) <= 3;
+    })).toBe(true);
+  }
   await expect(transactionButton).toHaveAttribute("aria-pressed", "true");
   await expect(shipmentButton).toHaveAttribute("aria-pressed", "false");
-  await expect(exportAction).toHaveAttribute("aria-disabled", "false");
-  await expect(exportAction).toHaveAttribute("href", /kind=TRANSACTION/u);
-  await expect(exportAction).toHaveAttribute("href", /marketplaces=BE/u);
-  await expect(exportAction).toHaveAttribute("href", /start=2026-04-01/u);
-  await expect(exportAction).toHaveAttribute("href", /end=2026-05-31/u);
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(transactionExportAction).toHaveAttribute("href", /kind=TRANSACTION/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /marketplaces=BE/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /start=2026-04-01/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /end=2026-05-31/u);
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(shipmentExportAction).toHaveAttribute("href", /kind=SHIPMENT/u);
+  await expect(shipmentExportAction).toHaveAttribute("href", /marketplaces=BE/u);
+
+  await dateRange.getByRole("button", { name: /日期范围/u }).click();
+  await dateRange.getByRole("button", { name: "2026年4月1日", exact: true }).click();
+  await page.locator("#intermediate-title").click();
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(transactionExportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(shipmentExportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(page.locator(".table-footer-actions")).toContainText("筛选已修改，请先应用筛选");
+  const summaryRequestsBeforeInvalidRange = summaryRequests;
+  await intermediateSection.getByRole("button", { name: "应用筛选" }).click();
+  await expect(intermediateSection.getByRole("alert")).toContainText("请选择完整的开始和结束日期");
+  expect(summaryRequests).toBe(summaryRequestsBeforeInvalidRange);
+
+  await dateRange.getByRole("button", { name: /日期范围/u }).click();
+  await dateRange.getByRole("button", { name: "2026年5月31日", exact: true }).click();
+  await intermediateSection.getByRole("button", { name: "应用筛选" }).click();
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "false");
+
+  armTransactionSummaryDelay();
+  await intermediateSection.getByRole("button", { name: "应用筛选" }).click();
+  await transactionSummaryStarted;
+  const currencyPopover = page.locator(".filter-popover").nth(1);
+  await currencyPopover.locator("summary").click();
+  await currencyPopover.getByLabel("EUR", { exact: true }).check();
+  await page.locator("#intermediate-title").click();
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "true");
+  releaseTransactionSummary();
+  await expect(intermediateSection).toHaveAttribute("aria-busy", "false");
+  await expect(page.locator(".table-footer-actions")).toContainText("筛选已修改，请先应用筛选");
+  await expect(transactionExportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(shipmentExportAction).not.toHaveAttribute("href", /.+/u);
+  await intermediateSection.getByRole("button", { name: "应用筛选" }).click();
+  await expect.poll(() => lastListUrl).toContain("currencies=EUR");
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(transactionExportAction).toHaveAttribute("href", /currencies=EUR/u);
+  await expect(shipmentExportAction).toHaveAttribute("href", /currencies=EUR/u);
 
   await page.locator("details.field-picker > summary").click();
   const descriptionField = page.locator("details.field-picker").getByLabel("交易说明", { exact: true });
@@ -194,33 +270,46 @@ test("业务计算固定筛选、中文字段、全量合计并让窄屏筛选�
   await shipmentButton.click();
   await shipmentSummaryStarted;
   await expect(intermediateSection).toHaveAttribute("aria-busy", "true");
-  await expect(exportAction).toHaveAttribute("aria-disabled", "true");
-  await expect(exportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(transactionExportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(shipmentExportAction).not.toHaveAttribute("href", /.+/u);
   await expect(intermediateSection.getByRole("status")).toHaveText("正在读取计算明细…");
   await transactionButton.click();
   releaseShipmentSummary();
   await expect(transactionButton).toHaveAttribute("aria-pressed", "true");
   await expect(intermediateSection).toHaveAttribute("aria-busy", "false");
-  await expect(exportAction).toHaveAttribute("aria-disabled", "false");
-  await expect(exportAction).toHaveAttribute("href", /kind=TRANSACTION/u);
-  await expect(exportAction).toHaveAttribute("href", /start=2026-04-01/u);
-  await expect(exportAction).toHaveAttribute("href", /end=2026-05-31/u);
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(transactionExportAction).toHaveAttribute("href", /kind=TRANSACTION/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /start=2026-04-01/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /end=2026-05-31/u);
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(shipmentExportAction).toHaveAttribute("href", /kind=SHIPMENT/u);
   await expect(page.locator(".table-footer-actions")).toContainText("原币金额按币种分别合计");
 
   await shipmentButton.click();
   await expect(shipmentButton).toHaveAttribute("aria-pressed", "true");
   await expect(transactionButton).toHaveAttribute("aria-pressed", "false");
-  await expect(exportAction).toHaveAttribute("aria-disabled", "false");
-  await expect(exportAction).toHaveAttribute("href", /kind=SHIPMENT/u);
-  await expect(exportAction).toHaveAttribute("href", /start=2026-06-01/u);
-  await expect(exportAction).toHaveAttribute("href", /end=2026-06-30/u);
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(transactionExportAction).toHaveAttribute("href", /kind=TRANSACTION/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /start=2026-06-01/u);
+  await expect(transactionExportAction).toHaveAttribute("href", /end=2026-06-30/u);
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "false");
+  await expect(shipmentExportAction).toHaveAttribute("href", /kind=SHIPMENT/u);
+  await expect(shipmentExportAction).toHaveAttribute("href", /start=2026-06-01/u);
+  await expect(shipmentExportAction).toHaveAttribute("href", /end=2026-06-30/u);
   await expect(page.locator(".table-footer-actions")).toContainText("8,960.25");
+  const shipmentSummaryUrl = new URL(lastShipmentSummaryUrl);
+  expect(shipmentSummaryUrl.searchParams.has("start")).toBe(false);
+  expect(shipmentSummaryUrl.searchParams.has("end")).toBe(false);
 
   failNextTransactionSummary = true;
   await transactionButton.click();
   await expect(intermediateSection).toHaveAttribute("aria-busy", "false");
-  await expect(exportAction).toHaveAttribute("aria-disabled", "true");
-  await expect(exportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(transactionExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(transactionExportAction).not.toHaveAttribute("href", /.+/u);
+  await expect(shipmentExportAction).toHaveAttribute("aria-disabled", "true");
+  await expect(shipmentExportAction).not.toHaveAttribute("href", /.+/u);
   await expect(intermediateSection.getByRole("alert")).toContainText("暂时无法切换明细类型");
 
   await reviewResult.locator(":scope > summary").focus();

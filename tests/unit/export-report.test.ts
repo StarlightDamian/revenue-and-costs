@@ -52,12 +52,13 @@ function input(rows?: Parameters<typeof section>[0]): ReportExportInput {
     policyVersion: "policy-v1", formulaVersion: "formula-v1", dataVersion: "data-v1", mappingVersion: "mapping-v1", fxVersion: "fx-v1",
     timezoneVersion: "iana-tzdb-2026a", codeVersion: "test-v1", priceVersion: "price-v1", manifestSha256: "a".repeat(64),
     costAssumptions: { profitRate: null, minimumSalesCostRate: null },
+    reportPeriod: { periodStart: "2025-10", periodEnd: "2025-10" },
     reportPeriods: ["2025-10"],
     monthly: value, quarterly: section(), annual: section(), completeness: section(), fees: section(), importAudit: section(),
   };
 }
 
-describe("five-sheet v9 export", () => {
+describe("five-sheet v10 export", () => {
   it("neutralizes control-character formula prefixes used by CSV readers", () => {
     expect(neutralizeSpreadsheetFormula("\t=HYPERLINK(\"x\")")).toBe("'\t=HYPERLINK(\"x\")");
     expect(neutralizeSpreadsheetFormula("\r@SUM(1,1)")).toBe("'\r@SUM(1,1)");
@@ -76,12 +77,16 @@ describe("five-sheet v9 export", () => {
       }),
     ]);
     const workbook = new ExcelJS.Workbook(); await workbook.xlsx.readFile(path);
-    expect(REPORT_EXPORT_FORMAT).toBe("revenue-and-costs-export-v9");
+    expect(REPORT_EXPORT_FORMAT).toBe("revenue-and-costs-export-v10");
     expect(REPORT_SHEETS).toEqual(EXPECTED_REPORT_SHEETS);
     expect(workbook.worksheets.map((sheet) => sheet.name)).toEqual(EXPECTED_REPORT_SHEETS);
-    expect(workbook.getWorksheet("口径说明")?.state).toBe("hidden");
-    expect(workbook.getWorksheet("口径说明")?.getCell("A2").value).toBe("ID");
-    expect(workbook.getWorksheet("口径说明")?.getCell("B2").value).toBe("E5YwPcW1JusfK5ZP8ocNjDn");
+    const notes = workbook.getWorksheet("口径说明")!;
+    expect(notes.state).toBe("hidden");
+    expect(notes.getCell("A2").value).toBe("ID");
+    expect(notes.getCell("B2").value).toBe("E5YwPcW1JusfK5ZP8ocNjDn");
+    const periodRow = notes.getColumn(1).values.findIndex((value) => value === "本次核算月份");
+    expect(periodRow).toBeGreaterThan(1);
+    expect(notes.getCell(periodRow, 2).value).toBe("2025年10月");
     expect(workbook.getWorksheet("汇率追溯")).toBeUndefined();
     for (const sheetName of REPORT_SHEETS.filter((sheetName) => sheetName !== "口径说明" && sheetName !== "成本核算表-人民币")) {
       const sheet = workbook.getWorksheet(sheetName)!;
@@ -130,13 +135,44 @@ describe("five-sheet v9 export", () => {
       .toBe("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     expect(result.files.find((file) => file.name === "manifest.json")?.mediaType).toBe("application/json");
     expect(result.files.find((file) => file.name.endsWith(".csv"))?.mediaType).toBe("text/csv");
-    const manifest = JSON.parse(await readZipText(path, "manifest.json")) as { format: string; sheetNames: string[] };
+    const manifest = JSON.parse(await readZipText(path, "manifest.json")) as {
+      format: string;
+      reportPeriod: { periodStart: string; periodEnd: string };
+      reportPeriods: string[];
+      sheetNames: string[];
+    };
     expect(manifest.format).toBe(REPORT_EXPORT_FORMAT);
+    expect(manifest.reportPeriod).toEqual({ periodStart: "2025-10", periodEnd: "2025-10" });
+    expect(manifest.reportPeriods).toEqual(["2025-10"]);
     expect(manifest.sheetNames).toEqual(EXPECTED_REPORT_SHEETS);
     expect(manifest.sheetNames).not.toContain("汇率追溯");
     expect(manifest.sheetNames).not.toContain("完整性检查");
     expect(manifest.sheetNames).not.toContain("费用明细");
     expect(manifest.sheetNames).not.toContain("导入审计");
+  });
+
+  it("records a null requested period and the full snapshot months in an unscoped ZIP manifest", async () => {
+    const root = await mkdtemp(join(tmpdir(), "revenue-export-")); roots.push(root);
+    const path = join(root, "report.zip");
+    const base = input([
+      { month: "2025-10", marketplace: "US", site: "US", amount: "1.00000000", note: "a" },
+      { month: "2025-11", marketplace: "US", site: "US", amount: "2.00000000", note: "b" },
+    ]);
+    const unscoped = { ...base };
+    delete unscoped.reportPeriod;
+
+    await exportReport(
+      { ...unscoped, reportPeriods: ["2025-10", "2025-11"] },
+      path,
+      { maxRowsPerSheet: 3, csvRowsPerPart: 1, workDirectory: root },
+    );
+
+    const manifest = JSON.parse(await readZipText(path, "manifest.json")) as {
+      reportPeriod: null;
+      reportPeriods: string[];
+    };
+    expect(manifest.reportPeriod).toBeNull();
+    expect(manifest.reportPeriods).toEqual(["2025-10", "2025-11"]);
   });
 
   it("applies the same decimal and integer validation to XLSX and overflow CSV", async () => {
@@ -230,7 +266,7 @@ describe("five-sheet v9 export", () => {
         expect(sheet.getRow(rowNumber).height).toBe(30);
       }
     }
-    expect(monthly.getCell("A2").value).toBe("公司");
+    expect(monthly.getCell("A2").value).toBe("店铺");
     expect(monthly.getCell("F2").value).toBe("收入");
     expect(monthly.getCell("F3").value).toBe("收入总额");
     expect(monthly.getCell("F4").value).toBe("原币金额");

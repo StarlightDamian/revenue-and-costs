@@ -28,6 +28,8 @@ const intermediateHistory = ref<string[]>([]);
 const intermediateLoading = ref(false);
 const intermediateSummaryLoading = ref(false);
 const intermediateSummaryReady = ref(false);
+const appliedFilterSignature = ref("");
+const appliedFilterQuery = ref("");
 const grain = ref<"MONTH" | "DAY">("MONTH");
 const start = ref("");
 const end = ref("");
@@ -61,7 +63,16 @@ const blockingCount = computed(() => current.value?.steps.reduce((sum, step) => 
 const warningCount = computed(() => current.value?.steps.reduce((sum, step) => sum + step.warningCount, 0) ?? 0);
 const stateText = computed(() => requiresHardExclusionConfirmation.value ? "资料缺失待确认" : requiresDateAttributionReplay.value ? "日期计算方式待统一" : requiresFxCoverage.value ? "汇率数据待补齐" : calculation.value?.severity === "BLOCKING" ? "需要先处理问题" : calculation.value?.state === "COMPLETED" ? "计算完成" : calculation.value?.state === "IN_PROGRESS" ? "计算中" : "等待资料");
 const intermediateBusy = computed(() => intermediateSummaryLoading.value || intermediateLoading.value);
-const intermediateExportReady = computed(() => intermediateSummaryReady.value && !intermediateBusy.value);
+const filterRangeError = computed(() => {
+  if (!start.value && !end.value) return "";
+  if (!start.value || !end.value) return "请选择完整的开始和结束日期";
+  return start.value > end.value ? "开始日期不能晚于结束日期" : "";
+});
+const currentFiltersApplied = computed(() => !filterRangeError.value
+  && appliedFilterSignature.value === filterSignature());
+const intermediateExportReady = computed(() => intermediateSummaryReady.value
+  && currentFiltersApplied.value
+  && !intermediateBusy.value);
 
 function decimalDisplay(value: string, scale = 2): string {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
@@ -97,7 +108,43 @@ function filterQuery(): URLSearchParams {
   return query;
 }
 
-const exportUrl = computed(() => api.intermediateReportExportUrl(shopId.value, intermediateKind.value, filterQuery()));
+interface IntermediateFilterSnapshot {
+  readonly kind: IntermediateReportKind;
+  readonly query: URLSearchParams;
+  readonly signature: string;
+}
+
+function captureFilterSnapshot(): IntermediateFilterSnapshot {
+  const kind = intermediateKind.value;
+  const query = filterQuery();
+  return { kind, query, signature: `${kind}?${query.toString()}` };
+}
+
+function filterSignature(): string {
+  return captureFilterSnapshot().signature;
+}
+
+function snapshotIsCurrent(snapshot: IntermediateFilterSnapshot): boolean {
+  return snapshot.kind === intermediateKind.value && snapshot.signature === filterSignature();
+}
+
+function clearAppliedFilters(): void {
+  appliedFilterSignature.value = "";
+  appliedFilterQuery.value = "";
+}
+
+function markFiltersApplied(snapshot: IntermediateFilterSnapshot): void {
+  if (!snapshotIsCurrent(snapshot)) return;
+  appliedFilterSignature.value = snapshot.signature;
+  appliedFilterQuery.value = snapshot.query.toString();
+}
+
+function appliedQuery(): URLSearchParams {
+  return new URLSearchParams(appliedFilterQuery.value);
+}
+
+const transactionExportUrl = computed(() => api.intermediateReportExportUrl(shopId.value, "TRANSACTION", appliedQuery()));
+const shipmentExportUrl = computed(() => api.intermediateReportExportUrl(shopId.value, "SHIPMENT", appliedQuery()));
 
 function restoreColumns(): void {
   const key = `revenue-cost-columns-${intermediateKind.value}`;
@@ -113,20 +160,24 @@ function saveColumns(): void {
   window.localStorage.setItem(`revenue-cost-columns-${intermediateKind.value}`, JSON.stringify(selectedColumnKeys.value));
 }
 
-async function loadSummary(resetCoverage = false) {
+async function loadSummary(resetCoverage = false, snapshot = captureFilterSnapshot()): Promise<boolean> {
   const sequence = ++intermediateSummaryRequestSequence;
-  const requestedKind = intermediateKind.value;
   intermediateSummaryLoading.value = true;
   intermediateSummaryReady.value = false;
   let next: IntermediateReportSummary;
   try {
-    next = await api.getIntermediateReportSummary(shopId.value, requestedKind, filterQuery());
+    next = await api.getIntermediateReportSummary(shopId.value, snapshot.kind, resetCoverage ? new URLSearchParams() : snapshot.query);
   } catch (caught) {
-    if (sequence !== intermediateSummaryRequestSequence || requestedKind !== intermediateKind.value) return;
+    if (sequence !== intermediateSummaryRequestSequence) return false;
     intermediateSummaryLoading.value = false;
+    if (!snapshotIsCurrent(snapshot)) return false;
     throw caught;
   }
-  if (sequence !== intermediateSummaryRequestSequence || requestedKind !== intermediateKind.value) return;
+  if (sequence !== intermediateSummaryRequestSequence) return false;
+  if (!snapshotIsCurrent(snapshot)) {
+    intermediateSummaryLoading.value = false;
+    return false;
+  }
   summary.value = next;
   if (resetCoverage) {
     const startValue = next.coverage.start ?? "";
@@ -136,42 +187,62 @@ async function loadSummary(resetCoverage = false) {
   }
   intermediateSummaryReady.value = true;
   intermediateSummaryLoading.value = false;
+  return true;
 }
 
-async function loadIntermediate(after?: string) {
+async function loadIntermediate(after?: string, snapshot = captureFilterSnapshot()): Promise<boolean> {
   const sequence = ++intermediateListRequestSequence;
-  const requestedKind = intermediateKind.value;
   intermediateLoading.value = true;
   error.value = "";
   try {
-    const page = await api.getIntermediateReport(shopId.value, requestedKind, filterQuery(), after);
-    if (sequence !== intermediateListRequestSequence || requestedKind !== intermediateKind.value) return;
+    const page = await api.getIntermediateReport(shopId.value, snapshot.kind, snapshot.query, after);
+    if (sequence !== intermediateListRequestSequence || !snapshotIsCurrent(snapshot)) return false;
     intermediateItems.value = page.items;
     intermediateNext.value = page.nextCursor;
     intermediateAfter.value = after;
+    return true;
   } catch (caught) {
-    if (sequence === intermediateListRequestSequence && requestedKind === intermediateKind.value) error.value = userFacingError(caught, "暂时无法读取计算明细，请检查网络后重试");
+    if (sequence === intermediateListRequestSequence && snapshotIsCurrent(snapshot)) error.value = userFacingError(caught, "暂时无法读取计算明细，请检查网络后重试");
+    return false;
   }
   finally { if (sequence === intermediateListRequestSequence) intermediateLoading.value = false; }
 }
 
 async function applyFilters() {
+  if (filterRangeError.value) {
+    clearAppliedFilters();
+    error.value = filterRangeError.value;
+    return;
+  }
+  const snapshot = captureFilterSnapshot();
+  clearAppliedFilters();
   intermediateHistory.value = [];
-  try { await Promise.all([loadSummary(), loadIntermediate()]); }
+  try {
+    const [summaryApplied, listApplied] = await Promise.all([loadSummary(false, snapshot), loadIntermediate(undefined, snapshot)]);
+    if (summaryApplied && listApplied) markFiltersApplied(snapshot);
+  }
   catch (caught) { error.value = userFacingError(caught, "筛选没有成功，请检查网络后重试"); }
 }
 
 async function resetFilters() {
+  clearAppliedFilters();
   selectedMarketplaces.value = [];
   selectedCurrencies.value = [];
   grain.value = "MONTH";
-  await loadSummary(true);
-  await loadIntermediate();
+  try {
+    const resetSnapshot = captureFilterSnapshot();
+    if (!await loadSummary(true, resetSnapshot)) return;
+    const appliedSnapshot = captureFilterSnapshot();
+    if (await loadIntermediate(undefined, appliedSnapshot)) markFiltersApplied(appliedSnapshot);
+  } catch (caught) {
+    error.value = userFacingError(caught, "暂时无法重置筛选，请检查网络后重试");
+  }
 }
 
 async function changeIntermediateKind(kind: IntermediateReportKind) {
   const sequence = ++intermediateKindChangeSequence;
   intermediateListRequestSequence += 1;
+  clearAppliedFilters();
   intermediateKind.value = kind;
   intermediateHistory.value = [];
   restoreColumns();
@@ -184,9 +255,15 @@ async function changeIntermediateKind(kind: IntermediateReportKind) {
   intermediateLoading.value = true;
   error.value = "";
   try {
-    await loadSummary(true);
+    const resetSnapshot = captureFilterSnapshot();
+    if (!await loadSummary(true, resetSnapshot)) {
+      if (sequence === intermediateKindChangeSequence && intermediateKind.value === kind) intermediateLoading.value = false;
+      return;
+    }
     if (sequence !== intermediateKindChangeSequence || intermediateKind.value !== kind) return;
-    await loadIntermediate();
+    const appliedSnapshot = captureFilterSnapshot();
+    const listApplied = await loadIntermediate(undefined, appliedSnapshot);
+    if (listApplied && sequence === intermediateKindChangeSequence && intermediateKind.value === kind) markFiltersApplied(appliedSnapshot);
   } catch (caught) {
     if (sequence === intermediateKindChangeSequence && intermediateKind.value === kind) {
       error.value = userFacingError(caught, "暂时无法切换明细类型，请检查网络后重试");
@@ -224,8 +301,16 @@ function guardIntermediateExport(event: globalThis.MouseEvent) {
   if (!intermediateExportReady.value) event.preventDefault();
 }
 
-async function nextIntermediate() { if (intermediateNext.value) { intermediateHistory.value.push(intermediateAfter.value ?? ""); await loadIntermediate(intermediateNext.value); } }
-async function previousIntermediate() { const prior = intermediateHistory.value.pop(); if (prior !== undefined) await loadIntermediate(prior || undefined); }
+function appliedFilterSnapshot(): IntermediateFilterSnapshot {
+  return {
+    kind: intermediateKind.value,
+    query: appliedQuery(),
+    signature: appliedFilterSignature.value,
+  };
+}
+
+async function nextIntermediate() { if (intermediateNext.value && currentFiltersApplied.value) { intermediateHistory.value.push(intermediateAfter.value ?? ""); await loadIntermediate(intermediateNext.value, appliedFilterSnapshot()); } }
+async function previousIntermediate() { if (!currentFiltersApplied.value) return; const prior = intermediateHistory.value.pop(); if (prior !== undefined) await loadIntermediate(prior || undefined, appliedFilterSnapshot()); }
 
 async function reload() {
   if (reloadInFlight) return;
@@ -253,8 +338,11 @@ async function confirmHardExclusions() {
     exclusionReason.value = "";
     await reload();
     if (!requiresHardExclusionConfirmation.value) {
-      await loadSummary(true);
-      await loadIntermediate();
+      const resetSnapshot = captureFilterSnapshot();
+      if (await loadSummary(true, resetSnapshot)) {
+        const appliedSnapshot = captureFilterSnapshot();
+        if (await loadIntermediate(undefined, appliedSnapshot)) markFiltersApplied(appliedSnapshot);
+      }
     }
   } catch (caught) { error.value = userFacingError(caught, "暂时无法保存本次选择，请稍后重试"); }
   finally { resuming.value = false; }
@@ -266,8 +354,11 @@ onMounted(async () => {
   restoreColumns();
   await reload();
   if (canManage.value && !requiresHardExclusionConfirmation.value) {
-    await loadSummary(true);
-    await loadIntermediate();
+    const resetSnapshot = captureFilterSnapshot();
+    if (await loadSummary(true, resetSnapshot)) {
+      const appliedSnapshot = captureFilterSnapshot();
+      if (await loadIntermediate(undefined, appliedSnapshot)) markFiltersApplied(appliedSnapshot);
+    }
   }
   timer = window.setInterval(() => { if (calculation.value?.state === "IN_PROGRESS" || publication.value?.state === "IN_PROGRESS") void reload(); }, 1800);
 });
@@ -312,24 +403,30 @@ onBeforeUnmount(() => { if (timer) window.clearInterval(timer); document.removeE
     </section>
 
     <section v-if="canManage && !requiresHardExclusionConfirmation" class="surface-section intermediate-results" aria-labelledby="intermediate-title" :aria-busy="intermediateBusy">
-      <div class="section-heading split-heading"><div><h2 id="intermediate-title">系统识别出的明细</h2><p>可按日期、站点和币种查看；合计会计算所有符合条件的明细，不只计算当前这一页。</p></div><a class="primary-button compact intermediate-export-link" role="link" :href="intermediateExportReady ? exportUrl : undefined" :aria-disabled="!intermediateExportReady" :title="intermediateExportReady ? undefined : '明细加载完成后可导出'" tabindex="0" @click="guardIntermediateExport">导出当前{{ intermediateKind === "TRANSACTION" ? "交易报告" : "配送货件" }}</a></div>
-      <div class="segmented-control intermediate-kind-control" role="group" aria-label="明细类型"><button type="button" :class="{ active: intermediateKind === 'TRANSACTION' }" :aria-pressed="intermediateKind === 'TRANSACTION'" @click="changeIntermediateKind('TRANSACTION')">交易报告</button><button type="button" :class="{ active: intermediateKind === 'SHIPMENT' }" :aria-pressed="intermediateKind === 'SHIPMENT'" @click="changeIntermediateKind('SHIPMENT')">配送货件</button></div>
+      <div class="section-heading"><h2 id="intermediate-title">系统识别出的明细</h2><p>可按日期、站点和币种查看；合计会计算所有符合条件的明细，不只计算当前这一页。</p></div>
 
       <details class="intermediate-filter-drawer" open>
         <summary>筛选日期和显示内容</summary>
         <div ref="filterBar" class="intermediate-filter-bar">
         <details class="filter-popover"><summary>站点 {{ selectedMarketplaces.length ? `(${selectedMarketplaces.length})` : "全部" }}</summary><div><label v-for="value in summary?.options.marketplaces" :key="value"><input v-model="selectedMarketplaces" type="checkbox" :value="value" />{{ value }}</label></div></details>
         <details class="filter-popover"><summary>币种 {{ selectedCurrencies.length ? `(${selectedCurrencies.length})` : "全部" }}</summary><div><label v-for="value in summary?.options.currencies" :key="value"><input v-model="selectedCurrencies" type="checkbox" :value="value" />{{ value }}</label></div></details>
-        <DateRangePicker :grain="grain" :start="start" :end="end" @update:grain="changeGrain" @update:start="start = $event" @update:end="end = $event" />
+        <DateRangePicker :grain="grain" :start="start" :end="end" :allow-grain-change="true" @update:grain="changeGrain" @update:start="start = $event" @update:end="end = $event" />
         <details class="filter-popover field-picker"><summary>显示列 ({{ visibleColumns.length }}/{{ allColumns.length }})</summary><div><label v-for="column in allColumns" :key="column.key"><input v-model="selectedColumnKeys" type="checkbox" :value="column.key" @change="saveColumns" />{{ column.header }}</label></div></details>
           <button class="primary-button compact" type="button" @click="applyFilters">应用筛选</button><button class="secondary-button compact" type="button" @click="resetFilters">重置</button>
+          <div class="intermediate-report-toolbar">
+            <div class="segmented-control intermediate-kind-control" role="group" aria-label="明细类型"><button type="button" :class="{ active: intermediateKind === 'TRANSACTION' }" :aria-pressed="intermediateKind === 'TRANSACTION'" @click="changeIntermediateKind('TRANSACTION')">交易报告</button><button type="button" :class="{ active: intermediateKind === 'SHIPMENT' }" :aria-pressed="intermediateKind === 'SHIPMENT'" @click="changeIntermediateKind('SHIPMENT')">配送货件</button></div>
+            <div class="intermediate-export-actions" role="group" aria-label="导出明细">
+              <a class="secondary-button compact intermediate-export-link" data-kind="TRANSACTION" role="link" :href="intermediateExportReady ? transactionExportUrl : undefined" :aria-disabled="!intermediateExportReady" :title="intermediateExportReady ? undefined : '明细加载完成后可导出'" :tabindex="intermediateExportReady ? 0 : -1" @click="guardIntermediateExport">导出交易报告</a>
+              <a class="secondary-button compact intermediate-export-link" data-kind="SHIPMENT" role="link" :href="intermediateExportReady ? shipmentExportUrl : undefined" :aria-disabled="!intermediateExportReady" :title="intermediateExportReady ? undefined : '明细加载完成后可导出'" :tabindex="intermediateExportReady ? 0 : -1" @click="guardIntermediateExport">导出配送货件</a>
+            </div>
+          </div>
         </div>
       </details>
 
       <p v-if="intermediateLoading" class="inline-empty" role="status" aria-live="polite">正在读取计算明细…</p>
       <div v-else-if="intermediateItems.length" class="intermediate-table-scroll" tabindex="0" role="region" :aria-label="`${intermediateKind === 'TRANSACTION' ? '交易报告' : '配送货件'}明细表`"><table><thead><tr><th v-for="column in visibleColumns" :key="column.key">{{ column.header }}</th></tr></thead><tbody><tr v-for="item in intermediateItems" :key="item.id"><td v-for="column in visibleColumns" :key="column.key" :class="{ numeric: !['text', 'date'].includes(column.kind) }">{{ intermediateValue(item, column.key) }}</td></tr></tbody><tfoot><tr v-for="total in summary?.totalsByCurrency" :key="total.currency"><th v-for="(column, index) in visibleColumns" :key="column.key">{{ index === 0 ? `${total.currency} 合计` : column.total ? decimalDisplay(total.values[column.key] ?? '0', column.kind === 'rate' ? 8 : 2) : "" }}</th></tr></tfoot></table></div>
       <p v-else class="inline-empty">当前筛选没有{{ intermediateKind === "TRANSACTION" ? "交易报告" : "配送货件" }}数据。</p>
-      <div class="table-footer-actions"><span>{{ intermediateKind === "SHIPMENT" ? `人民币跨币种总计：${summary?.cnyTotal ? decimalDisplay(summary.cnyTotal) : "汇率不完整"}` : "原币金额按币种分别合计" }}</span><div><button class="secondary-button" type="button" :disabled="intermediateHistory.length === 0 || intermediateLoading" @click="previousIntermediate">上一页</button><button class="secondary-button" type="button" :disabled="!intermediateNext || intermediateLoading" @click="nextIntermediate">下一页</button></div></div>
+      <div class="table-footer-actions"><span>{{ currentFiltersApplied ? (intermediateKind === "SHIPMENT" ? `人民币跨币种总计：${summary?.cnyTotal ? decimalDisplay(summary.cnyTotal) : "汇率不完整"}` : "原币金额按币种分别合计") : "筛选已修改，请先应用筛选" }}</span><div><button class="secondary-button" type="button" :disabled="!currentFiltersApplied || intermediateHistory.length === 0 || intermediateLoading" @click="previousIntermediate">上一页</button><button class="secondary-button" type="button" :disabled="!currentFiltersApplied || !intermediateNext || intermediateLoading" @click="nextIntermediate">下一页</button></div></div>
       <p v-if="error" class="form-error" role="alert">{{ error }}</p>
     </section>
 

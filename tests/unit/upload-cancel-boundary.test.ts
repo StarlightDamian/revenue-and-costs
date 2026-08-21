@@ -131,6 +131,7 @@ describe("upload cancellation boundary", () => {
     expect(candidateQuery).toContain("SKIP LOCKED");
     const cleanupQuery = queries.find((sql) => sql.includes("FROM upload_file file"));
     expect(cleanupQuery).toContain("batch.status IN ('EXPIRED','CANCELLED')");
+    expect(cleanupQuery).toContain("file.status='FAILED' OR");
     expect(cleanupQuery).toContain("file.temp_path<>''");
     expect(cleanupQuery).toContain("ORDER BY file.updated_at,file.id");
     expect(cleanupQuery).toContain("LIMIT 100");

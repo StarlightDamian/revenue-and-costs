@@ -374,6 +374,15 @@ active_calculations="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 
 active_imports="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
   -c "SELECT count(*) FROM import_batch WHERE status NOT IN ('RESULT_PUBLISHED','FAILED','CANCELLED')")"
 [[ "$active_imports" == '0' ]] || fail 'ACTIVE_IMPORTS_REQUIRE_DRAIN'
+active_exports="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
+  -c "SELECT count(*) FROM export_request WHERE status IN ('QUEUED','RUNNING')")"
+[[ "$active_exports" == '0' ]] || fail 'ACTIVE_EXPORTS_REQUIRE_DRAIN'
+active_uploads="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
+  -c "SELECT count(*) FROM upload_file WHERE status IN ('PENDING','UPLOADING','COMPLETE','ENCRYPTING') AND NOT metadata_only")"
+[[ "$active_uploads" == '0' ]] || fail 'ACTIVE_UPLOADS_REQUIRE_DRAIN'
+pending_business_outbox="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
+  -c "SELECT count(*) FROM outbox_event WHERE dispatched_at IS NULL AND topic IN ('upload.finalize','import.analyze','import.commit','calculation.requested','calculation.run','report.auto-publish','export.generate')")"
+[[ "$pending_business_outbox" == '0' ]] || fail 'PENDING_BUSINESS_OUTBOX_REQUIRE_DRAIN'
 runuser -u postgres -- "$pg_dump_bin" --format=custom "$database_name" > "$backup_partial"
 [[ -s "$backup_partial" ]] || fail 'DATABASE_BACKUP_EMPTY'
 "$pg_restore_bin" --list "$backup_partial" >/dev/null

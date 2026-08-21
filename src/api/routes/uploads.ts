@@ -34,6 +34,9 @@ const CreateBatchBody = Type.Object({
   files: Type.Optional(Type.Array(UploadRegistrationFile, { minItems: 1, maxItems: MAX_UPLOAD_FILES })),
 }, { additionalProperties: false });
 const BatchParams = Type.Object({ batchId: UuidSchema });
+const RemoveFilesBody = Type.Object({
+  fileIds: Type.Array(UuidSchema, { minItems: 1, maxItems: MAX_UPLOAD_FILES, uniqueItems: true }),
+}, { additionalProperties: false });
 const FileParams = Type.Object({ fileId: UuidSchema });
 const OriginalDownloadQuery = Type.Object({ token: Type.String({ pattern: "^[A-Za-z0-9_-]{43}$" }) });
 const ChunkHeaders = Type.Object({
@@ -139,6 +142,13 @@ export async function registerUploadRoutes(app: FastifyInstance, deps: UploadRou
     const batchId = (request.params as { batchId: string }).batchId;
     await deps.authorize(request, await deps.service.resolveBatchShop(batchId), "upload");
     return deps.service.completeBatch(batchId);
+  });
+  app.post<{ Params: { batchId: string }; Body: { fileIds: string[] } }>("/api/v1/uploads/batches/:batchId/remove-files", {
+    schema: { params: BatchParams, body: RemoveFilesBody },
+  }, async (request) => {
+    const shopId = await deps.service.resolveBatchShop(request.params.batchId);
+    const actor = await deps.authorize(request, shopId, "upload");
+    return deps.service.removeFiles(request.params.batchId, request.body.fileIds, actor.accountId);
   });
   app.post("/api/v1/uploads/batches/:batchId/cancel", { schema: { params: BatchParams } }, async (request, reply) => {
     const batchId = (request.params as { batchId: string }).batchId;

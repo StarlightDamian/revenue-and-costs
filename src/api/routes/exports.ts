@@ -2,6 +2,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import type { Actor } from "../../modules/authorization/index.js";
 import type { ExportAssumptionInput, PostgresExportService } from "../../modules/exports/postgres.js";
+import { parseAccountingPeriodScope, type AccountingPeriodInput } from "../../shared/accounting-period.js";
 import { UuidSchema } from "../../shared/contracts.js";
 import { requireIdempotencyKey } from "../idempotency.js";
 
@@ -14,10 +15,13 @@ const NullableRateSchema = Type.Union([Type.Null(), RateStringSchema]);
 const ContinentPrefixesSchema = Type.Array(Type.Union([
   Type.Literal("AS"), Type.Literal("EU"), Type.Literal("AF"), Type.Literal("AM"), Type.Literal("OC"),
 ]), { maxItems: 5, uniqueItems: true });
+const MonthSchema = Type.String({ pattern: "^(?:19|20|21)[0-9]{2}-(?:0[1-9]|1[0-2])$" });
 const ExportAssumptionsSchema = Type.Object({
   profitRate: Type.Optional(NullableRateSchema),
   minimumSalesCostRate: Type.Optional(NullableRateSchema),
   continentPrefixes: Type.Optional(ContinentPrefixesSchema),
+  periodStart: Type.Optional(MonthSchema),
+  periodEnd: Type.Optional(MonthSchema),
 }, { additionalProperties: false });
 const ExportListQuery = Type.Object({ shopId: UuidSchema });
 const ExportParams = Type.Object({ id: UuidSchema });
@@ -28,6 +32,8 @@ const CurrentExportParams = Type.Object({ shopId: UuidSchema });
 const CostPreviewQuery = Type.Object({
   profitRate: Type.Optional(Type.String({ maxLength: 10, pattern: "^(?:(?:0|1)(?:\\.\\d{1,8})?)?$" })),
   minimumSalesCostRate: Type.Optional(Type.String({ maxLength: 10, pattern: "^(?:(?:0|1)(?:\\.\\d{1,8})?)?$" })),
+  periodStart: Type.Optional(MonthSchema),
+  periodEnd: Type.Optional(MonthSchema),
 }, { additionalProperties: false });
 const CreateSnapshotExportSchema = Type.Object({
   shopId: UuidSchema,
@@ -35,6 +41,8 @@ const CreateSnapshotExportSchema = Type.Object({
   profitRate: Type.Optional(NullableRateSchema),
   minimumSalesCostRate: Type.Optional(NullableRateSchema),
   continentPrefixes: Type.Optional(ContinentPrefixesSchema),
+  periodStart: Type.Optional(MonthSchema),
+  periodEnd: Type.Optional(MonthSchema),
 }, { additionalProperties: false });
 type ExportAssumptionsBody = Static<typeof ExportAssumptionsSchema>;
 type CostPreviewQuerystring = Static<typeof CostPreviewQuery>;
@@ -47,6 +55,13 @@ function previewAssumptions(query: CostPreviewQuerystring): ExportAssumptionInpu
       ? {}
       : { minimumSalesCostRate: query.minimumSalesCostRate === "" ? null : query.minimumSalesCostRate }),
   };
+}
+
+function previewPeriod(query: CostPreviewQuerystring): AccountingPeriodInput {
+  return parseAccountingPeriodScope({
+    ...(query.periodStart ? { periodStart: query.periodStart } : {}),
+    ...(query.periodEnd ? { periodEnd: query.periodEnd } : {}),
+  }) ?? {};
 }
 
 export interface ExportRouteOptions {
@@ -67,6 +82,7 @@ export const exportRoutes: FastifyPluginAsync<ExportRouteOptions> = async (app, 
       await options.authenticate(request, false),
       request.params.shopId,
       previewAssumptions(request.query),
+      previewPeriod(request.query),
     ),
   );
   app.post<{ Params: { shopId: string }; Body: ExportAssumptionsBody }>(

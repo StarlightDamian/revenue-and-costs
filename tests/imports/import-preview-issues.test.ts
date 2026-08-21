@@ -31,4 +31,106 @@ describe("import preview issue groups", () => {
     expect(batch).toMatchObject({ uploadBatchId: "upload-1", uploadReady: true });
     expect(`${batch.issues[0]?.message}${batch.issues[0]?.action}`).not.toContain("selling_fees");
   });
+
+  it("returns only removable staged upload files while an upload is still open", async () => {
+    const database = { query: vi.fn()
+      .mockResolvedValueOnce({ rows: [{
+        id: "batch-1", status: "UPLOADING", current_stage: "UPLOAD", failure_code: null,
+        upload_batch_id: "upload-1", upload_batch_status: "UPLOADING", upload_ready: true,
+        accounting_period_start: null, accounting_period_end: null,
+      }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [
+        { id: "file-1", relative_path: "US/transaction.csv", declared_size: "1024", status: "COMPLETE", metadata_only: false },
+        { id: "file-2", relative_path: "notes.pdf", declared_size: "0", status: "COMPLETE", metadata_only: true },
+      ] })
+      .mockResolvedValueOnce({ rows: [] }) };
+    const service = new PostgresImportService({ transaction: vi.fn() } as never, database as never);
+
+    const batch = await service.getBatch("shop-1", "batch-1");
+
+    expect(batch.stagedUploadFiles).toEqual([
+      { id: "file-1", relativePath: "US/transaction.csv", bytes: "1024", status: "COMPLETE", metadataOnly: false },
+      { id: "file-2", relativePath: "notes.pdf", bytes: "0", status: "COMPLETE", metadataOnly: true },
+    ]);
+    const stagedQuery = database.query.mock.calls[2];
+    expect(String(stagedQuery?.[0])).toContain("archive_reservation_state='NONE'");
+    expect(String(stagedQuery?.[0])).toContain("UPLOAD_FILES_REMOVED_BEFORE_IMPORT");
+    expect(stagedQuery?.[1]).toEqual(["upload-1"]);
+  });
+
+  it("projects source presence independently from reconciliation quantities", async () => {
+    const database = { query: vi.fn().mockResolvedValue({ rows: [
+      {
+        slice_id: "shipment-only",
+        dataset_version_id: "version-shipment",
+        normalized_marketplace: "CA",
+        local_month: "2026-04",
+        status: "ACTIVE",
+        shipment_count: "1",
+        transaction_count: "0",
+        warning: null,
+        shipment_quantity: null,
+        transaction_quantity: null,
+        unmatched_absolute: null,
+        unmatched_ratio: null,
+      },
+      {
+        slice_id: "transaction-only",
+        dataset_version_id: "version-transaction",
+        normalized_marketplace: "MX",
+        local_month: "2026-04",
+        status: "ACTIVE",
+        shipment_count: "0",
+        transaction_count: "1",
+        warning: null,
+        shipment_quantity: null,
+        transaction_quantity: null,
+        unmatched_absolute: null,
+        unmatched_ratio: null,
+      },
+      {
+        slice_id: "missing-shipment",
+        dataset_version_id: "version-missing",
+        normalized_marketplace: "US",
+        local_month: "2026-04",
+        status: "INCOMPLETE",
+        shipment_count: "0",
+        transaction_count: "1",
+        warning: null,
+        shipment_quantity: null,
+        transaction_quantity: null,
+        unmatched_absolute: null,
+        unmatched_ratio: null,
+      },
+    ] }) };
+    const service = new PostgresImportService({ transaction: vi.fn() } as never, database as never);
+
+    await expect(service.getCompleteness("shop-1")).resolves.toEqual([
+      expect.objectContaining({
+        sliceId: "shipment-only",
+        state: "COMPLETE",
+        shipmentSourceCount: "1",
+        transactionSourceCount: "0",
+        missingReports: [],
+      }),
+      expect.objectContaining({
+        sliceId: "transaction-only",
+        state: "COMPLETE",
+        shipmentSourceCount: "0",
+        transactionSourceCount: "1",
+        missingReports: [],
+      }),
+      expect.objectContaining({
+        sliceId: "missing-shipment",
+        state: "MISSING_SHIPMENT",
+        shipmentSourceCount: "0",
+        transactionSourceCount: "1",
+        missingReports: ["SHIPMENT"],
+      }),
+    ]);
+    const completenessSql = String(database.query.mock.calls[0]?.[0]);
+    expect(completenessSql).toContain("count(*) FILTER (WHERE b.report_kind='SHIPMENT')");
+    expect(completenessSql).toContain("count(*) FILTER (WHERE b.report_kind='TRANSACTION')");
+  });
 });

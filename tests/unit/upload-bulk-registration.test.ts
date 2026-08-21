@@ -38,7 +38,7 @@ describe("upload bulk registration", () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
-  it("creates batch, files, PDF metadata and zero-byte outbox in one transaction with one batch lock", async () => {
+  it("creates batch, files and PDF metadata in one transaction while leaving zero-byte files staged", async () => {
     const calls: Array<{ sql: string; parameters?: readonly unknown[] }> = [];
     const client = {
       async query(sql: string, parameters?: readonly unknown[]) {
@@ -52,7 +52,6 @@ describe("upload bulk registration", () => {
           return { rows: ids.map((id) => ({ id })), rowCount: ids.length };
         }
         if (sql.includes("INSERT INTO import_file")) return { rows: [], rowCount: 1 };
-        if (sql.includes("INSERT INTO outbox_event")) return { rows: [{ id: "outbox-id" }], rowCount: 1 };
         return { rows: [], rowCount: 1 };
       },
       release: vi.fn(),
@@ -71,7 +70,9 @@ describe("upload bulk registration", () => {
     expect(calls.filter((call) => call.sql.includes("INSERT INTO upload_file"))).toHaveLength(1);
     expect(calls.some((call) => call.sql.includes("INSERT INTO import_file") && call.sql.includes("file.metadata_only"))).toBe(true);
     expect(calls.find((call) => call.sql.includes("INSERT INTO import_batch"))?.parameters?.slice(-2)).toEqual(["2026-04-01", "2026-06-01"]);
-    expect(calls.some((call) => call.sql.includes("INSERT INTO outbox_event") && call.sql.includes("upload.finalize"))).toBe(true);
+    expect(calls.some((call) => call.sql.includes("INSERT INTO outbox_event") && call.sql.includes("upload.finalize"))).toBe(false);
+    const uploadInsert = calls.find((call) => call.sql.includes("INSERT INTO upload_file"));
+    expect(uploadInsert?.parameters?.[5]).toEqual(["COMPLETE", "COMPLETE"]);
     expect(calls[0]?.sql).toBe("BEGIN");
     const existingIndex = calls.findIndex((call) => call.sql.includes("idempotency_key=$2"));
     const shopLockIndex = calls.findIndex((call) => call.sql.includes("FROM shop") && call.sql.includes("FOR UPDATE"));

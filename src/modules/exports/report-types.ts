@@ -40,6 +40,11 @@ export interface ReportExportInput {
     readonly minimumSalesCostRate: string | null;
   };
   continentPrefixes?: readonly string[];
+  /** Optional user-selected projection range; absent means the full published snapshot scope. */
+  reportPeriod?: {
+    readonly periodStart: string;
+    readonly periodEnd: string;
+  };
   /** Inclusive ISO months represented by the published snapshot. */
   reportPeriods: readonly string[];
   monthly: ReportSection;

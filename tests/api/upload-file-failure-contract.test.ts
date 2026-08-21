@@ -182,6 +182,63 @@ describe("upload file failure HTTP contract", () => {
     await app.close();
   });
 
+  it("authorizes staged file removal through the owning batch and returns the cleanup result", async () => {
+    const resolveBatchShop = vi.fn(async () => "20000000-0000-4000-8000-000000000002");
+    const removeFiles = vi.fn(async () => ({ removedCount: 2, remainingCount: 1, cancelled: false }));
+    const authorize = vi.fn(async () => actor);
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: { resolveBatchShop, removeFiles } as unknown as UploadService,
+      objectStore: {} as EncryptedObjectStore,
+      authorize,
+      async auditOriginalDownload() {},
+    });
+    const fileIds = [
+      "30000000-0000-4000-8000-000000000003",
+      "40000000-0000-4000-8000-000000000004",
+    ];
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/uploads/batches/50000000-0000-4000-8000-000000000005/remove-files",
+      payload: { fileIds },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(resolveBatchShop).toHaveBeenCalledWith("50000000-0000-4000-8000-000000000005");
+    expect(authorize).toHaveBeenCalledWith(expect.anything(), "20000000-0000-4000-8000-000000000002", "upload");
+    expect(removeFiles).toHaveBeenCalledWith("50000000-0000-4000-8000-000000000005", fileIds, actor.accountId);
+    expect(response.json()).toEqual({ removedCount: 2, remainingCount: 1, cancelled: false });
+    await app.close();
+  });
+
+  it("rejects empty, duplicate or invalid staged file selections before authorization", async () => {
+    const resolveBatchShop = vi.fn();
+    const removeFiles = vi.fn();
+    const authorize = vi.fn(async () => actor);
+    const app = Fastify();
+    await registerUploadRoutes(app, {
+      service: { resolveBatchShop, removeFiles } as unknown as UploadService,
+      objectStore: {} as EncryptedObjectStore,
+      authorize,
+      async auditOriginalDownload() {},
+    });
+    const validId = "30000000-0000-4000-8000-000000000003";
+
+    for (const fileIds of [[], [validId, validId], ["not-a-uuid"]]) {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/v1/uploads/batches/50000000-0000-4000-8000-000000000005/remove-files",
+        payload: { fileIds },
+      });
+      expect(response.statusCode).toBe(400);
+    }
+    expect(resolveBatchShop).not.toHaveBeenCalled();
+    expect(authorize).not.toHaveBeenCalled();
+    expect(removeFiles).not.toHaveBeenCalled();
+    await app.close();
+  });
+
   it("rejects invalid batch and file ids before resolving their shops", async () => {
     const resolveBatchShop = vi.fn(async () => "20000000-0000-4000-8000-000000000002");
     const resolveFileShop = vi.fn(async () => "20000000-0000-4000-8000-000000000002");

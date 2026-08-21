@@ -8,7 +8,7 @@ import { once } from "node:events";
 import type { ColumnDefinition, ReportCell, ReportExportInput, ReportRow, ReportSection } from "./report-types";
 
 export const REPORT_SHEETS = ["口径说明", "月度明细账单", "季度明细账单", "年度明细账单", "成本核算表-人民币"] as const;
-export const REPORT_EXPORT_FORMAT = "revenue-and-costs-export-v9";
+export const REPORT_EXPORT_FORMAT = "revenue-and-costs-export-v10";
 const EXCEL_MAX_ROWS = 1_048_576;
 const REPORT_ROW_HEIGHT = 30;
 const HEADER_FILL = "1F4E78";
@@ -278,7 +278,7 @@ function setFinancialHeader(sheet: ExcelJS.Worksheet, periods: readonly string[]
   sheet.getRow(1).values = ["导出日期：", reportPeriodLabel(periods)];
   sheet.getRow(1).height = REPORT_ROW_HEIGHT;
   sheet.mergeCells("B1:AF1");
-  sheet.getRow(2).values = ["公司", "日期", "平台", "站点", "原币币种", "收入", "", "", "", "", "", "平台支出", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "采购成本", "", "", "利润", "", ""];
+  sheet.getRow(2).values = ["店铺", "日期", "平台", "站点", "原币币种", "收入", "", "", "", "", "", "平台支出", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "采购成本", "", "", "利润", "", ""];
   sheet.getRow(3).values = ["", "", "", "", "", "收入总额", "", "退款金额", "", "收入净额", "", "商品税", "", "平台费", "", "FBA发货费", "", "FBA 仓储费", "", "广告费", "", "其他扣费", "", "费用合计", "", "平台扣费率", "销售成本率", "采购成本", "", "利润率", "利润金额", ""];
   sheet.getRow(4).values = ["", "", "", "", "", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "原币金额", "人民币金额", "", "", "原币金额", "人民币金额", "", "原币金额", "人民币金额"];
   for (const range of ["A2:A4", "B2:B4", "C2:C4", "D2:D4", "E2:E4", "F2:K2", "L2:Y2", "Z2:AC2", "AD2:AF2", "F3:G3", "H3:I3", "J3:K3", "L3:M3", "N3:O3", "P3:Q3", "R3:S3", "T3:U3", "V3:W3", "X3:Y3", "Z3:Z4", "AA3:AA4", "AB3:AC3", "AD3:AD4", "AE3:AF3"]) sheet.mergeCells(range);
@@ -574,13 +574,14 @@ async function createWorkbook(
   notes.addRow(["跨境电商平台收入与平台成本报告"]).font = { bold: true, size: 16, color: { argb: `FF${HEADER_FILL}` }, name: "Microsoft YaHei" };
   notes.mergeCells("A1:B1");
   const metadata: readonly [string, string][] = [
-    ["ID", input.diagnosticId], ["公司", input.shopName], ["快照", input.snapshotId], ["发布时间", input.publishedAt], ["导出生成时间", input.generatedAt],
+    ["ID", input.diagnosticId], ["店铺", input.shopName], ["快照", input.snapshotId], ["发布时间", input.publishedAt], ["导出生成时间", input.generatedAt],
     ["数据版本", input.dataVersion], ["映射版本", input.mappingVersion], ["汇率版本", input.fxVersion],
     ["日期口径版本", input.timezoneVersion], ["口径版本", input.policyVersion], ["公式版本", input.formulaVersion],
     ["代码版本", input.codeVersion], ["应用价格版本", input.priceVersion], ["Manifest SHA-256", input.manifestSha256],
     ["金额精度", "数据库金额与汇率追溯值保留8位小数，工作簿统一显示2位小数。"],
     ["本次利润率", input.costAssumptions.profitRate ?? "未设置"],
     ["本次最低销售成本率", input.costAssumptions.minimumSalesCostRate ?? "未设置"],
+    ["本次核算月份", reportPeriodLabel(input.reportPeriods)],
     ["导出站点前缀", input.continentPrefixes?.join(",") || "未启用"],
     ["采购成本边界", "采购成本由本次可选参数测算，不写回发布快照或事实明细；最低成本率触发时利润作为勾稽余项降低。利润不含人工、管理费用及所得税。"],
     ["发布边界", "本报告固定到一个不可变已发布快照，不跨快照拼接。"],
@@ -711,6 +712,8 @@ export async function exportReport(input: ReportExportInput, outputPath: string,
       },
       costAssumptions: input.costAssumptions,
       continentPrefixes: input.continentPrefixes ?? [],
+      reportPeriod: input.reportPeriod ?? null,
+      reportPeriods: input.reportPeriods,
       workbook: workbookManifest,
       files: csvFiles,
       sheetNames: REPORT_SHEETS,

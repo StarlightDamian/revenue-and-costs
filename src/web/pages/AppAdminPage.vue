@@ -26,7 +26,7 @@ const appStatusName = (status: AdminApp["status"]) => status === "PUBLISHED" ? "
   <section>
     <PageHeader
       title="应用管理"
-      description="管理应用上下架、顺序、做账员建公司权限和只向前生效的年度价格版本。管理员可为选定企业免费使用启用中的应用。"
+      description="管理应用上下架、顺序、做账员建店权限和只向前生效的年度价格版本。管理员可为选定企业免费使用启用中的应用。"
     />
     <AsyncState
       :status="status"
@@ -41,7 +41,7 @@ const appStatusName = (status: AdminApp["status"]) => status === "PUBLISHED" ? "
           tabindex="0"
         >
           <table>
-            <thead><tr><th>应用</th><th>状态</th><th>排序</th><th>年度价格（分）</th><th>价格版本</th><th>做账员建公司</th><th>操作</th></tr></thead><tbody>
+            <thead><tr><th>应用</th><th>状态</th><th>排序</th><th>年度价格（分）</th><th>价格版本</th><th>做账员建店</th><th>操作</th></tr></thead><tbody>
               <tr
                 v-for="app in apps"
                 :key="app.id"

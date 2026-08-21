@@ -14,6 +14,7 @@ import type {
   IntermediateReportSummary,
   Me,
   ReportResult,
+  ReportPeriod,
   Shop,
   ShopMembership,
   ShopWorkflow,
@@ -82,7 +83,7 @@ export function cnyToCents(value: string): string {
 function addBillingYears(startDate: string, yearsText: string): string {
   const years = Number(yearsText);
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(startDate);
-  if (!match || !Number.isSafeInteger(years) || years < 1 || years > 100) throw new Error("公司期限无效");
+  if (!match || !Number.isSafeInteger(years) || years < 1 || years > 100) throw new Error("店铺期限无效");
   const year = Number(match[1]) + years;
   const month = Number(match[2]);
   const day = Number(match[3]);
@@ -185,6 +186,10 @@ export const api = {
   failUploadFile: (fileId: string, reasonCode: "CLIENT_NETWORK_RETRY_EXHAUSTED" | "CLIENT_FILE_READ_FAILED" | "CLIENT_UPLOAD_ABORTED") =>
     apiRequest<void>(`/api/v1/uploads/files/${encodeURIComponent(fileId)}/fail`, { method: "POST", body: json({ reasonCode }) }),
   completeUpload: async (batchId: string) => normalizeUploadCompletion(await apiRequest<unknown>(`/api/v1/uploads/batches/${encodeURIComponent(batchId)}/complete`, { method: "POST" })),
+  removeUploadFiles: (batchId: string, fileIds: readonly string[]) => apiRequest<{ removedCount: number; remainingCount: number; cancelled: boolean }>(
+    `/api/v1/uploads/batches/${encodeURIComponent(batchId)}/remove-files`,
+    { method: "POST", body: json({ fileIds }) },
+  ),
   cancelUpload: (batchId: string) => apiRequest<void>(`/api/v1/uploads/batches/${encodeURIComponent(batchId)}/cancel`, { method: "POST" }),
   getImportPreview: (shopId: string, batchId: string) => apiRequest<ImportPreview>(`/api/v1/imports/shops/${encodeURIComponent(shopId)}/batches/${encodeURIComponent(batchId)}`),
   getLatestImportPreview: (shopId: string) => apiRequest<ImportPreview | null>(`/api/v1/imports/shops/${encodeURIComponent(shopId)}/batches/latest`),
@@ -220,15 +225,19 @@ export const api = {
   },
   publishReport: (shopId: string, report: ReportResult) => apiRequest<ReportResult>(`/api/v1/reports/shops/${encodeURIComponent(shopId)}/publish`, { method: "POST", body: json({ calculationRunId: report.runId, slices: (report.publishSlices ?? report.completeness).map((slice) => ({ sliceId: slice.sliceId, datasetVersionId: slice.datasetVersionId, disposition: slice.disposition })) }) }),
   listExports: (shopId: string) => apiRequest<ExportJob[]>(`/api/v1/exports?shopId=${encodeURIComponent(shopId)}`),
-  previewCostAccounting: (shopId: string, preferences: AccountingPreferences) => {
+  previewCostAccounting: (shopId: string, preferences: AccountingPreferences, period?: ReportPeriod) => {
     const query = new URLSearchParams({
       profitRate: preferences.profitRate ?? "",
       minimumSalesCostRate: preferences.minimumSalesCostRate ?? "",
     });
+    if (period) {
+      query.set("periodStart", period.periodStart);
+      query.set("periodEnd", period.periodEnd);
+    }
     return apiRequest<CostAccountingPreview>(`/api/v1/shops/${encodeURIComponent(shopId)}/exports/cost-preview?${query}`);
   },
-  createExport: (shopId: string, snapshotId: string, preferences?: AccountingPreferences) => apiRequest<ExportJob>("/api/v1/exports", { method: "POST", body: json({ shopId, snapshotId, ...preferences }) }),
-  createCurrentExport: (shopId: string, preferences?: AccountingPreferences) => apiRequest<ExportJob>(`/api/v1/shops/${encodeURIComponent(shopId)}/exports/current`, { method: "POST", body: json(preferences ?? {}) }),
+  createExport: (shopId: string, snapshotId: string, preferences?: AccountingPreferences, period?: ReportPeriod) => apiRequest<ExportJob>("/api/v1/exports", { method: "POST", body: json({ shopId, snapshotId, ...preferences, ...period }) }),
+  createCurrentExport: (shopId: string, preferences?: AccountingPreferences, period?: ReportPeriod) => apiRequest<ExportJob>(`/api/v1/shops/${encodeURIComponent(shopId)}/exports/current`, { method: "POST", body: json({ ...(preferences ?? {}), ...(period ?? {}) }) }),
   cancelExport: (id: string) => apiRequest<void>(`/api/v1/exports/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
   getDownloadUrl: async (id: string) => {
     const result = await apiRequest<{ url: string }>(`/api/v1/exports/${encodeURIComponent(id)}/download-token`, { method: "POST" });

@@ -41,7 +41,7 @@ describe("bulk shop trash", () => {
   it("rejects the whole operation when any shop has an active workflow", async () => {
     const test = fixture([shops[0]!.id]);
     await expect(test.service.bulkTrash({ actor, shopIds: shops.map((shop) => shop.id), reason: "批量整理", idempotencyKey: "key-2", requestId: "request-2" }))
-      .rejects.toMatchObject({ code: "SHOP_HAS_ACTIVE_WORKFLOW", statusCode: 409 });
+      .rejects.toMatchObject({ code: "SHOP_HAS_ACTIVE_WORKFLOW", statusCode: 409, message: "所选店铺存在运行中的任务，请完成或取消后再删除" });
     expect(test.query.mock.calls.some(([sql]) => String(sql).startsWith("UPDATE shop"))).toBe(false);
     expect(test.effects.audit).not.toHaveBeenCalled();
   });

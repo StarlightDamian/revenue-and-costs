@@ -5,6 +5,64 @@ import type { ReportExportInput } from "../../src/modules/exports/report-types.j
 import type { EncryptedObjectStore } from "../../src/modules/storage/encrypted-object-store.js";
 
 describe("export without embedded FX trace", () => {
+  it("projects every workbook section from the same frozen report month range", async () => {
+    const calls: Array<{ sql: string; parameters?: readonly unknown[] }> = [];
+    const query = vi.fn(async (sql: string, parameters?: readonly unknown[]) => {
+      calls.push({ sql, ...(parameters ? { parameters } : {}) });
+      if (sql.includes("FROM published_snapshot s JOIN published_snapshot_integrity")) {
+        return { rows: [{
+          shop_name: "shop", manifest: { slices: [] }, manifest_sha256: "a".repeat(64),
+          calculation_run_id: "run", published_at: new Date("2026-07-28T00:00:00Z"),
+        }], rowCount: 1 };
+      }
+      if (sql.includes("FROM published_snapshot_slice ps JOIN dataset_slice")) {
+        return { rows: [
+          { period: "2026-05", month: "2026-05", marketplace: "US", currency: "USD", disposition: "INCLUDED", datasetVersionId: "version-5" },
+          { period: "2026-06", month: "2026-06", marketplace: "US", currency: "USD", disposition: "INCLUDED", datasetVersionId: "version-6" },
+        ], rowCount: 2 };
+      }
+      if (sql.includes("WITH component_amount AS")) {
+        return { rows: [
+          { period: "2026-05", marketplace: "US", currency: "USD", currencyCount: "1", incomeCny: "5" },
+          { period: "2026-06", marketplace: "US", currency: "USD", currencyCount: "1", incomeCny: "6" },
+        ], rowCount: 2 };
+      }
+      if (sql.includes("FROM calculation_fact_result r JOIN dataset_version") && sql.includes("r.component NOT IN")) return { rows: [], rowCount: 0 };
+      if (sql.includes("FROM import_file f WHERE")) return { rows: [], rowCount: 0 };
+      throw new Error(`UNEXPECTED_QUERY:${sql}`);
+    });
+    const service = new PostgresExportService(
+      { query } as unknown as Pool,
+      {} as EncryptedObjectStore,
+      "D:/tmp/export-period-projection",
+    );
+    const input = await (service as unknown as {
+      buildInput(
+        shopId: string,
+        snapshotId: string,
+        preferences: { profitRate: null; minimumSalesCostRate: null; continentPrefixes: readonly string[] },
+        exportId: string | undefined,
+        reportPeriod: { periodStart: string; periodEnd: string },
+      ): Promise<ReportExportInput>;
+    }).buildInput(
+      "10000000-0000-4000-8000-000000000001",
+      "20000000-0000-4000-8000-000000000002",
+      { profitRate: null, minimumSalesCostRate: null, continentPrefixes: ["EU"] },
+      undefined,
+      { periodStart: "2026-05", periodEnd: "2026-06" },
+    );
+
+    const monthly = [];
+    for await (const row of input.monthly.source.rows()) monthly.push(row);
+    expect(input.reportPeriods).toEqual(["2026-05", "2026-06"]);
+    expect(monthly.map((row) => row.period)).toEqual(["2026-05", "2026-06"]);
+    const scopedCalls = calls.filter((call) => call.sql.includes("$2::date"));
+    expect(scopedCalls).toHaveLength(4);
+    for (const call of scopedCalls) {
+      expect(call.parameters?.slice(-2)).toEqual(["2026-05-01", "2026-06-01"]);
+    }
+  });
+
   it("fails closed with a safe permanent error when included slices span natural years", async () => {
     const query = vi.fn(async (sql: string) => {
       if (sql.includes("FROM published_snapshot s JOIN published_snapshot_integrity")) {

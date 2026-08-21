@@ -174,6 +174,13 @@ export interface ImportPreview {
   progress: string;
   stage?: string;
   failureCode?: string | null;
+  stagedUploadFiles?: Array<{
+    id: string;
+    relativePath: string;
+    bytes: string;
+    status: "PENDING" | "UPLOADING" | "COMPLETE" | "FAILED";
+    metadataOnly: boolean;
+  }>;
   files: Array<{ id: string; relativePath: string; bytes: string; classification?: string; status: string }>;
   ignored: Array<{ relativePath: string; reason: string }>;
   issues: Array<{
@@ -215,6 +222,8 @@ export interface CompletenessSlice {
   month: string;
   state: SliceState;
   missingReports?: Array<"TRANSACTION" | "SHIPMENT">;
+  transactionSourceCount?: string;
+  shipmentSourceCount?: string;
   transactionQuantity?: string;
   shipmentQuantity?: string;
   unmatchedAbsolute?: string;
@@ -278,6 +287,8 @@ export interface ExportJob {
   profitRate?: DecimalString | null;
   minimumSalesCostRate?: DecimalString | null;
   continentPrefixes?: AccountingPreferences["continentPrefixes"];
+  periodStart?: string;
+  periodEnd?: string;
   error?: string;
 }
 
@@ -285,6 +296,11 @@ export interface AccountingPreferences {
   profitRate: DecimalString | null;
   minimumSalesCostRate: DecimalString | null;
   continentPrefixes: Array<"AS" | "EU" | "AF" | "AM" | "OC">;
+}
+
+export interface ReportPeriod {
+  periodStart: string;
+  periodEnd: string;
 }
 
 export interface CostAccountingPreviewRow {
@@ -302,6 +318,8 @@ export interface CostAccountingPreviewRow {
 export interface CostAccountingPreview {
   snapshotId: string;
   year: string;
+  periodStart?: string;
+  periodEnd?: string;
   assumptions: AccountingPreferences;
   rows: CostAccountingPreviewRow[];
   total: Omit<CostAccountingPreviewRow, "period">;
