@@ -524,14 +524,6 @@ export class UploadService {
       );
       if (BigInt(pending.rows[0]?.count ?? "0") !== 0n) throw new Error("UPLOAD_FILES_NOT_COMPLETE");
       await tx.query("UPDATE upload_batch SET status = 'READY', updated_at = clock_timestamp() WHERE id = $1 AND status IN ('OPEN','UPLOADING','READY')", [batchId]);
-      await tx.query(
-        `INSERT INTO outbox_event (topic,business_key,payload)
-         SELECT 'upload.finalize',file.id::text,jsonb_build_object('fileId',file.id::text)
-           FROM upload_file file
-          WHERE file.batch_id=$1 AND file.status='COMPLETE' AND NOT file.metadata_only
-         ON CONFLICT (topic,business_key) DO NOTHING`,
-        [batchId],
-      );
       const currentImport = await tx.query<{ id: string; status: string }>(
         "SELECT id,status FROM import_batch WHERE upload_batch_id=$1 FOR UPDATE",
         [batchId],
@@ -541,6 +533,18 @@ export class UploadService {
       if (!["UPLOADING", "ANALYZING", "AWAITING_MAPPING", "AWAITING_COMMIT_CONFIRMATION"].includes(currentImport.rows[0]!.status)) {
         return { id: importBatchId, status: currentImport.rows[0]!.status };
       }
+      await tx.query(
+        `INSERT INTO outbox_event (topic,business_key,payload)
+         SELECT 'upload.finalize',file.id::text,jsonb_build_object('fileId',file.id::text)
+           FROM upload_file file
+           JOIN upload_batch batch ON batch.id=file.batch_id
+           JOIN import_batch batch_import ON batch_import.upload_batch_id=batch.id
+          WHERE file.batch_id=$1 AND file.status='COMPLETE' AND NOT file.metadata_only
+            AND batch.status='READY'
+            AND batch_import.status IN ('UPLOADING','ANALYZING','AWAITING_MAPPING','AWAITING_COMMIT_CONFIRMATION')
+         ON CONFLICT (topic,business_key) DO NOTHING`,
+        [batchId],
+      );
       const projection = await refreshUploadPreflight(tx, batchId, importBatchId);
       return { id: importBatchId, status: projection.status };
     });

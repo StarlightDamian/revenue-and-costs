@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { recordUploadFileFailure } from "../../src/modules/uploads/partial-failure.js";
+import { UploadService } from "../../src/modules/uploads/service.js";
 import { createPostgresTestSchema, type PostgresTestSchema } from "./postgres-harness.js";
 
 describe("upload partial failure PostgreSQL projection", () => {
@@ -13,7 +14,13 @@ describe("upload partial failure PostgreSQL projection", () => {
   });
   afterAll(async () => { await database?.cleanup(); });
 
-  async function createBatch(fileStatuses: readonly ("ENCRYPTING" | "STORED")[]) {
+  async function createBatch(
+    fileStatuses: readonly ("COMPLETE" | "ENCRYPTING" | "STORED")[],
+    options: {
+      readonly uploadStatus?: "UPLOADING" | "READY" | "CANCELLED" | "FAILED" | "EXPIRED";
+      readonly importStatus?: "UPLOADING" | "ANALYZING" | "RESULT_PUBLISHED" | "CANCELLED" | "FAILED";
+    } = {},
+  ) {
     const accountId = randomUUID();
     const enterpriseId = randomUUID();
     const mappingId = randomUUID();
@@ -51,13 +58,13 @@ describe("upload partial failure PostgreSQL projection", () => {
     );
     await pool.query(
       `INSERT INTO upload_batch(id,shop_id,created_by,status,declared_bytes,received_bytes,file_count,expires_at)
-       VALUES($1,$2,$3,'READY',$4,$4,$5,clock_timestamp()+interval '1 day')`,
-      [batchId, shopId, accountId, fileStatuses.length.toString(), fileStatuses.length],
+       VALUES($1,$2,$3,$4,$5,$5,$6,clock_timestamp()+interval '1 day')`,
+      [batchId, shopId, accountId, options.uploadStatus ?? "READY", fileStatuses.length.toString(), fileStatuses.length],
     );
     await pool.query(
       `INSERT INTO import_batch(id,shop_id,upload_batch_id,status,current_stage,idempotency_key,created_by)
-       VALUES($1,$2,$3,'ANALYZING','PREFLIGHT',$4,$5)`,
-      [importBatchId, shopId, batchId, randomUUID(), accountId],
+       VALUES($1,$2,$3,$4,'PREFLIGHT',$5,$6)`,
+      [importBatchId, shopId, batchId, options.importStatus ?? "ANALYZING", randomUUID(), accountId],
     );
 
     const fileIds: string[] = [];
@@ -195,5 +202,61 @@ describe("upload partial failure PostgreSQL projection", () => {
       archive_expanded_bytes: "0",
       archive_file_count: 0,
     });
+  });
+
+  it("backfills one finalize event across repeated completion calls", async () => {
+    const fixture = await createBatch(["COMPLETE"], { uploadStatus: "UPLOADING", importStatus: "UPLOADING" });
+    const service = new UploadService(pool, ".");
+
+    await expect(service.completeBatch(fixture.batchId)).resolves.toMatchObject({ id: fixture.importBatchId, status: "ANALYZING" });
+    await expect(service.completeBatch(fixture.batchId)).resolves.toMatchObject({ id: fixture.importBatchId, status: "ANALYZING" });
+
+    const state = await pool.query<{ upload_status: string; outbox_count: string }>(
+      `SELECT batch.status AS upload_status,
+              count(event.id) FILTER (WHERE event.topic='upload.finalize' AND event.business_key=$2)::text AS outbox_count
+         FROM upload_batch batch
+         LEFT JOIN outbox_event event ON true
+        WHERE batch.id=$1
+        GROUP BY batch.id`,
+      [fixture.batchId, fixture.fileIds[0]],
+    );
+    expect(state.rows[0]).toEqual({ upload_status: "READY", outbox_count: "1" });
+  });
+
+  it("preserves an existing finalize event when completion is replayed", async () => {
+    const fixture = await createBatch(["COMPLETE"], { uploadStatus: "UPLOADING", importStatus: "UPLOADING" });
+    const fileId = fixture.fileIds[0]!;
+    await pool.query(
+      `INSERT INTO outbox_event(topic,business_key,payload)
+       VALUES('upload.finalize',$1,jsonb_build_object('fileId',$1::text))`,
+      [fileId],
+    );
+
+    await expect(new UploadService(pool, ".").completeBatch(fixture.batchId))
+      .resolves.toMatchObject({ id: fixture.importBatchId, status: "ANALYZING" });
+
+    const outbox = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM outbox_event WHERE topic='upload.finalize' AND business_key=$1",
+      [fileId],
+    );
+    expect(outbox.rows[0]?.count).toBe("1");
+  });
+
+  it.each([
+    { uploadStatus: "CANCELLED", importStatus: "CANCELLED" },
+    { uploadStatus: "FAILED", importStatus: "FAILED" },
+    { uploadStatus: "EXPIRED", importStatus: "FAILED" },
+    { uploadStatus: "READY", importStatus: "RESULT_PUBLISHED" },
+  ] as const)("does not backfill a terminal $uploadStatus/$importStatus batch", async ({ uploadStatus, importStatus }) => {
+    const fixture = await createBatch(["COMPLETE"], { uploadStatus, importStatus });
+
+    await expect(new UploadService(pool, ".").completeBatch(fixture.batchId))
+      .resolves.toEqual({ id: fixture.importBatchId, status: importStatus });
+
+    const outbox = await pool.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM outbox_event WHERE topic='upload.finalize' AND business_key=$1",
+      [fixture.fileIds[0]],
+    );
+    expect(outbox.rows[0]?.count).toBe("0");
   });
 });
