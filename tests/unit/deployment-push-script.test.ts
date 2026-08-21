@@ -279,6 +279,7 @@ describe("one-click code release guardrails", () => {
     const stopServices = remote.indexOf('systemctl stop "$api_service" "$worker_service"', servicesStopped);
     const backup = remote.indexOf('runuser -u postgres -- "$pg_dump_bin"', stopServices);
     const drain = remote.slice(stopServices, backup);
+    const uploadGate = drain.slice(drain.indexOf("active_uploads="), drain.indexOf("pending_business_outbox="));
 
     expect(servicesStopped).toBeGreaterThan(0);
     expect(stopServices).toBeGreaterThan(servicesStopped);
@@ -286,7 +287,11 @@ describe("one-click code release guardrails", () => {
     expect(drain).toContain("FROM calculation_run WHERE status IN ('QUEUED','RUNNING','BLOCKED')");
     expect(drain).toContain("FROM import_batch WHERE status NOT IN ('RESULT_PUBLISHED','FAILED','CANCELLED')");
     expect(drain).toContain("FROM export_request WHERE status IN ('QUEUED','RUNNING')");
-    expect(drain).toContain("FROM upload_file WHERE status IN ('PENDING','UPLOADING','COMPLETE','ENCRYPTING')");
+    expect(uploadGate).toContain(
+      "FROM upload_file WHERE status IN ('PENDING','UPLOADING','COMPLETE','ENCRYPTING') AND NOT metadata_only",
+    );
+    expect(uploadGate).not.toContain("import_batch");
+    expect(uploadGate).not.toContain("upload_batch");
     expect(drain).toContain("FROM outbox_event WHERE dispatched_at IS NULL");
     for (const topic of [
       "upload.finalize",

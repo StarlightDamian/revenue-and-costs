@@ -282,6 +282,7 @@ export class PostgresImportService {
       return {
         sliceId: row.slice_id, datasetVersionId: row.dataset_version_id, marketplace: row.normalized_marketplace,
         month: row.local_month, state, missingReports, shipmentQuantity: row.shipment_quantity, transactionQuantity: row.transaction_quantity,
+        shipmentSourceCount: row.shipment_count, transactionSourceCount: row.transaction_count,
         unmatchedAbsolute: row.unmatched_absolute, unmatchedRatio: row.unmatched_ratio,
       };
     });

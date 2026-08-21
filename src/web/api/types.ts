@@ -222,6 +222,8 @@ export interface CompletenessSlice {
   month: string;
   state: SliceState;
   missingReports?: Array<"TRANSACTION" | "SHIPMENT">;
+  transactionSourceCount?: string;
+  shipmentSourceCount?: string;
   transactionQuantity?: string;
   shipmentQuantity?: string;
   unmatchedAbsolute?: string;

@@ -205,7 +205,13 @@ const previewStatusLabel = computed(() => ({
   PUBLISHED: "已完成", FAILED: "需要处理", CANCELLED: "已取消",
 } as Record<string, string>)[preview.value?.status ?? ""] ?? "处理中");
 const matrixSourceState = (slice: CompletenessSlice, kind: RecognizedFileKind): "MISSING" | "PRESENT" | "NOT_REQUIRED" => {
-  if (slice.missingReports?.includes(kind)) return "MISSING";
+  const sourceCount = kind === "TRANSACTION" ? slice.transactionSourceCount : slice.shipmentSourceCount;
+  if (/^[1-9][0-9]*$/u.test(sourceCount ?? "")) return "PRESENT";
+  const missingByState = kind === "TRANSACTION"
+    ? slice.state === "MISSING_TRANSACTION"
+    : slice.state === "MISSING_SHIPMENT";
+  if (slice.missingReports?.includes(kind) || missingByState) return "MISSING";
+  if (sourceCount === "0") return "NOT_REQUIRED";
   const quantity = kind === "TRANSACTION" ? slice.transactionQuantity : slice.shipmentQuantity;
   return quantity !== undefined && quantity !== null ? "PRESENT" : "NOT_REQUIRED";
 };
@@ -215,7 +221,7 @@ const matrixSourceLabel = (slice: CompletenessSlice, kind: RecognizedFileKind): 
   NOT_REQUIRED: "无需补充",
 })[matrixSourceState(slice, kind)];
 const matrixNote = (slice: CompletenessSlice): string => {
-  const missing = slice.missingReports ?? [];
+  const missing = (["TRANSACTION", "SHIPMENT"] as const).filter((kind) => matrixSourceState(slice, kind) === "MISSING");
   if (missing.length > 0) return `请补充${missing.map((kind) => classificationNames[kind]).join("、")}`;
   if (["CONFLICT", "PUBLISHED_WARNING"].includes(slice.state)) return "两份资料数量需要复核";
   if (slice.state === "AWAITING_MAPPING") return "表格列名等待确认";

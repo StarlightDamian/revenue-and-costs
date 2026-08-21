@@ -82,10 +82,12 @@ const preview = {
 };
 
 const completeness = [
-  { sliceId: "slice-sa", datasetVersionId: "version-sa", marketplace: "SA", month: "2025-09", state: "MISSING_SHIPMENT", missingReports: ["TRANSACTION", "SHIPMENT"] },
-  { sliceId: "slice-be", datasetVersionId: "version-be", marketplace: "BE", month: "2025-10", state: "MISSING_TRANSACTION", missingReports: ["TRANSACTION"] },
-  { sliceId: "slice-us", datasetVersionId: "version-us", marketplace: "US", month: "2025-10", state: "COMPLETE", missingReports: [] },
-  { sliceId: "slice-ae", datasetVersionId: "version-ae", marketplace: "AE", month: "2025-11", state: "MISSING_SHIPMENT", missingReports: ["SHIPMENT"] },
+  { sliceId: "slice-sa", datasetVersionId: "version-sa", marketplace: "SA", month: "2025-09", state: "MISSING_SHIPMENT", missingReports: ["TRANSACTION", "SHIPMENT"], transactionSourceCount: "0", shipmentSourceCount: "0" },
+  { sliceId: "slice-be", datasetVersionId: "version-be", marketplace: "BE", month: "2025-10", state: "MISSING_TRANSACTION", missingReports: ["TRANSACTION"], transactionSourceCount: "0", shipmentSourceCount: "1" },
+  { sliceId: "slice-ca", datasetVersionId: "version-ca", marketplace: "CA", month: "2025-10", state: "COMPLETE", missingReports: [], transactionSourceCount: "0", shipmentSourceCount: "1" },
+  { sliceId: "slice-mx", datasetVersionId: "version-mx", marketplace: "MX", month: "2025-10", state: "COMPLETE", missingReports: [], transactionSourceCount: "1", shipmentSourceCount: "0" },
+  { sliceId: "slice-us", datasetVersionId: "version-us", marketplace: "US", month: "2025-10", state: "COMPLETE", missingReports: [], transactionSourceCount: "1", shipmentSourceCount: "1" },
+  { sliceId: "slice-ae", datasetVersionId: "version-ae", marketplace: "AE", month: "2025-11", state: "MISSING_SHIPMENT", missingReports: ["SHIPMENT"], transactionSourceCount: "1", shipmentSourceCount: "0" },
 ];
 
 test("资料准备页用白话说明缺少的资料和处理方法", async ({ page }, testInfo) => {
@@ -157,9 +159,11 @@ test("资料准备页用白话说明缺少的资料和处理方法", async ({ pa
   await expect(page.getByRole("group", { name: "资料明细查看维度" })).toBeVisible();
   await page.getByRole("button", { name: "按站点和月份" }).click();
   const coverageMatrix = page.getByRole("region", { name: "按站点和月份查看资料" });
-  await expect(coverageMatrix.locator("tbody tr")).toHaveCount(4);
-  await expect(coverageMatrix.locator("tbody tr td:first-child")).toHaveText(["AE", "BE", "SA", "US"]);
+  await expect(coverageMatrix.locator("tbody tr")).toHaveCount(6);
+  await expect(coverageMatrix.locator("tbody tr td:first-child")).toHaveText(["AE", "BE", "CA", "MX", "SA", "US"]);
   await expect(coverageMatrix.locator("tbody tr").filter({ hasText: "SA" }).locator(".status-chip")).toHaveText(["缺失", "缺失"]);
+  await expect(coverageMatrix.locator("tbody tr").filter({ hasText: "CA" }).locator(".status-chip")).toHaveText(["无需补充", "已收到"]);
+  await expect(coverageMatrix.locator("tbody tr").filter({ hasText: "MX" }).locator(".status-chip")).toHaveText(["已收到", "无需补充"]);
   await page.getByRole("button", { name: "按文件查看" }).click();
   await expect(page.getByRole("cell", { name: "交易报告", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "配送货件", exact: true })).toBeVisible();

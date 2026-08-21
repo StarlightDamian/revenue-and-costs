@@ -378,7 +378,7 @@ active_exports="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -
   -c "SELECT count(*) FROM export_request WHERE status IN ('QUEUED','RUNNING')")"
 [[ "$active_exports" == '0' ]] || fail 'ACTIVE_EXPORTS_REQUIRE_DRAIN'
 active_uploads="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
-  -c "SELECT count(*) FROM upload_file WHERE status IN ('PENDING','UPLOADING','COMPLETE','ENCRYPTING')")"
+  -c "SELECT count(*) FROM upload_file WHERE status IN ('PENDING','UPLOADING','COMPLETE','ENCRYPTING') AND NOT metadata_only")"
 [[ "$active_uploads" == '0' ]] || fail 'ACTIVE_UPLOADS_REQUIRE_DRAIN'
 pending_business_outbox="$(runuser -u postgres -- "$psql_bin" -X -v ON_ERROR_STOP=1 -At -d "$database_name" \
   -c "SELECT count(*) FROM outbox_event WHERE dispatched_at IS NULL AND topic IN ('upload.finalize','import.analyze','import.commit','calculation.requested','calculation.run','report.auto-publish','export.generate')")"
